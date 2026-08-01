@@ -94,6 +94,7 @@ impl Applet for Init {
                 return reap_with_shutdown(
                     None,
                     "console-shell.service",
+                    &None,
                     &mut Vec::new(),
                     &empty,
                     None,
@@ -113,6 +114,7 @@ impl Applet for Init {
                 return reap_with_shutdown(
                     None,
                     "console-shell.service",
+                    &None,
                     &mut Vec::new(),
                     &empty,
                     None,
@@ -124,6 +126,7 @@ impl Applet for Init {
         let mut services: Vec<ServiceInstance> = Vec::new();
         let mut console_child: Option<std::process::Child> = None;
         let mut console_name = String::from("console-shell.service");
+        let mut console_reload: Option<String> = None;
         for unit_name in &order {
             if let Some(unit) = units.get(unit_name) {
                 if unit.is_target {
@@ -157,6 +160,7 @@ impl Applet for Init {
                     let env = parse_environment(&unit.service.environment);
                     if unit.service.console {
                         console_name = unit.name.clone();
+                        console_reload = unit.service.exec_reload.clone();
                         let cfg = SpawnConfig::from_unit(unit);
                         console_child = spawn_unit_command(&unit.name, cmd, &env, &cfg);
                     } else if unit.service.typ == "forking" {
@@ -177,6 +181,7 @@ impl Applet for Init {
         reap_with_shutdown(
             console_child,
             &console_name,
+            &console_reload,
             &mut services,
             &units,
             status_listener,
@@ -201,6 +206,7 @@ fn install_signal_handlers() {
 fn reap_with_shutdown(
     mut console: Option<std::process::Child>,
     console_name: &str,
+    console_reload: &Option<String>,
     services: &mut Vec<ServiceInstance>,
     units: &HashMap<String, Unit>,
     status_listener: Option<UnixListener>,
@@ -275,7 +281,14 @@ fn reap_with_shutdown(
         // 2.5 响应控制请求（rbox status / rservice）
         if let Some(listener) = &status_listener {
             if let Ok((stream, _)) = listener.accept() {
-                handle_control_connection(stream, console_name, console.as_ref(), services, units);
+                handle_control_connection(
+                    stream,
+                    console_name,
+                    console_reload,
+                    console.as_ref(),
+                    services,
+                    units,
+                );
             }
         }
 

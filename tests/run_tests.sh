@@ -67,6 +67,8 @@ OUT=$(timeout 120 bash -c '
   printf "rservice list\n"; sleep 0.5
   # init 增强：reload、sysctl、User= 降权
   printf "rservice reload longrun\n"; sleep 0.5
+  printf "rservice reload console-shell\n"; sleep 0.5
+  printf "rservice status console-shell\n"; sleep 0.5
   printf "cat /proc/sys/kernel/panic\n"; sleep 0.5
   printf "cat /tmp/usertest.log\n"; sleep 0.5
   printf "rbox head -n 60 /dev/kmsg\n"; sleep 0.5
@@ -142,6 +144,8 @@ assert_contains "rservice list 显示服务" "longrun"
 echo ""
 echo "[init 增强]"
 assert_contains "ExecReload 执行" "reloaded-ok"
+assert_contains "console reload 提示" "console-shell has no ExecReload"
+assert_contains "status 单查 console" "^console-shell running"
 assert_contains "sysctl kernel.panic" "^10$"
 assert_contains "User= 降权 nobody" "65534"
 assert_contains "Type=forking 等待父进程" "started forktest"

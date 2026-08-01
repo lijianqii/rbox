@@ -1,12 +1,12 @@
 //! init 控制协议服务端：监听 unix socket，处理 status/start/stop/restart/reload。
 
 use crate::applets::core::control::STATUS_SOCKET;
-use crate::applets::core::log;
 use crate::applets::core::init::services::{
-    parse_environment, respawn_service, start_forking_service, start_service,
-    stop_service_instance, ServiceInstance,
+    ServiceInstance, parse_environment, respawn_service, start_forking_service, start_service,
+    stop_service_instance,
 };
-use crate::applets::core::init::units::{parse_cmdline, Unit};
+use crate::applets::core::init::units::{Unit, parse_cmdline};
+use crate::applets::core::log;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -31,6 +31,7 @@ pub(crate) fn create_status_listener() -> Option<UnixListener> {
 pub(crate) fn handle_control_connection(
     mut stream: UnixStream,
     console_name: &str,
+    console_reload: &Option<String>,
     console: Option<&Child>,
     services: &mut Vec<ServiceInstance>,
     units: &HashMap<String, Unit>,
@@ -41,7 +42,7 @@ pub(crate) fn handle_control_connection(
         let _ = reader.read_line(&mut req);
     }
     let resp = match parse_control_request(&req) {
-        Ok(r) => execute_control_request(r, console_name, console, services, units),
+        Ok(r) => execute_control_request(r, console_name, console_reload, console, services, units),
         Err(e) => format!("error: {}\n", e),
     };
     let _ = stream.write_all(resp.as_bytes());
@@ -83,6 +84,7 @@ fn parse_control_request(req: &str) -> Result<ControlRequest<'_>, String> {
 fn execute_control_request(
     req: ControlRequest<'_>,
     console_name: &str,
+    console_reload: &Option<String>,
     console: Option<&Child>,
     services: &mut Vec<ServiceInstance>,
     units: &HashMap<String, Unit>,
@@ -93,7 +95,7 @@ fn execute_control_request(
         }
         ControlRequest::Start(name) => do_start(name, services, units),
         ControlRequest::Stop(name) => do_stop(name, console_name, services),
-        ControlRequest::Reload(name) => do_reload(name, services),
+        ControlRequest::Reload(name) => do_reload(name, console_name, console_reload, services),
         ControlRequest::Restart(name) => {
             let stop_out = do_stop(name, console_name, services);
             if stop_out.starts_with("unknown") || stop_out.contains("console") {
@@ -105,8 +107,19 @@ fn execute_control_request(
     }
 }
 
-/// 重载服务：执行 ExecReload 命令（不重启进程）。
-fn do_reload(name: &str, services: &mut [ServiceInstance]) -> String {
+/// 重载服务：执行 ExecReload 命令（不重启进程）。console 服务单独处理。
+fn do_reload(
+    name: &str,
+    console_name: &str,
+    console_reload: &Option<String>,
+    services: &mut [ServiceInstance],
+) -> String {
+    if name == console_name {
+        return match console_reload {
+            Some(cmd) => run_reload_cmd(name, cmd),
+            None => format!("{} has no ExecReload\n", name),
+        };
+    }
     let svc = match services.iter_mut().find(|s| s.name == name) {
         Some(s) => s,
         None => return format!("unknown unit: {}\n", name),
@@ -115,18 +128,21 @@ fn do_reload(name: &str, services: &mut [ServiceInstance]) -> String {
         return format!("{} not running\n", name);
     }
     match &svc.exec_reload {
-        Some(cmd) => {
-            let argv = parse_cmdline(cmd);
-            if argv.is_empty() {
-                return format!("{} has empty ExecReload\n", name);
-            }
-            let _ = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .status();
-            format!("{} reloaded\n", name)
-        }
+        Some(cmd) => run_reload_cmd(name, cmd),
         None => format!("{} has no ExecReload\n", name),
     }
+}
+
+/// 执行 ExecReload 命令并返回响应。
+fn run_reload_cmd(name: &str, cmd: &str) -> String {
+    let argv = parse_cmdline(cmd);
+    if argv.is_empty() {
+        return format!("{} has empty ExecReload\n", name);
+    }
+    let _ = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status();
+    format!("{} reloaded\n", name)
 }
 
 /// 启动服务：已在 services 中的重新拉起；否则从单元文件新建实例。
@@ -192,16 +208,15 @@ fn do_stop(name: &str, console_name: &str, services: &mut [ServiceInstance]) -> 
     format!("{} stopped\n", name)
 }
 
-/// 生成 status 响应文本。请求为空时列出全部；`status <unit>` 查单个。
+/// 生成 status 响应文本。`unit` 为空列出全部；否则查单个单元。
 fn format_status(
-    req: &str,
+    unit: &str,
     console_name: &str,
     console: Option<&Child>,
     services: &[ServiceInstance],
 ) -> String {
-    let req = req.trim();
+    let unit = unit.trim();
     let mut out = String::new();
-    let unit = req.strip_prefix("status ").map(str::trim).unwrap_or("");
 
     if unit.is_empty() {
         out.push_str(&format!("init pid={}\n", std::process::id()));
@@ -237,29 +252,48 @@ mod tests {
         let services = vec![test_svc("a.service", false), test_svc("b.service", true)];
         let out = format_status("", "console-shell.service", None, &services);
         assert!(out.contains("init pid="), "out: {}", out);
-        assert!(out.contains("console-shell.service stopped"), "out: {}", out);
+        assert!(
+            out.contains("console-shell.service stopped"),
+            "out: {}",
+            out
+        );
         assert!(out.contains("a.service exited"), "out: {}", out);
-        assert!(out.contains("b.service exited restart=on-failure"), "out: {}", out);
+        assert!(
+            out.contains("b.service exited restart=on-failure"),
+            "out: {}",
+            out
+        );
     }
 
     #[test]
     fn format_status_single_unit() {
         let services = vec![test_svc("a.service", false)];
-        let out = format_status("status a.service", "console-shell.service", None, &services);
+        let out = format_status("a.service", "console-shell.service", None, &services);
         assert!(out.contains("a.service exited"), "out: {}", out);
         assert!(!out.contains("init pid="), "out: {}", out);
     }
 
     #[test]
     fn format_status_unknown_unit() {
-        let out = format_status("status ghost.service", "console-shell.service", None, &[]);
+        let out = format_status("ghost.service", "console-shell.service", None, &[]);
         assert!(out.contains("unknown unit: ghost.service"), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_single_console() {
+        // console 服务单查：只输出 console 一行，不含 init
+        let out = format_status("console-shell", "console-shell", None, &[]);
+        assert!(out.contains("console-shell stopped"), "out: {}", out);
+        assert!(!out.contains("init pid="), "out: {}", out);
     }
 
     #[test]
     fn parse_control_request_status() {
         assert_eq!(parse_control_request(""), Ok(ControlRequest::Status(None)));
-        assert_eq!(parse_control_request("status"), Ok(ControlRequest::Status(None)));
+        assert_eq!(
+            parse_control_request("status"),
+            Ok(ControlRequest::Status(None))
+        );
         assert_eq!(
             parse_control_request("status hello.service"),
             Ok(ControlRequest::Status(Some("hello.service")))
@@ -302,6 +336,10 @@ mod tests {
             parse_control_request("reload hello"),
             Ok(ControlRequest::Reload("hello"))
         );
-        assert!(parse_control_request("reload").unwrap_err().contains("usage"));
+        assert!(
+            parse_control_request("reload")
+                .unwrap_err()
+                .contains("usage")
+        );
     }
 }
