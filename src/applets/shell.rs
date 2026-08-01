@@ -57,11 +57,8 @@ impl Applet for Shell {
         "shell - command interpreter (pipes, redirections)"
     }
     fn run(&self, _args: &[String]) -> ExitCode {
-        if std::env::var_os("PATH").is_none() {
-            // SAFETY: shell 启动时单线程，无并发风险
-            unsafe { std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin") };
-        }
-
+        // PATH 由 init（PID 1）启动时统一设置，shell 直接继承；
+        // 独立运行时若 PATH 缺失，命令查找回退到 rbox 内置 applet。
         let stdin = io::stdin();
         let mut lines = stdin.lock().lines();
         let mut last_rc: i32 = 0;
@@ -512,7 +509,10 @@ mod tests {
 
     #[test]
     fn tokenize_simple_words() {
-        assert_eq!(flatten(&tokenize("echo hello world")), ["echo", "hello", "world"]);
+        assert_eq!(
+            flatten(&tokenize("echo hello world")),
+            ["echo", "hello", "world"]
+        );
     }
 
     #[test]
@@ -524,12 +524,18 @@ mod tests {
 
     #[test]
     fn tokenize_quote_keeps_spaces() {
-        assert_eq!(flatten(&tokenize("echo \"hello world\"")), ["echo", "hello world"]);
+        assert_eq!(
+            flatten(&tokenize("echo \"hello world\"")),
+            ["echo", "hello world"]
+        );
     }
 
     #[test]
     fn tokenize_backslash_escape() {
-        assert_eq!(flatten(&tokenize("echo hello\\ world")), ["echo", "hello world"]);
+        assert_eq!(
+            flatten(&tokenize("echo hello\\ world")),
+            ["echo", "hello world"]
+        );
     }
 
     #[test]

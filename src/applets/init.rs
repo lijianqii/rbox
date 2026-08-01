@@ -44,6 +44,15 @@ pub static INIT: &Init = &Init;
 const SYSTEM_DIR: &str = "/etc/rbox/system";
 const DEFAULT_TARGET: &str = "default.target";
 
+/// 内置默认挂载集：/etc/fstab 缺失时回退使用。
+const DEFAULT_FSTAB: &[&str] = &[
+    "proc     /proc      proc      defaults  0 0",
+    "sysfs    /sys       sysfs     defaults  0 0",
+    "devtmpfs /dev       devtmpfs  defaults  0 0",
+    "devpts   /dev/pts   devpts    defaults  0 0",
+    "tmpfs    /tmp       tmpfs     defaults  0 0",
+];
+
 /// 解析后的单元文件（TOML 反序列化）。
 /// TOML 表名使用 systemd 风格的 [Unit]/[Service]/[Install]。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -120,8 +129,9 @@ impl Applet for Init {
             log("rbox init: running in test mode (not PID 1)");
         }
 
-        // 1. 基本文件系统初始化
-        mount_basic_fs();
+        // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载）
+        setup_environment();
+        mount_all_fs();
         log("rbox init: basic filesystems mounted");
 
         // 2. 解析所有单元文件
@@ -172,8 +182,7 @@ impl Applet for Init {
                             unit_name, unit.unit.description, cmd
                         ));
                     }
-                    let is_console = unit_name == "console-shell.service"
-                        || cmd.contains("shell");
+                    let is_console = unit_name == "console-shell.service" || cmd.contains("shell");
                     if is_console {
                         console_child = spawn_unit_command(unit, cmd);
                     } else if let Some(inst) = start_service(unit, cmd) {
@@ -297,7 +306,11 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
     } else {
         log("rbox init: power off");
     }
-    let _ = reboot_syscall(if is_reboot { libc::RB_AUTOBOOT } else { libc::RB_POWER_OFF });
+    let _ = reboot_syscall(if is_reboot {
+        libc::RB_AUTOBOOT
+    } else {
+        libc::RB_POWER_OFF
+    });
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -339,27 +352,76 @@ fn spawn_unit_command(unit: &Unit, cmd: &str) -> Option<std::process::Child> {
     }
 }
 
+/// 一条 fstab 挂载记录：<device> <mountpoint> <type> <options> [<dump> <pass>]。
+#[derive(Debug, Clone)]
+struct FstabEntry {
+    device: String,
+    mountpoint: String,
+    fstype: String,
+    options: String,
+}
 
+/// 解析一行 fstab 记录；空行、注释行、字段不足的行返回 None。
+fn parse_fstab_line(line: &str) -> Option<FstabEntry> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut fields = line.split_whitespace();
+    let device = fields.next()?;
+    let mountpoint = fields.next()?;
+    let fstype = fields.next()?;
+    let options = fields.next().unwrap_or("defaults");
+    Some(FstabEntry {
+        device: device.to_string(),
+        mountpoint: mountpoint.to_string(),
+        fstype: fstype.to_string(),
+        options: options.to_string(),
+    })
+}
 
-/// 挂载 proc / sys / devtmpfs 等基本文件系统（若已挂载则跳过）。
-fn mount_basic_fs() {
-    let _ = fs::create_dir_all("/proc");
-    let _ = run_mount("proc", "/proc", "proc");
-    let _ = fs::create_dir_all("/sys");
-    let _ = run_mount("sysfs", "/sys", "sysfs");
-    let _ = fs::create_dir_all("/dev");
-    let _ = run_mount("devtmpfs", "/dev", "devtmpfs");
-    let _ = fs::create_dir_all("/dev/pts");
-    let _ = run_mount("devpts", "/dev/pts", "devpts");
-    let _ = fs::create_dir_all("/tmp");
-    // 为 shell 提供默认 PATH
+/// 解析整个 fstab 内容。
+fn parse_fstab(content: &str) -> Vec<FstabEntry> {
+    content.lines().filter_map(parse_fstab_line).collect()
+}
+
+/// 挂载所有文件系统：优先读取 /etc/fstab，缺失时回退到内置默认集。
+/// 单个挂载失败只记录日志，不中断其余挂载。
+fn mount_all_fs() {
+    let entries: Vec<FstabEntry> = match fs::read_to_string("/etc/fstab") {
+        Ok(content) => parse_fstab(&content),
+        Err(_) => {
+            log("rbox init: /etc/fstab not found, using built-in defaults");
+            DEFAULT_FSTAB
+                .iter()
+                .filter_map(|l| parse_fstab_line(l))
+                .collect()
+        }
+    };
+    for e in &entries {
+        log(&format!(
+            "rbox init: mounting {} on {} ({})",
+            e.device, e.mountpoint, e.fstype
+        ));
+        let _ = fs::create_dir_all(&e.mountpoint);
+        if let Err(err) = run_mount(&e.device, &e.mountpoint, &e.fstype, &e.options) {
+            log(&format!(
+                "rbox init: mount {} on {} failed: {}",
+                e.device, e.mountpoint, err
+            ));
+        }
+    }
+}
+
+/// 为所有子进程（shell、服务）提供默认 PATH。
+fn setup_environment() {
     if std::env::var_os("PATH").is_none() {
         // SAFETY: init 是单线程 PID 1，无并发修改环境变量风险
         unsafe { std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin") };
     }
 }
 
-fn run_mount(src: &str, tgt: &str, fstype: &str) -> std::io::Result<()> {
+fn run_mount(src: &str, tgt: &str, fstype: &str, options: &str) -> std::io::Result<()> {
     use std::ffi::CString;
     let s = CString::new(src).unwrap();
     let t = CString::new(tgt).unwrap();
@@ -369,7 +431,7 @@ fn run_mount(src: &str, tgt: &str, fstype: &str) -> std::io::Result<()> {
             s.as_ptr(),
             t.as_ptr(),
             f.as_ptr(),
-            0,
+            parse_mount_flags(options),
             std::ptr::null::<std::ffi::c_void>(),
         )
     };
@@ -378,6 +440,25 @@ fn run_mount(src: &str, tgt: &str, fstype: &str) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// 解析 fstab options（逗号分隔）为 mount(2) 标志位；defaults/未知选项视为 0。
+fn parse_mount_flags(options: &str) -> libc::c_ulong {
+    let mut flags: libc::c_ulong = 0;
+    for opt in options.split(',') {
+        match opt {
+            "defaults" | "rw" | "" => {}
+            "ro" => flags |= libc::MS_RDONLY,
+            "remount" => flags |= libc::MS_REMOUNT,
+            "noexec" => flags |= libc::MS_NOEXEC,
+            "nosuid" => flags |= libc::MS_NOSUID,
+            "nodev" => flags |= libc::MS_NODEV,
+            "noatime" => flags |= libc::MS_NOATIME,
+            "sync" => flags |= libc::MS_SYNCHRONOUS,
+            _ => {}
+        }
+    }
+    flags
 }
 
 /// 加载 SYSTEM_DIR 下所有 .toml 单元文件。
@@ -418,10 +499,7 @@ fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
 
 /// 从 default.target 出发，计算服务的启动顺序（拓扑排序）。
 /// Requires= 和 After= 都构成"必须先启动"的边。
-fn compute_start_order(
-    units: &HashMap<String, Unit>,
-    root: &str,
-) -> Result<Vec<String>, String> {
+fn compute_start_order(units: &HashMap<String, Unit>, root: &str) -> Result<Vec<String>, String> {
     let mut order = Vec::new();
     let mut visited: HashMap<String, u8> = HashMap::new(); // 0=未访问 1=进行中 2=已完成
 
@@ -606,7 +684,10 @@ mod tests {
             "default.target".into(),
             unit("default.target", true, &["b.service"], &[], &[]),
         );
-        units.insert("b.service".into(), unit("b.service", false, &["a.service"], &[], &[]));
+        units.insert(
+            "b.service".into(),
+            unit("b.service", false, &["a.service"], &[], &[]),
+        );
         units.insert("a.service".into(), unit("a.service", false, &[], &[], &[]));
         let order = compute_start_order(&units, "default.target").unwrap();
         assert_eq!(order, vec!["a.service", "b.service", "default.target"]);
@@ -627,8 +708,14 @@ mod tests {
     #[test]
     fn start_order_detects_cycle() {
         let mut units = HashMap::new();
-        units.insert("a.service".into(), unit("a.service", false, &["b.service"], &[], &[]));
-        units.insert("b.service".into(), unit("b.service", false, &["a.service"], &[], &[]));
+        units.insert(
+            "a.service".into(),
+            unit("a.service", false, &["b.service"], &[], &[]),
+        );
+        units.insert(
+            "b.service".into(),
+            unit("b.service", false, &["a.service"], &[], &[]),
+        );
         let err = compute_start_order(&units, "a.service").unwrap_err();
         assert!(err.contains("cycle"), "unexpected error: {}", err);
     }
@@ -657,5 +744,41 @@ mod tests {
     fn start_order_missing_root_is_ok() {
         let units: HashMap<String, Unit> = HashMap::new();
         assert!(compute_start_order(&units, "ghost.target").is_ok());
+    }
+
+    #[test]
+    fn parse_fstab_basic_entries() {
+        let entries = parse_fstab("proc /proc proc defaults 0 0\nsysfs /sys sysfs ro 0 0\n");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].device, "proc");
+        assert_eq!(entries[0].mountpoint, "/proc");
+        assert_eq!(entries[0].fstype, "proc");
+        assert_eq!(entries[0].options, "defaults");
+        assert_eq!(entries[1].options, "ro");
+    }
+
+    #[test]
+    fn parse_fstab_skips_comments_and_blank_lines() {
+        let entries = parse_fstab("# comment\n\n   \nproc /proc proc defaults 0 0\n");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].device, "proc");
+    }
+
+    #[test]
+    fn parse_fstab_drops_short_lines() {
+        let entries = parse_fstab("proc /proc\nproc /proc proc defaults 0 0\n");
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn parse_mount_flags_mapping() {
+        assert_eq!(parse_mount_flags("defaults"), 0);
+        assert_eq!(parse_mount_flags("rw"), 0);
+        assert_eq!(parse_mount_flags("ro"), libc::MS_RDONLY);
+        assert_eq!(
+            parse_mount_flags("ro,noexec,nosuid"),
+            libc::MS_RDONLY | libc::MS_NOEXEC | libc::MS_NOSUID
+        );
+        assert_eq!(parse_mount_flags("unknownopt"), 0);
     }
 }

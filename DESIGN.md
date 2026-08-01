@@ -246,6 +246,8 @@ enum Token {
 命令查找（resolve_command）：含 / 按字面路径，否则在 PATH 下查找可执行文件。查找失败时回退到 `rbox <cmd>` 内置 applet。
 
 重定向文件（`>`/`>>`/`<`）打开失败时打印错误并返回非零退出码，不会静默丢弃输出。
+
+默认 PATH 由 init（PID 1）启动时统一设置，shell 直接继承，不再自行设置。
 ## Init
 
 文件：src/applets/init.rs（646 行，含单元测试）
@@ -278,7 +280,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 ### 启动流程
 
 1. **信号处理**：安装 SIGTERM/SIGINT 处理器（SIGTERM 设关机标志，SIGINT 设重启标志）
-2. **挂载文件系统**：/proc、/sys、/dev（devtmpfs）、/dev/pts、/tmp，设置默认 PATH
+2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
 5. **启动服务**：按排序结果依次 fork+exec ExecStart，记录 Child 句柄和 ExecStop；console-shell.service 作为前台 shell 等待
@@ -310,7 +312,7 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 
 | 函数 | 用途 | 使用位置 |
 |------|------|----------|
-| libc::mount | 挂载 proc/sys/devtmpfs 等 | init.rs |
+| libc::mount | 挂载 /etc/fstab 列出的文件系统 | init.rs |
 | libc::signal | 注册 SIGTERM/SIGINT 处理器 | init.rs |
 | libc::kill | 向进程/所有进程发送信号 | init.rs, shutdown.rs, reboot.rs |
 | libc::sync | 刷新文件系统缓冲 | init.rs |
@@ -328,6 +330,21 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 | default.target.toml | target | 启动根节点 |
 | console-shell.service.toml | service | ExecStart=/bin/rbox shell，前台交互 shell |
 | hello.service.toml | service | 测试用，含 ExecStart + ExecStop，验证有序关机 |
+
+### fstab 挂载表
+
+init 启动时读取 `/etc/fstab` 逐个挂载文件系统（标准五/六字段格式，`#` 注释与空行忽略）；文件缺失时回退到内置默认集：
+
+```fstab
+# <device> <mountpoint> <type> <options> <dump> <pass>
+proc     /proc      proc      defaults  0 0
+sysfs    /sys       sysfs     defaults  0 0
+devtmpfs /dev       devtmpfs  defaults  0 0
+devpts   /dev/pts   devpts    defaults  0 0
+tmpfs    /tmp       tmpfs     defaults  0 0
+```
+
+options 支持常见标志（逗号分隔）：`ro`/`remount`/`noexec`/`nosuid`/`nodev`/`noatime`/`sync`，`defaults` 与未知选项视为 0。单个挂载失败仅记录日志，不中断其余挂载。
 ## 构建系统
 
 文件：Makefile
@@ -394,9 +411,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 | 基本 applet | uname -m、pwd、echo、cat | 4 |
 | 文件操作 | 重定向写入、cp、ls | 3 |
 | 管道与重定向 | 管道 cat\|cat、追加写入 | 3 |
-| init 启动流程 | PID 1 启动、挂载、加载单元、reached target | 4 |
+| init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **17** |
+| **合计** | | **18** |
 
 ### 运行测试
 
@@ -417,8 +434,8 @@ make unittest
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
 | shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测） | 8 |
-| **合计** | | **19** |
+| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射） | 12 |
+| **合计** | | **23** |
 
 测试结果示例：
 
@@ -462,6 +479,7 @@ rootfs/
 │       └── libgcc_s.so.1        # GCC 运行时
 └── etc/
     ├── hostname                 # 测试文件
+    ├── fstab                    # init 挂载表
     └── rbox/
         └── system/              # init TOML 单元文件
             ├── default.target.toml

@@ -14,10 +14,10 @@ PASS=0
 FAIL=0
 
 # 单次 QEMU 运行所有测试命令
-# 命令序列本身约 24 秒，超时需留足内核启动余量（负载高时启动会变慢）
-OUT=$(timeout 60 bash -c '
+# 命令序列本身约 25 秒，超时需留足内核启动余量（负载高时启动会变慢）
+OUT=$(timeout 90 bash -c '
 {
-  sleep 5
+  sleep 8
   # 基本 applet
   printf "uname -m\n"; sleep 0.5
   printf "pwd\n"; sleep 0.5
@@ -83,6 +83,7 @@ assert_contains "追加写入 >>" "appended"
 echo ""
 echo "[init 启动流程]"
 assert_contains "init PID 1 启动" "rbox init: starting as PID 1"
+assert_contains "fstab 挂载 proc" "mounting proc on /proc"
 assert_contains "挂载基本文件系统" "basic filesystems mounted"
 assert_contains "加载 TOML 单元" "loaded"
 assert_contains "达到 default.target" "reached target"
