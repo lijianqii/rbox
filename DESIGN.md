@@ -191,7 +191,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 13 | init | init | PID 1 系统初始化（见下文） |
 | 14 | shell | shell | 命令解释器（见下文） |
 | 15 | shutdown | shutdown | 向 PID 1 发 SIGTERM 触发有序关机 |
-| 16 | reboot | reboot | 调用 reboot(RB_AUTOBOOT) 系统调用重启 |
+| 16 | reboot | reboot | 向 PID 1 发 SIGINT 触发有序重启 |
 | 17 | head | head [-n N] [file] | 输出文件前 N 行（默认 10） |
 | 18 | tail | tail [-n N] [file] | 输出文件后 N 行（默认 10） |
 | 19 | wc | wc [-l] [-w] [-c] [file] | 统计行数/单词数/字节数 |
@@ -244,6 +244,8 @@ enum Token {
 `build_pipeline` 将 Token 序列构建为 Pipeline（若干 SimpleCmd）。`execute_pipeline` 用 `Stdio::piped()` 串联子进程。
 
 命令查找（resolve_command）：含 / 按字面路径，否则在 PATH 下查找可执行文件。查找失败时回退到 `rbox <cmd>` 内置 applet。
+
+重定向文件（`>`/`>>`/`<`）打开失败时打印错误并返回非零退出码，不会静默丢弃输出。
 ## Init
 
 文件：src/applets/init.rs（646 行，含单元测试）
@@ -275,7 +277,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 
 ### 启动流程
 
-1. **信号处理**：安装 SIGTERM/SIGINT 处理器（设置全局关机标志）
+1. **信号处理**：安装 SIGTERM/SIGINT 处理器（SIGTERM 设关机标志，SIGINT 设重启标志）
 2. **挂载文件系统**：/proc、/sys、/dev（devtmpfs）、/dev/pts、/tmp，设置默认 PATH
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
@@ -284,12 +286,13 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 
 `Type=` 目前仅支持 `simple`，遇到其他值会打印警告并按 simple 处理。
 
-### 关机流程
+### 关机/重启流程
 
 ```
-shutdown 命令 / SIGTERM / SIGINT
+shutdown 命令 / SIGTERM ──► 关机（设置 SHUTDOWN_REQUESTED 标志）
+reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
   |
-  +-- 设置 SHUTDOWN_REQUESTED 全局标志
+  +-- 设置对应全局标志
   +-- 主循环检测到标志 -> kill console shell
   +-- do_shutdown():
   |     +-- 逆序遍历已启动的服务，执行 ExecStop + SIGTERM 等服务退出
@@ -297,8 +300,8 @@ shutdown 命令 / SIGTERM / SIGINT
   |     +-- kill(-1, SIGTERM) -> 所有残留进程
   |     +-- sleep 500ms
   |     +-- sync()
-  |     +-- reboot(RB_POWER_OFF)
-  +-- QEMU 退出
+  |     +-- reboot(RB_POWER_OFF)（关机）或 reboot(RB_AUTOBOOT)（重启）
+  +-- QEMU 退出 / 重启
 ```
 
 ### 系统调用封装
@@ -309,9 +312,9 @@ shutdown 命令 / SIGTERM / SIGINT
 |------|------|----------|
 | libc::mount | 挂载 proc/sys/devtmpfs 等 | init.rs |
 | libc::signal | 注册 SIGTERM/SIGINT 处理器 | init.rs |
-| libc::kill | 向进程/所有进程发送信号 | init.rs, shutdown.rs |
-| libc::sync | 刷新文件系统缓冲 | init.rs, reboot.rs |
-| libc::reboot | 关机 (RB_POWER_OFF) / 重启 (RB_AUTOBOOT) | init.rs, reboot.rs |
+| libc::kill | 向进程/所有进程发送信号 | init.rs, shutdown.rs, reboot.rs |
+| libc::sync | 刷新文件系统缓冲 | init.rs |
+| libc::reboot | 关机 (RB_POWER_OFF) / 重启 (RB_AUTOBOOT) | init.rs |
 | libc::uname | 获取系统信息 | uname.rs |
 | libc::time / localtime_r | 获取时间 | date.rs, ls.rs |
 | libc::utimensat | 设置文件时间戳 | touch.rs |
@@ -413,9 +416,9 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误） | 10 |
+| shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
 | init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测） | 8 |
-| **合计** | | **18** |
+| **合计** | | **19** |
 
 测试结果示例：
 

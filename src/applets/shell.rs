@@ -338,7 +338,18 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         let stdout = if is_last {
             // 最后一条：可能重定向到文件
             if let Some(f) = &cmd.stdout_file {
-                open_stdout(f, cmd.append)
+                match open_stdout(f, cmd.append) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("shell: {}: {}", f, e);
+                        // 清理已启动的管道子进程，避免遗留
+                        for mut c in children.drain(..) {
+                            let _ = c.kill();
+                            let _ = c.wait();
+                        }
+                        return 1;
+                    }
+                }
             } else {
                 Stdio::inherit()
             }
@@ -379,20 +390,35 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
 /// 执行单条命令（无管道，但可能含重定向）。
 fn run_simple(cmd: &SimpleCmd, stdin: Option<Stdio>, stdout: Option<Stdio>) -> i32 {
     let mut command = build_command(&cmd.argv);
-    if let Some(s) = stdin.or_else(|| {
-        cmd.stdin_file
-            .as_ref()
-            .and_then(|f| std::fs::File::open(f).ok())
-            .map(Stdio::from)
-    }) {
+
+    // 输入重定向：调用参数优先，其次命令行中的 < file；打开失败直接报错返回
+    if let Some(s) = stdin {
         command.stdin(s);
+    } else if let Some(f) = &cmd.stdin_file {
+        match std::fs::File::open(f) {
+            Ok(file) => {
+                command.stdin(Stdio::from(file));
+            }
+            Err(e) => {
+                eprintln!("shell: {}: {}", f, e);
+                return 1;
+            }
+        }
     }
-    if let Some(o) = stdout.or_else(|| {
-        cmd.stdout_file
-            .as_ref()
-            .map(|f| open_stdout(f, cmd.append))
-    }) {
+
+    // 输出重定向：调用参数优先，其次命令行中的 > file / >> file；打开失败直接报错返回
+    if let Some(o) = stdout {
         command.stdout(o);
+    } else if let Some(f) = &cmd.stdout_file {
+        match open_stdout(f, cmd.append) {
+            Ok(s) => {
+                command.stdout(s);
+            }
+            Err(e) => {
+                eprintln!("shell: {}: {}", f, e);
+                return 1;
+            }
+        }
     }
 
     match command.status() {
@@ -435,8 +461,8 @@ fn spawn_command(cmd: &SimpleCmd, stdin: Stdio, stdout: Stdio) -> io::Result<Chi
     command.spawn()
 }
 
-/// 打开 stdout 文件用于重定向。
-fn open_stdout(path: &str, append: bool) -> Stdio {
+/// 打开 stdout 文件用于重定向。失败时返回错误（由调用方报错并返回非零）。
+fn open_stdout(path: &str, append: bool) -> io::Result<Stdio> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true);
     if append {
@@ -444,13 +470,7 @@ fn open_stdout(path: &str, append: bool) -> Stdio {
     } else {
         opts.truncate(true);
     }
-    match opts.open(path) {
-        Ok(f) => Stdio::from(f),
-        Err(e) => {
-            eprintln!("shell: {}: {}", path, e);
-            Stdio::null()
-        }
-    }
+    opts.open(path).map(Stdio::from)
 }
 
 /// 解析命令路径：含 / 则按字面；否则在 PATH 各目录下查找可执行文件。
@@ -551,5 +571,12 @@ mod tests {
     fn build_pipeline_empty_line() {
         let p = build_pipeline(&tokenize("")).unwrap();
         assert!(p.cmds.is_empty());
+    }
+
+    #[test]
+    fn open_stdout_failure_is_reported() {
+        // 父目录不存在，打开必然失败，错误必须向上传播而非静默
+        assert!(open_stdout("/nonexistent-rbox-dir/out", false).is_err());
+        assert!(open_stdout("/nonexistent-rbox-dir/out", true).is_err());
     }
 }

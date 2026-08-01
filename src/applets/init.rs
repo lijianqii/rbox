@@ -19,12 +19,23 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 全局关机标志：信号处理器设置，主循环检查。
+/// 全局关机标志：SIGTERM 信号处理器设置，主循环检查。
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// 全局重启标志：SIGINT 信号处理器设置，主循环检查。
+static REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// 信号处理器：设置关机标志。
-extern "C" fn signal_handler(_sig: i32) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+/// 信号处理器：SIGTERM 设置关机标志，SIGINT 设置重启标志。
+extern "C" fn signal_handler(sig: i32) {
+    if sig == libc::SIGINT {
+        REBOOT_REQUESTED.store(true, Ordering::SeqCst);
+    } else {
+        SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// 是否已请求关机或重启。
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || REBOOT_REQUESTED.load(Ordering::SeqCst)
 }
 
 pub struct Init;
@@ -196,7 +207,7 @@ fn reap_with_shutdown(
         // 1. console shell：运行中则检查退出，退出后标记待 respawn
         if let Some(child) = console.as_mut() {
             if let Ok(Some(_)) = child.try_wait() {
-                if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                if shutdown_requested() {
                     return do_shutdown(services);
                 }
                 log("rbox init: shell exited, respawning");
@@ -204,7 +215,7 @@ fn reap_with_shutdown(
             }
         }
         // 未运行（未启动或已退出）则拉起；失败则稍后重试
-        if console.is_none() && !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        if console.is_none() && !shutdown_requested() {
             match spawn_fresh_shell() {
                 Some(c) => console = Some(c),
                 None => {
@@ -229,8 +240,8 @@ fn reap_with_shutdown(
             }
         }
 
-        // 3. 关机标志
-        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+        // 3. 关机/重启标志
+        if shutdown_requested() {
             log("rbox init: shutdown requested, terminating shell");
             if let Some(mut child) = console.take() {
                 let _ = child.kill();
@@ -280,8 +291,13 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
     let _ = kill_all(15);
     std::thread::sleep(std::time::Duration::from_millis(500));
     sync_fs();
-    log("rbox init: power off");
-    let _ = reboot_syscall(0);
+    let is_reboot = REBOOT_REQUESTED.load(Ordering::SeqCst);
+    if is_reboot {
+        log("rbox init: rebooting");
+    } else {
+        log("rbox init: power off");
+    }
+    let _ = reboot_syscall(if is_reboot { libc::RB_AUTOBOOT } else { libc::RB_POWER_OFF });
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -521,10 +537,9 @@ fn sync_fs() {
 }
 
 /// reboot 系统调用。
-/// cmd: 0 = RB_POWER_OFF, 1 = RB_AUTOBOOT (restart)
-fn reboot_syscall(cmd: i32) -> std::io::Result<()> {
-    let cmd_val = if cmd == 0 { libc::RB_POWER_OFF } else { libc::RB_AUTOBOOT };
-    let rc = unsafe { libc::reboot(cmd_val) };
+/// cmd: libc::RB_POWER_OFF（关机）或 libc::RB_AUTOBOOT（重启）
+fn reboot_syscall(cmd: libc::c_int) -> std::io::Result<()> {
+    let rc = unsafe { libc::reboot(cmd) };
     if rc == 0 {
         Ok(())
     } else {
