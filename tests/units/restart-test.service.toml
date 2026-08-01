@@ -1,5 +1,6 @@
 [Unit]
 Description = "Restart test (always fails, Restart=on-failure)"
+Name = "restart-test"
 
 [Service]
 Type = "simple"

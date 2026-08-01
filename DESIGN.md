@@ -249,6 +249,7 @@ enum Token {
 
 [Unit]
 Description = "Hello service"
+Name = "hello"                        # 可选：单元名（rservice/status/依赖引用用它；缺省回退文件名）
 After = ["network.service"]        # 可选：在此服务之后启动
 Requires = ["network.service"]     # 可选：硬依赖
 
@@ -265,6 +266,8 @@ WantedBy = ["default.target"]      # 被哪个 target 拉入
 ```
 
 target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依赖图的根节点。
+
+**单元命名**：`[Unit] Name = "..."` 显式声明单元名（rservice/status/依赖引用均使用它）；缺省时回退文件名（去掉 `.toml`）。target 类型按文件名 `.target` 后缀判定，不受 Name 影响。
 
 ### 启动流程
 
@@ -333,12 +336,12 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 
 ### 当前 TOML 单元文件（生产 rootfs）
 
-| 文件 | 类型 | 说明 |
-|------|------|------|
-| default.target.toml | target | 启动根节点 |
-| console-shell.service.toml | service | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
+| 文件 | 类型 | Name | 说明 |
+|------|------|------|------|
+| default.target.toml | target | default.target | 启动根节点（无 Name 字段，回退文件名） |
+| console-shell.service.toml | service | console-shell | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
 
-测试专用服务（hello.service：Environment/ExecStop；restart-test.service：Restart=on-failure；longrun.service：rservice 管理用长驻服务）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
+测试专用服务（hello、restart-test、longrun）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
 
 ### fstab 挂载表
 
@@ -447,8 +450,8 @@ make unittest
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
 | shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/错误） | 20 |
-| **合计** | | **31** |
+| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/错误）、resolve_unit_name/is_target_file | 22 |
+| **合计** | | **33** |
 
 测试结果示例：
 

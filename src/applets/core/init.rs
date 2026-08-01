@@ -79,6 +79,10 @@ struct UnitSection {
     #[serde(default)]
     #[serde(rename = "Description")]
     description: String,
+    /// 单元名：rservice/status/依赖引用均使用它；缺省回退文件名
+    #[serde(default)]
+    #[serde(rename = "Name")]
+    name: String,
     #[serde(default)]
     #[serde(rename = "After")]
     after: Vec<String>,
@@ -624,6 +628,20 @@ fn parse_mount_flags(options: &str) -> libc::c_ulong {
     flags
 }
 
+/// 单元名解析：优先 [Unit] Name 字段，缺省回退文件名（去掉 .toml）。
+fn resolve_unit_name(file_stem: &str, declared: &str) -> String {
+    if declared.is_empty() {
+        file_stem.to_string()
+    } else {
+        declared.to_string()
+    }
+}
+
+/// 是否为 target 单元（按文件名 .target 后缀判定，与 Name 字段无关）。
+fn is_target_file(file_stem: &str) -> bool {
+    file_stem.ends_with(".target")
+}
+
 /// 加载 SYSTEM_DIR 下所有 .toml 单元文件。
 fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     let mut units: HashMap<String, Unit> = HashMap::new();
@@ -638,12 +656,13 @@ fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
             if let Ok(content) = fs::read_to_string(&path) {
                 match toml::from_str::<Unit>(&content) {
                     Ok(mut unit) => {
-                        // 文件名去掉 .toml 作为单元名
-                        unit.name = path
+                        // 文件名去掉 .toml；单元名优先用 [Unit] Name，缺省回退文件名
+                        let file_stem = path
                             .file_stem()
                             .map(|n| n.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        unit.is_target = unit.name.ends_with(".target");
+                        unit.is_target = is_target_file(&file_stem);
+                        unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
                         units.insert(unit.name.clone(), unit);
                     }
                     Err(e) => {
@@ -1031,6 +1050,7 @@ mod tests {
             is_target,
             unit: UnitSection {
                 description: String::new(),
+                name: String::new(),
                 after: after.iter().map(|s| s.to_string()).collect(),
                 requires: requires.iter().map(|s| s.to_string()).collect(),
             },
@@ -1265,7 +1285,28 @@ mod tests {
 
     #[test]
     fn parse_control_request_errors() {
-        assert!(parse_control_request("start").unwrap_err().contains("usage"));
-        assert!(parse_control_request("frobnicate x").unwrap_err().contains("unknown"));
+        assert!(
+            parse_control_request("start")
+                .unwrap_err()
+                .contains("usage")
+        );
+        assert!(
+            parse_control_request("frobnicate x")
+                .unwrap_err()
+                .contains("unknown")
+        );
+    }
+
+    #[test]
+    fn resolve_unit_name_prefers_declared() {
+        assert_eq!(resolve_unit_name("hello.service", ""), "hello.service");
+        assert_eq!(resolve_unit_name("hello.service", "hello"), "hello");
+    }
+
+    #[test]
+    fn is_target_file_uses_filename_suffix() {
+        assert!(is_target_file("default.target"));
+        assert!(!is_target_file("default"));
+        assert!(!is_target_file("hello.service"));
     }
 }

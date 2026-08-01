@@ -56,11 +56,11 @@ OUT=$(timeout 120 bash -c '
   printf "cat /tmp/a\n"; sleep 0.5
   # 服务管理：env 注入、status 查询、Restart=on-failure
   printf "rbox status\n"; sleep 0.5
-  printf "rbox status hello.service\n"; sleep 0.5
+  printf "rbox status hello\n"; sleep 0.5
   # rservice：stop/start/restart/list
-  printf "rservice stop longrun.service\n"; sleep 0.5
-  printf "rservice start longrun.service\n"; sleep 0.5
-  printf "rservice restart longrun.service\n"; sleep 0.5
+  printf "rservice stop longrun\n"; sleep 0.5
+  printf "rservice start longrun\n"; sleep 0.5
+  printf "rservice restart longrun\n"; sleep 0.5
   printf "rservice list\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
@@ -116,19 +116,19 @@ assert_contains "达到 default.target" "reached target"
 echo ""
 echo "[服务管理]"
 assert_contains "Environment= 注入 HELLO" "HELLO=world"
-assert_contains "Restart=on-failure 自动重启" "restarting restart-test.service"
-assert_contains "status 列出 console" "console-shell.service"
-assert_contains "status 列出重启服务" "restart-test.service"
-assert_contains "status 单服务查询" "hello.service"
+assert_contains "Restart=on-failure 自动重启" "restarting restart-test"
+assert_contains "status 列出 console" "console-shell"
+assert_contains "status 列出重启服务" "restart-test"
+assert_contains "status 单服务查询" "^hello "
 assert_contains "status 显示重启策略" "restart=on-failure"
 
 
 echo ""
 echo "[rservice 管理]"
-assert_contains "rservice stop" "longrun.service stopped"
-assert_contains "rservice start" "longrun.service started"
-assert_contains "rservice restart" "longrun.service started"
-assert_contains "rservice list 显示服务" "longrun.service"
+assert_contains "rservice stop" "longrun stopped"
+assert_contains "rservice start" "longrun started"
+assert_contains "rservice restart" "longrun started"
+assert_contains "rservice list 显示服务" "longrun"
 
 
 echo ""

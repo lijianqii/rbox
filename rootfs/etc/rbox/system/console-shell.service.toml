@@ -1,5 +1,6 @@
 [Unit]
 Description = "Console shell"
+Name = "console-shell"
 
 [Service]
 Type = "simple"

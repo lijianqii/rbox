@@ -1,7 +1,6 @@
 [Unit]
 Description = "Hello service (test Environment/ExecStop)"
-After = []
-Requires = []
+Name = "hello"
 
 [Service]
 Type = "simple"

@@ -1,5 +1,6 @@
 [Unit]
 Description = "Long-running test service (rservice start/stop/restart)"
+Name = "longrun"
 
 [Service]
 Type = "simple"
