@@ -1,0 +1,10 @@
+[Unit]
+Description = "Restart test (always fails, Restart=on-failure)"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox false"
+Restart = "on-failure"
+
+[Install]
+WantedBy = ["default.target"]

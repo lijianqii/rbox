@@ -14,7 +14,9 @@ use crate::applet::Applet;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +45,8 @@ pub static INIT: &Init = &Init;
 
 const SYSTEM_DIR: &str = "/etc/rbox/system";
 const DEFAULT_TARGET: &str = "default.target";
+/// status 查询用的 unix socket 路径（/tmp 为 tmpfs，重启后自动消失）。
+const STATUS_SOCKET: &str = "/tmp/rbox.sock";
 
 /// 内置默认挂载集：/etc/fstab 缺失时回退使用。
 const DEFAULT_FSTAB: &[&str] = &[
@@ -94,6 +98,18 @@ struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "ExecStop")]
     exec_stop: Option<String>,
+    /// 重启策略："" / "no"（默认）或 "on-failure"
+    #[serde(default)]
+    #[serde(rename = "Restart")]
+    restart: String,
+    /// 服务环境变量：["VAR=value", ...]
+    #[serde(default)]
+    #[serde(rename = "Environment")]
+    environment: Vec<String>,
+    /// 前台 console 服务（如交互 shell），退出后自动 respawn
+    #[serde(default)]
+    #[serde(rename = "Console")]
+    console: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -109,6 +125,26 @@ struct ServiceInstance {
     name: String,
     child: Option<std::process::Child>,
     exec_stop: Option<String>,
+    /// ExecStart 原文，Restart=on-failure 时用于重新拉起
+    exec_start: String,
+    /// 服务环境变量（已解析的 VAR=value 对）
+    env: Vec<(String, String)>,
+    restart_on_failure: bool,
+}
+
+impl ServiceInstance {
+    /// status 输出的一行状态。
+    fn status_line(&self) -> String {
+        let restart = if self.restart_on_failure {
+            " restart=on-failure"
+        } else {
+            ""
+        };
+        match &self.child {
+            Some(c) => format!("{} running pid={}{}\n", self.name, c.id(), restart),
+            None => format!("{} exited{}\n", self.name, restart),
+        }
+    }
 }
 
 impl Applet for Init {
@@ -142,7 +178,7 @@ impl Applet for Init {
             }
             Err(e) => {
                 log(&format!("rbox init: failed to load units: {}", e));
-                return reap_with_shutdown(None, &mut Vec::new());
+                return reap_with_shutdown(None, "console-shell.service", &mut Vec::new(), None);
             }
         };
 
@@ -154,13 +190,14 @@ impl Applet for Init {
             }
             Err(e) => {
                 log(&format!("rbox init: dependency error: {}", e));
-                return reap_with_shutdown(None, &mut Vec::new());
+                return reap_with_shutdown(None, "console-shell.service", &mut Vec::new(), None);
             }
         };
 
         // 4. 依次启动服务，记录已启动的实例
         let mut services: Vec<ServiceInstance> = Vec::new();
         let mut console_child: Option<std::process::Child> = None;
+        let mut console_name = String::from("console-shell.service");
         for unit_name in &order {
             if let Some(unit) = units.get(unit_name) {
                 if unit.is_target {
@@ -174,6 +211,12 @@ impl Applet for Init {
                             unit_name, unit.service.typ
                         ));
                     }
+                    if !unit.service.restart.is_empty() && unit.service.restart != "on-failure" {
+                        log(&format!(
+                            "rbox init: warning: {} Restart={:?} unsupported, treating as no",
+                            unit_name, unit.service.restart
+                        ));
+                    }
                     if unit.unit.description.is_empty() {
                         log(&format!("rbox init: starting {}: {}", unit_name, cmd));
                     } else {
@@ -182,10 +225,11 @@ impl Applet for Init {
                             unit_name, unit.unit.description, cmd
                         ));
                     }
-                    let is_console = unit_name == "console-shell.service" || cmd.contains("shell");
-                    if is_console {
-                        console_child = spawn_unit_command(unit, cmd);
-                    } else if let Some(inst) = start_service(unit, cmd) {
+                    let env = parse_environment(&unit.service.environment);
+                    if unit.service.console {
+                        console_name = unit.name.clone();
+                        console_child = spawn_unit_command(&unit.name, cmd, &env);
+                    } else if let Some(inst) = start_service(unit, cmd, &env) {
                         services.push(inst);
                     }
                 }
@@ -194,23 +238,31 @@ impl Applet for Init {
 
         log("rbox init: startup complete");
 
-        // 5. 主循环：回收子进程，等待关机标志
-        reap_with_shutdown(console_child, &mut services)
+        // 5. 主循环：回收子进程、响应 status 查询，等待关机标志
+        let status_listener = create_status_listener();
+        reap_with_shutdown(console_child, &console_name, &mut services, status_listener)
     }
 }
 
-/// 安装 SIGTERM/SIGINT 信号处理器。
+/// 安装 SIGTERM/SIGINT 信号处理器（sigaction + SA_RESTART）。
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGTERM, signal_handler as *const () as usize);
-        libc::signal(libc::SIGINT, signal_handler as *const () as usize);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = signal_handler as *const () as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
     }
 }
 
-/// 主循环：管理 console shell（退出则 respawn）、回收服务进程，检测关机标志。
+/// 主循环：管理 console shell（退出则 respawn）、回收/重启服务、
+/// 响应 status 查询，检测关机标志。
 fn reap_with_shutdown(
     mut console: Option<std::process::Child>,
+    console_name: &str,
     services: &mut [ServiceInstance],
+    status_listener: Option<UnixListener>,
 ) -> ExitCode {
     loop {
         // 1. console shell：运行中则检查退出，退出后标记待 respawn
@@ -235,7 +287,7 @@ fn reap_with_shutdown(
             }
         }
 
-        // 2. 回收已退出的服务进程，避免僵尸
+        // 2. 回收已退出的服务进程；Restart=on-failure 且非零退出时重新拉起
         for svc in services.iter_mut() {
             if let Some(child) = svc.child.as_mut() {
                 if let Ok(Some(status)) = child.try_wait() {
@@ -244,8 +296,24 @@ fn reap_with_shutdown(
                         svc.name,
                         status.code()
                     ));
+                    let restart =
+                        svc.restart_on_failure && !status.success() && !shutdown_requested();
                     svc.child = None;
+                    if restart {
+                        log(&format!(
+                            "rbox init: restarting {} (Restart=on-failure)",
+                            svc.name
+                        ));
+                        svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env);
+                    }
                 }
+            }
+        }
+
+        // 2.5 响应 status 查询（rbox status）
+        if let Some(listener) = &status_listener {
+            if let Ok((stream, _)) = listener.accept() {
+                handle_status_connection(stream, console_name, console.as_ref(), services);
             }
         }
 
@@ -276,16 +344,16 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
                     .status();
             }
         }
-        // 优雅终止：SIGTERM 等 1 秒，超时 SIGKILL
+        // 优雅终止：向整个进程组发 SIGTERM 等 1 秒，超时 SIGKILL
         if let Some(mut child) = svc.child.take() {
-            let _ = kill_process(child.id(), libc::SIGTERM);
+            let _ = kill_process_group(child.id(), libc::SIGTERM);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
                     Ok(None) => {
                         if std::time::Instant::now() >= deadline {
-                            let _ = child.kill();
+                            let _ = kill_process_group(child.id(), libc::SIGKILL);
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -297,7 +365,7 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
         }
     }
     log("rbox init: sending SIGTERM to all processes");
-    let _ = kill_all(15);
+    let _ = kill_all(libc::SIGTERM);
     std::thread::sleep(std::time::Duration::from_millis(500));
     sync_fs();
     let is_reboot = REBOOT_REQUESTED.load(Ordering::SeqCst);
@@ -306,11 +374,18 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
     } else {
         log("rbox init: power off");
     }
-    let _ = reboot_syscall(if is_reboot {
+    let action = if is_reboot {
         libc::RB_AUTOBOOT
     } else {
         libc::RB_POWER_OFF
-    });
+    };
+    if let Err(e) = reboot_syscall(action) {
+        log(&format!("rbox init: reboot syscall failed: {}", e));
+        // 重启失败时回退到关机；仍失败则挂起等待人工干预
+        if is_reboot {
+            let _ = reboot_syscall(libc::RB_POWER_OFF);
+        }
+    }
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
@@ -325,31 +400,49 @@ fn spawn_fresh_shell() -> Option<std::process::Child> {
 }
 
 /// 解析 ExecStart 命令并 spawn 子进程，返回子进程句柄。
-/// ExecStart 以 `rbox <applet>` 开头时走 /bin/rbox。
-fn spawn_unit_command(unit: &Unit, cmd: &str) -> Option<std::process::Child> {
+/// ExecStart 以 `rbox` 或 `/bin/rbox` 开头时统一走 /bin/rbox。
+/// 服务放入独立进程组（process_group），关机时可按组清理其后代进程。
+fn spawn_unit_command(
+    name: &str,
+    cmd: &str,
+    env: &[(String, String)],
+) -> Option<std::process::Child> {
     let argv = parse_cmdline(cmd);
     if argv.is_empty() {
         return None;
     }
-    let (program, args) = if argv[0] == "rbox" && argv.len() >= 2 {
+    let (program, args) = if (argv[0] == "rbox" || argv[0] == "/bin/rbox") && argv.len() >= 2 {
         ("/bin/rbox", &argv[1..])
     } else {
         (argv[0].as_str(), &argv[1..])
     };
-    match std::process::Command::new(program).args(args).spawn() {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    command.envs(env.iter().cloned());
+    command.process_group(0);
+    match command.spawn() {
         Ok(child) => {
-            log(&format!(
-                "rbox init: started {} (pid {})",
-                unit.name,
-                child.id()
-            ));
+            log(&format!("rbox init: started {} (pid {})", name, child.id()));
             Some(child)
         }
         Err(e) => {
-            log(&format!("rbox init: failed to start {}: {}", unit.name, e));
+            log(&format!("rbox init: failed to start {}: {}", name, e));
             None
         }
     }
+}
+
+/// 解析 [Service] Environment 列表为 (VAR, value) 对；跳过非法项。
+fn parse_environment(envs: &[String]) -> Vec<(String, String)> {
+    envs.iter()
+        .filter_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// 一条 fstab 挂载记录：<device> <mountpoint> <type> <options> [<dump> <pass>]。
@@ -549,12 +642,15 @@ fn compute_start_order(units: &HashMap<String, Unit>, root: &str) -> Result<Vec<
 }
 
 /// 启动一个服务（simple 类型），返回运行时实例。
-fn start_service(unit: &Unit, cmd: &str) -> Option<ServiceInstance> {
-    let child = spawn_unit_command(unit, cmd)?;
+fn start_service(unit: &Unit, cmd: &str, env: &[(String, String)]) -> Option<ServiceInstance> {
+    let child = spawn_unit_command(&unit.name, cmd, env)?;
     Some(ServiceInstance {
         name: unit.name.clone(),
         child: Some(child),
         exec_stop: unit.service.exec_stop.clone(),
+        exec_start: cmd.to_string(),
+        env: env.to_vec(),
+        restart_on_failure: unit.service.restart == "on-failure",
     })
 }
 
@@ -580,6 +676,72 @@ fn parse_cmdline(s: &str) -> Vec<String> {
     argv
 }
 
+/// 创建 status 查询 socket（非阻塞）；失败时返回 None（不影响启动）。
+fn create_status_listener() -> Option<UnixListener> {
+    match UnixListener::bind(STATUS_SOCKET) {
+        Ok(l) => {
+            let _ = l.set_nonblocking(true);
+            Some(l)
+        }
+        Err(e) => {
+            log(&format!("rbox init: status socket failed: {}", e));
+            None
+        }
+    }
+}
+
+/// 处理一次 status 查询连接：读一行请求，回写状态文本，关闭。
+/// 读请求带 100ms 超时，避免异常客户端挂住主循环。
+fn handle_status_connection(
+    mut stream: UnixStream,
+    console_name: &str,
+    console: Option<&std::process::Child>,
+    services: &[ServiceInstance],
+) {
+    let mut req = String::new();
+    if let Ok(peer) = stream.try_clone() {
+        let mut reader = std::io::BufReader::new(peer);
+        let _ = reader.read_line(&mut req);
+    }
+    let resp = format_status(&req, console_name, console, services);
+    let _ = stream.write_all(resp.as_bytes());
+}
+
+/// 生成 status 响应文本。请求为空时列出全部；`status <unit>` 查单个。
+fn format_status(
+    req: &str,
+    console_name: &str,
+    console: Option<&std::process::Child>,
+    services: &[ServiceInstance],
+) -> String {
+    let req = req.trim();
+    let mut out = String::new();
+    let unit = req.strip_prefix("status ").map(str::trim).unwrap_or("");
+
+    if unit.is_empty() {
+        out.push_str(&format!("init pid={}\n", std::process::id()));
+        match console {
+            Some(c) => out.push_str(&format!("{} running pid={}\n", console_name, c.id())),
+            None => out.push_str(&format!("{} stopped\n", console_name)),
+        }
+        for svc in services {
+            out.push_str(&svc.status_line());
+        }
+    } else if unit == "init" {
+        out.push_str(&format!("init pid={}\n", std::process::id()));
+    } else if unit == console_name {
+        match console {
+            Some(c) => out.push_str(&format!("{} running pid={}\n", console_name, c.id())),
+            None => out.push_str(&format!("{} stopped\n", console_name)),
+        }
+    } else if let Some(svc) = services.iter().find(|s| s.name == unit) {
+        out.push_str(&svc.status_line());
+    } else {
+        out.push_str(&format!("unknown unit: {}\n", unit));
+    }
+    out
+}
+
 /// 往 console 输出日志。
 fn log(msg: &str) {
     let mut stderr = std::io::stderr();
@@ -589,9 +751,9 @@ fn log(msg: &str) {
 
 // ─── 系统调用封装（使用 libc crate）──────────────────
 
-/// 发送信号给指定进程。
-fn kill_process(pid: u32, sig: i32) -> std::io::Result<()> {
-    let rc = unsafe { libc::kill(pid as i32, sig) };
+/// 发送信号给进程组（pgid 由组首进程 pid 表示，kill 负 pid）。
+fn kill_process_group(pgid: u32, sig: i32) -> std::io::Result<()> {
+    let rc = unsafe { libc::kill(-(pgid as i32), sig) };
     if rc == 0 {
         Ok(())
     } else {
@@ -649,6 +811,9 @@ mod tests {
                 typ: "simple".to_string(),
                 exec_start: None,
                 exec_stop: None,
+                restart: String::new(),
+                environment: Vec::new(),
+                console: false,
             },
             install: InstallSection {
                 wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),
@@ -780,5 +945,67 @@ mod tests {
             libc::MS_RDONLY | libc::MS_NOEXEC | libc::MS_NOSUID
         );
         assert_eq!(parse_mount_flags("unknownopt"), 0);
+    }
+
+    #[test]
+    fn parse_environment_basic() {
+        let env = parse_environment(&["A=1".into(), "B=two words".into()]);
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "two words".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_environment_skips_invalid() {
+        let env = parse_environment(&["A=1".into(), "NOEQUALS".into(), "=v".into()]);
+        assert_eq!(env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    /// 构造一个测试用 ServiceInstance。
+    fn svc(name: &str, restart_on_failure: bool) -> ServiceInstance {
+        ServiceInstance {
+            name: name.to_string(),
+            child: None,
+            exec_stop: None,
+            exec_start: "/bin/rbox false".to_string(),
+            env: Vec::new(),
+            restart_on_failure,
+        }
+    }
+
+    #[test]
+    fn format_status_lists_all() {
+        let services = vec![svc("a.service", false), svc("b.service", true)];
+        let out = format_status("", "console-shell.service", None, &services);
+        assert!(out.contains("init pid="), "out: {}", out);
+        assert!(
+            out.contains("console-shell.service stopped"),
+            "out: {}",
+            out
+        );
+        assert!(out.contains("a.service exited"), "out: {}", out);
+        assert!(
+            out.contains("b.service exited restart=on-failure"),
+            "out: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn format_status_single_unit() {
+        let services = vec![svc("a.service", false)];
+        let out = format_status("status a.service", "console-shell.service", None, &services);
+        assert!(out.contains("a.service exited"), "out: {}", out);
+        assert!(!out.contains("init pid="), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_unknown_unit() {
+        let out = format_status("status ghost.service", "console-shell.service", None, &[]);
+        assert!(out.contains("unknown unit: ghost.service"), "out: {}", out);
     }
 }

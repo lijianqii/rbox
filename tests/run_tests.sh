@@ -1,17 +1,32 @@
 #!/bin/bash
 # rbox 集成测试脚本
 # 在 QEMU 全系统模拟中运行预设命令并验证输出
+#
+# 测试专用服务（tests/units/*.toml）在运行时注入 rootfs 并打包独立的
+# 测试 initramfs，测试结束后自动清理，生产 rootfs 保持干净。
 set -e
 
 cd "$(dirname "$0")/.."
 
 KERNEL=kernel/arch/arm64/boot/Image
 INITRD=initramfs.cpio.gz
+TEST_INITRD=initramfs.test.cpio.gz
+UNITS_DIR=rootfs/etc/rbox/system
 QEMU="qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic"
 APPEND="console=ttyAMA0 rdinit=/init"
 
 PASS=0
 FAIL=0
+
+# ─── 注入测试服务 + 打包测试 initramfs ───────────────
+cp tests/units/*.toml "$UNITS_DIR"/
+(cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip > ../$TEST_INITRD)
+
+cleanup() {
+    rm -f "$TEST_INITRD"
+    rm -f "$UNITS_DIR/hello.service.toml" "$UNITS_DIR/restart-test.service.toml"
+}
+trap cleanup EXIT
 
 # 单次 QEMU 运行所有测试命令
 # 命令序列本身约 25 秒，超时需留足内核启动余量（负载高时启动会变慢）
@@ -38,10 +53,13 @@ OUT=$(timeout 90 bash -c '
   printf "cat /tmp/a /tmp/b | cat\n"; sleep 0.5
   printf "echo appended >> /tmp/a\n"; sleep 0.5
   printf "cat /tmp/a\n"; sleep 0.5
+  # 服务管理：env 注入、status 查询、Restart=on-failure
+  printf "rbox status\n"; sleep 0.5
+  printf "rbox status hello.service\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
-  -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"'"
+  -kernel '"$KERNEL"' -initrd '"$TEST_INITRD"' -append "'"$APPEND"'"
 ' 2>&1) || true
 
 # 断言输出包含某字符串
@@ -87,6 +105,16 @@ assert_contains "fstab 挂载 proc" "mounting proc on /proc"
 assert_contains "挂载基本文件系统" "basic filesystems mounted"
 assert_contains "加载 TOML 单元" "loaded"
 assert_contains "达到 default.target" "reached target"
+
+echo ""
+echo "[服务管理]"
+assert_contains "Environment= 注入 HELLO" "HELLO=world"
+assert_contains "Restart=on-failure 自动重启" "restarting restart-test.service"
+assert_contains "status 列出 console" "console-shell.service"
+assert_contains "status 列出重启服务" "restart-test.service"
+assert_contains "status 单服务查询" "hello.service"
+assert_contains "status 显示重启策略" "restart=on-failure"
+
 
 echo ""
 echo "[关机流程]"

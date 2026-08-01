@@ -26,3 +26,4 @@ pub mod env;
 pub mod printf;
 pub mod basename;
 pub mod dirname;
+pub mod status;

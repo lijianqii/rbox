@@ -48,4 +48,5 @@ pub static APPLETS: &[&dyn Applet] = &[
     crate::applets::printf::PRINTF,
     crate::applets::basename::BASENAME,
     crate::applets::dirname::DIRNAME,
+    crate::applets::status::STATUS,
 ];

@@ -82,6 +82,7 @@ rbox/
 │       ├── mod.rs          # 子模块声明
 │       ├── init.rs         # PID 1 系统初始化（systemd 风格，TOML 配置）
 │       ├── shell.rs        # 命令解释器（管道 + 重定向 + 内置命令）
+│       ├── status.rs       # status [unit]（unix socket 查询 init 服务状态）
 │       ├── true_.rs        # true
 │       ├── false_.rs       # false
 │       ├── echo.rs         # echo [-n]
@@ -106,7 +107,8 @@ rbox/
 │       ├── env.rs          # env [VAR=val] [cmd]
 │       ├── printf.rs       # printf FORMAT [args]
 │       ├── basename.rs     # basename PATH [SUFFIX]
-│       └── dirname.rs      # dirname PATH
+│       ├── dirname.rs      # dirname PATH
+│       └── status.rs       # status [unit]（unix socket 查询 init 服务状态）
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接
 │   ├── bin/
@@ -119,7 +121,8 @@ rbox/
 ├── initramfs.cpio.gz       # 打包好的 initramfs
 ├── kernel/                 # Linux 内核源码 + 编译产物
 └── tests/
-    └── run_tests.sh        # 集成测试脚本
+    ├── run_tests.sh        # 集成测试脚本（注入 tests/units 测试服务）
+    └── units/              # 测试专用服务单元（运行时注入 rootfs，不入生产镜像）
 ```
 ## 架构设计
 
@@ -172,7 +175,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 27 个 applet：
+共 28 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -203,9 +206,10 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 25 | printf | printf FORMAT [args] | 格式化输出（%s/%d/%x/%c） |
 | 26 | basename | basename PATH [SUFFIX] | 取文件名部分 |
 | 27 | dirname | dirname PATH | 取目录部分 |
+| 28 | status | status [unit] | 通过 unix socket 查询 init 服务状态 |
 ## Shell
 
-文件：src/applets/shell.rs（555 行，含单元测试）
+文件：src/applets/shell.rs（含单元测试）
 
 一个极简的命令解释器，REPL 循环读取一行输入并执行。提示符：`rbox# `
 
@@ -250,7 +254,7 @@ enum Token {
 默认 PATH 由 init（PID 1）启动时统一设置，shell 直接继承，不再自行设置。
 ## Init
 
-文件：src/applets/init.rs（646 行，含单元测试）
+文件：src/applets/init.rs（含单元测试）
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
@@ -270,6 +274,9 @@ Requires = ["network.service"]     # 可选：硬依赖
 Type = "simple"                    # 仅支持 simple
 ExecStart = "/bin/rbox echo hello" # 启动命令
 ExecStop = "/bin/rbox echo bye"    # 可选：关机时执行的停止命令
+Environment = ["HELLO=world"]      # 可选：服务环境变量
+Restart = "on-failure"             # 可选：非零退出自动重启（默认 no）
+Console = true                     # 可选：前台 console 服务（如交互 shell，退出自动 respawn）
 
 [Install]
 WantedBy = ["default.target"]      # 被哪个 target 拉入
@@ -283,10 +290,13 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
-5. **启动服务**：按排序结果依次 fork+exec ExecStart，记录 Child 句柄和 ExecStop；console-shell.service 作为前台 shell 等待
-6. **常驻**：主循环同时回收 console shell（退出则 respawn）与已退出的服务进程（try_wait，避免僵尸）；检测关机标志
+5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop；`Console = true` 的服务作为前台 console 等待
+6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；通过 `/tmp/rbox.sock` 响应 `rbox status` 查询；检测关机标志
 
 `Type=` 目前仅支持 `simple`，遇到其他值会打印警告并按 simple 处理。
+`Restart=` 目前仅支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
+
+关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。
 
 ### 关机/重启流程
 
@@ -313,7 +323,7 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 | 函数 | 用途 | 使用位置 |
 |------|------|----------|
 | libc::mount | 挂载 /etc/fstab 列出的文件系统 | init.rs |
-| libc::signal | 注册 SIGTERM/SIGINT 处理器 | init.rs |
+| libc::sigaction | 注册 SIGTERM/SIGINT 处理器（SA_RESTART） | init.rs |
 | libc::kill | 向进程/所有进程发送信号 | init.rs, shutdown.rs, reboot.rs |
 | libc::sync | 刷新文件系统缓冲 | init.rs |
 | libc::reboot | 关机 (RB_POWER_OFF) / 重启 (RB_AUTOBOOT) | init.rs |
@@ -323,13 +333,14 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 
 libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手动传递 magic number。
 
-### 当前 TOML 单元文件
+### 当前 TOML 单元文件（生产 rootfs）
 
 | 文件 | 类型 | 说明 |
 |------|------|------|
 | default.target.toml | target | 启动根节点 |
-| console-shell.service.toml | service | ExecStart=/bin/rbox shell，前台交互 shell |
-| hello.service.toml | service | 测试用，含 ExecStart + ExecStop，验证有序关机 |
+| console-shell.service.toml | service | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
+
+测试专用服务（hello.service：Environment/ExecStop；restart-test.service：Restart=on-failure）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
 
 ### fstab 挂载表
 
@@ -404,6 +415,8 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 集成测试通过单次 QEMU 启动运行所有测试命令，捕获输出并用 grep 断言。
 
+测试专用服务单元（`tests/units/`）在脚本运行时注入 `rootfs/etc/rbox/system/`，打包独立的 `initramfs.test.cpio.gz` 供 QEMU 使用；测试结束（含中断）通过 trap 自动清理注入文件与测试镜像，生产 rootfs 与 `make run` 用的 `initramfs.cpio.gz` 保持干净。
+
 ### 测试覆盖
 
 | 类别 | 测试项 | 数量 |
@@ -412,8 +425,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 | 文件操作 | 重定向写入、cp、ls | 3 |
 | 管道与重定向 | 管道 cat\|cat、追加写入 | 3 |
 | init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
+| 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **18** |
+| **合计** | | **24** |
 
 ### 运行测试
 
@@ -434,8 +448,8 @@ make unittest
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
 | shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射） | 12 |
-| **合计** | | **23** |
+| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知） | 17 |
+| **合计** | | **28** |
 
 测试结果示例：
 
@@ -483,10 +497,9 @@ rootfs/
     ├── hostname                 # 测试文件
     ├── fstab                    # init 挂载表
     └── rbox/
-        └── system/              # init TOML 单元文件
+        └── system/              # init TOML 单元文件（生产：仅 default.target + console-shell）
             ├── default.target.toml
-            ├── console-shell.service.toml
-            └── hello.service.toml
+            └── console-shell.service.toml
 ```
 
 glibc 运行时从交叉编译器的 multiarch 库目录拷贝（用 `-print-file-name` 解析真实路径，`-print-sysroot` 在部分发行版上不可靠）：
@@ -569,16 +582,19 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 
 ### 第三优先级：Init 增强
 
-| 功能 | 说明 |
-|------|------|
-| Type=forking | 支持 forking 类型服务（等待 PID 文件） |
-| Restart=on-failure | 服务退出后自动重启 |
-| ExecReload | 重新加载配置 |
-| Environment= | 服务环境变量 |
-| 前台/后台服务区分 | 非 console 服务 fork 后不阻塞 |
-| 服务状态查询 | rbox status / rbox list-units |
-| 多 target 切换 | boot.target / multi-user.target / rescue.target |
-| 依赖更精细控制 | Wants= / Requisite= / Before= |
+以下功能已在后续迭代中实现：
+
+| 功能 | 说明 | 状态 |
+|------|------|------|
+| Restart=on-failure | 服务退出后自动重启 | ✅ 已实现 |
+| Environment= | 服务环境变量 | ✅ 已实现 |
+| 前台/后台服务区分 | Console=true 显式标记 | ✅ 已实现 |
+| 服务状态查询 | rbox status / status <unit>（unix socket） | ✅ 已实现 |
+| 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
+| Type=forking | 支持 forking 类型服务（等待 PID 文件） | 未实现 |
+| ExecReload | 重新加载配置 | 未实现 |
+| 多 target 切换 | boot.target / multi-user.target / rescue.target | 未实现 |
+| 依赖更精细控制 | Wants= / Requisite= / Before= | 未实现 |
 
 ### 第四优先级：工程化进阶
 
@@ -603,7 +619,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 ### 常见问题
 
 **Q: 为什么用 libc crate 而不是直接 FFI？**
-A: 早期版本使用直接 extern "C" FFI 声明系统调用，但存在类型安全、平台兼容性和维护性问题。现已全面改用 libc crate，统一管理所有系统调用：mount/signal/kill/sync/reboot/uname/time/localtime_r/utimensat 等。
+A: 早期版本使用直接 extern "C" FFI 声明系统调用，但存在类型安全、平台兼容性和维护性问题。现已全面改用 libc crate，统一管理所有系统调用：mount/sigaction/kill/sync/reboot/uname/time/localtime_r/utimensat 等。
 
 **Q: 为什么用 glibc 而不是 musl？**
 A: 用户选择 glibc 动态链接（aarch64-unknown-linux-gnu）。后续可以切换到 musl 静态链接以简化 rootfs。

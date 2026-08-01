@@ -1,11 +1,12 @@
 [Unit]
-Description = "Hello service (test ExecStop)"
+Description = "Hello service (test Environment/ExecStop)"
 After = []
 Requires = []
 
 [Service]
 Type = "simple"
-ExecStart = "/bin/rbox echo hello-service-started"
+ExecStart = "/bin/rbox env"
+Environment = ["HELLO=world"]
 ExecStop = "/bin/rbox echo hello-service-stopping"
 
 [Install]
