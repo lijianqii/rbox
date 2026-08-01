@@ -1,30 +1,6 @@
-//! 所有 applet 子模块的入口。
-pub mod true_;
-pub mod false_;
-pub mod echo;
-pub mod cat;
-pub mod pwd;
-pub mod uname;
-pub mod init;
-pub mod shell;
-pub mod ls;
-pub mod cp;
-pub mod mv;
-pub mod rm;
-pub mod mkdir;
-pub mod touch;
-pub mod shutdown;
-pub mod reboot;
-pub mod head;
-pub mod tail;
-pub mod wc;
-pub mod grep;
-pub mod ln;
-pub mod date;
-pub mod sleep;
-pub mod env;
-pub mod printf;
-pub mod basename;
-pub mod dirname;
-pub mod status;
-pub mod rservice;
+//! 所有 applet 子模块的入口，按功能分四组：
+//! core（系统核心）/ file（文件操作）/ text（文本处理）/ sys（系统工具）。
+pub mod core;
+pub mod file;
+pub mod text;
+pub mod sys;

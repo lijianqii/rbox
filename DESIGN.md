@@ -78,37 +78,18 @@ rbox/
 ├── src/
 │   ├── main.rs             # 入口，argv[0]/subcommand 分发 + --list/--help/--version
 │   ├── applet.rs           # Applet trait + 全局 APPLETS 注册表
-│   └── applets/
+│   └── applets/            # 按功能分四组（core/file/text/sys）
 │       ├── mod.rs          # 子模块声明
-│       ├── init.rs         # PID 1 系统初始化（systemd 风格，TOML 配置）
-│       ├── shell.rs        # 命令解释器（管道 + 重定向 + 内置命令）
-│       ├── status.rs       # status [unit]（unix socket 查询 init 服务状态）
-│       ├── rservice.rs     # rservice（unix socket 管理 init 服务：start/stop/restart）
-│       ├── true_.rs        # true
-│       ├── false_.rs       # false
-│       ├── echo.rs         # echo [-n]
-│       ├── cat.rs          # cat [files...]
-│       ├── pwd.rs          # pwd
-│       ├── uname.rs        # uname [-asnrvm]
-│       ├── ls.rs           # ls [-a] [-l] [-1]
-│       ├── cp.rs           # cp SOURCE DEST
-│       ├── mv.rs           # mv SOURCE DEST
-│       ├── rm.rs           # rm [-r] [-f]
-│       ├── mkdir.rs        # mkdir [-p]
-│       ├── touch.rs        # touch FILES...
-│       ├── shutdown.rs     # shutdown（向 PID 1 发 SIGTERM）
-│       ├── reboot.rs       # reboot（reboot 系统调用）
-│       ├── head.rs         # head [-n N]
-│       ├── tail.rs         # tail [-n N]
-│       ├── wc.rs           # wc [-lwc]
-│       ├── grep.rs         # grep [-inv]
-│       ├── ln.rs           # ln [-s]
-│       ├── date.rs         # date
-│       ├── sleep.rs        # sleep N
-│       ├── env.rs          # env [VAR=val] [cmd]
-│       ├── printf.rs       # printf FORMAT [args]
-│       ├── basename.rs     # basename PATH [SUFFIX]
-│       ├── dirname.rs      # dirname PATH
+│       ├── core/           # 系统核心：init、shell、shutdown、reboot、status、rservice
+│       │   ├── init.rs     # PID 1 系统初始化（systemd 风格，TOML 配置）
+│       │   ├── shell.rs    # 命令解释器（管道 + 重定向 + 内置命令）
+│       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
+│       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
+│       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
+│       │   └── rservice.rs # rservice（unix socket 管理 init 服务：start/stop/restart）
+│       ├── file/           # 文件与目录操作：ls、cp、mv、rm、mkdir、touch、ln、cat
+│       ├── text/           # 文本与字符串处理：head、tail、wc、grep、printf、echo、basename、dirname
+│       └── sys/            # 系统信息与进程工具：true、false、pwd、uname、date、sleep、env
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接
 │   ├── bin/
@@ -165,9 +146,9 @@ pub trait Applet: Sync {
 
 ### 新增 Applet 步骤
 
-1. 创建 `src/applets/<name>.rs`，实现 Applet trait
-2. 在 `src/applets/mod.rs` 添加 `pub mod <name>;`
-3. 在 `src/applet.rs` 的 APPLETS 数组添加 `crate::applets::<name>::XXX,`
+1. 创建 `src/applets/<category>/<name>.rs`（按功能选 core/file/text/sys），实现 Applet trait
+2. 在对应 `src/applets/<category>/mod.rs` 添加 `pub mod <name>;`
+3. 在 `src/applet.rs` 的 APPLETS 数组添加 `crate::applets::<category>::<name>::XXX,`
 4. 在 `Makefile` 的 APPLETS 变量添加 applet 名（用于 rootfs 符号链接）
 
 ### Shell 命令查找回退
@@ -210,7 +191,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
 ## Shell
 
-文件：src/applets/shell.rs（含单元测试）
+文件：src/applets/core/shell.rs（含单元测试）
 
 一个极简的命令解释器，REPL 循环读取一行输入并执行。提示符：`rbox# `
 
@@ -255,7 +236,7 @@ enum Token {
 默认 PATH 由 init（PID 1）启动时统一设置，shell 直接继承，不再自行设置。
 ## Init
 
-文件：src/applets/init.rs（含单元测试）
+文件：src/applets/core/init.rs（含单元测试）
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
