@@ -4,10 +4,10 @@
 //! 若文件不存在则创建；若存在则更新访问/修改时间为当前时间。
 
 use crate::applet::Applet;
+use std::ffi::CString;
 use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::ffi::CString;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,11 +46,12 @@ impl Applet for Touch {
 }
 
 fn touch_one(path: &str) -> io::Result<()> {
-    // 先尝试打开（创建），确保文件存在
-    let _ = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(path)?;
+    // 确保文件存在（目录跳过创建，仅更新时间戳）
+    match OpenOptions::new().create(true).write(true).open(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::IsADirectory => {}
+        Err(e) => return Err(e),
+    }
 
     // 设置修改/访问时间为当前时间
     set_file_times(path, SystemTime::now(), SystemTime::now())
@@ -63,13 +64,17 @@ fn set_file_times(path: &str, atime: SystemTime, mtime: SystemTime) -> io::Resul
     let mtv = to_timespec(mtime)?;
 
     let times = [
-        libc::timespec { tv_sec: atv.0, tv_nsec: atv.1 as i64 },
-        libc::timespec { tv_sec: mtv.0, tv_nsec: mtv.1 as i64 },
+        libc::timespec {
+            tv_sec: atv.0,
+            tv_nsec: atv.1 as i64,
+        },
+        libc::timespec {
+            tv_sec: mtv.0,
+            tv_nsec: mtv.1 as i64,
+        },
     ];
 
-    let rc = unsafe {
-        libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0)
-    };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
     if rc == 0 {
         Ok(())
     } else {
@@ -78,8 +83,8 @@ fn set_file_times(path: &str, atime: SystemTime, mtime: SystemTime) -> io::Resul
 }
 
 fn to_timespec(t: SystemTime) -> io::Result<(i64, i64)> {
-    let dur = t.duration_since(UNIX_EPOCH).map_err(|_| {
-        io::Error::new(io::ErrorKind::Other, "time before UNIX epoch")
-    })?;
+    let dur = t
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "time before UNIX epoch"))?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }

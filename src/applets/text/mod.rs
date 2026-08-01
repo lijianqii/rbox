@@ -7,3 +7,4 @@ pub mod printf;
 pub mod echo;
 pub mod basename;
 pub mod dirname;
+pub(crate) mod util;

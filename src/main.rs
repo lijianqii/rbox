@@ -30,13 +30,13 @@ fn main() -> ExitCode {
     let (cmd, args): (&str, &[String]) = if basename == "rbox" {
         // subcommand 模式：rbox <applet> [args...]
         if raw_args.len() < 2 {
-            return print_usage();
+            return print_usage(false);
         }
         let sub = &raw_args[1];
         // 内置元命令
         match sub.as_str() {
             "--list" | "list" => return print_list(),
-            "--help" | "-h" | "help" => return print_usage(),
+            "--help" | "-h" | "help" => return print_usage(true),
             "--version" | "-V" | "version" => return print_version(),
             _ => {}
         }
@@ -47,7 +47,7 @@ fn main() -> ExitCode {
             Some(app) => app.run(&raw_args[1..]),
             None => {
                 eprintln!("rbox: unknown command '{}'", basename);
-                print_usage()
+                print_usage(false)
             }
         };
     };
@@ -57,7 +57,7 @@ fn main() -> ExitCode {
         Some(app) => app.run(args),
         None => {
             eprintln!("rbox: unknown command '{}'", cmd);
-            print_usage()
+            print_usage(false)
         }
     }
 }
@@ -68,8 +68,12 @@ fn applet_for(name: &str) -> Option<&'static dyn Applet> {
     applet::APPLETS.iter().find(|a| a.name() == lookup).copied()
 }
 
-fn print_usage() -> ExitCode {
-    eprintln!("rbox v{} - a busybox-like multi-binary", env!("CARGO_PKG_VERSION"));
+/// 打印用法。`ok=true`（--help）返回成功，其余错误路径返回失败。
+fn print_usage(ok: bool) -> ExitCode {
+    eprintln!(
+        "rbox v{} - a busybox-like multi-binary",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!();
     eprintln!("Usage:");
     eprintln!("  rbox <applet> [args...]   run an applet");
@@ -86,7 +90,11 @@ fn print_usage() -> ExitCode {
             eprintln!("  {:12} {}", app.name(), h);
         }
     }
-    ExitCode::FAILURE
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn print_list() -> ExitCode {

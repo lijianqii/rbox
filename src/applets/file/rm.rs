@@ -5,9 +5,9 @@
 //!   -f       强制（忽略不存在的文件，不报错）
 
 use crate::applet::Applet;
+use crate::applets::file::util::remove_recursive;
 use std::fs;
 use std::io;
-use std::path::Path;
 use std::process::ExitCode;
 
 pub struct Rm;
@@ -72,7 +72,10 @@ fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
             if force {
                 return Ok(());
             }
-            return Err(io::Error::new(io::ErrorKind::NotFound, "no such file or directory"));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such file or directory",
+            ));
         }
     };
 
@@ -80,25 +83,9 @@ fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
         if !recursive {
             return Err(io::Error::new(io::ErrorKind::Other, "is a directory"));
         }
-        remove_dir_recursive(path)?;
+        remove_recursive(path)?;
     } else {
         fs::remove_file(path)?;
     }
-    Ok(())
-}
-
-fn remove_dir_recursive(path: &str) -> io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let sub = Path::new(path).join(&name);
-        let meta = fs::metadata(&sub)?;
-        if meta.is_dir() {
-            remove_dir_recursive(&sub.to_string_lossy())?;
-        } else {
-            fs::remove_file(&sub)?;
-        }
-    }
-    fs::remove_dir(path)?;
     Ok(())
 }

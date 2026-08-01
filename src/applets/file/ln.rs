@@ -6,8 +6,12 @@ pub struct Ln;
 pub static LN: &Ln = &Ln;
 
 impl Applet for Ln {
-    fn name(&self) -> &'static str { "ln" }
-    fn help(&self) -> &'static str { "ln [-s] TARGET LINK - create link (default hard, -s symbolic)" }
+    fn name(&self) -> &'static str {
+        "ln"
+    }
+    fn help(&self) -> &'static str {
+        "ln [-s] TARGET LINK - create link (default hard, -s symbolic)"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
         let mut symbolic = false;
         let mut positional: Vec<&String> = Vec::new();
@@ -15,7 +19,7 @@ impl Applet for Ln {
         for a in args {
             match a.as_str() {
                 "-s" => symbolic = true,
-                "-f" => {} // 强制（目前默认就是覆盖行为）
+                "-f" => {} // 兼容：硬链接已存在时报错（与 GNU 一致），符号链接默认覆盖
                 "-sf" | "-fs" => symbolic = true,
                 s if s.starts_with('-') && s.len() > 1 && s != "--" => {
                     eprintln!("ln: unknown option: {}", s);

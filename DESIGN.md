@@ -80,15 +80,23 @@ rbox/
 │   ├── applet.rs           # Applet trait + 全局 APPLETS 注册表
 │   └── applets/            # 按功能分四组（core/file/text/sys）
 │       ├── mod.rs          # 子模块声明
-│       ├── core/           # 系统核心：init、shell、shutdown、reboot、status、rservice
-│       │   ├── init.rs     # PID 1 系统初始化（systemd 风格，TOML 配置）
+│       ├── core/           # 系统核心 applet + init 内部实现
+│       │   ├── mod.rs      # 模块声明 + 共享 log()（kmsg/console）
+│       │   ├── init/       # PID 1 实现（非 applet，仅 init 使用）
+│       │   │   ├── mod.rs  # 入口：信号、run、主循环（回收/重启/关机）
+│       │   │   ├── units.rs    # 单元 TOML 解析、单元名、拓扑排序
+│       │   │   ├── services.rs # 服务生命周期：spawn/daemon化/重启退避/停止/降权
+│       │   │   ├── server.rs   # 控制协议服务端（status/start/stop/restart/reload）
+│       │   │   ├── mount.rs    # fstab 挂载、hostname、sysctl
+│       │   │   └── syscall.rs  # libc 系统调用封装
+│       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
 │       │   ├── shell.rs    # 命令解释器（管道 + 重定向 + 内置命令）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
 │       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
-│       │   └── rservice.rs # rservice（unix socket 管理 init 服务：start/stop/restart）
-│       ├── file/           # 文件与目录操作：ls、cp、mv、rm、mkdir、touch、ln、cat
-│       ├── text/           # 文本与字符串处理：head、tail、wc、grep、printf、echo、basename、dirname
+│       │   └── rservice.rs # rservice（unix socket 管理 init 服务：start/stop/restart/reload）
+│       ├── file/           # 文件与目录操作：ls、cp、mv、rm、mkdir、touch、ln、cat（+ util.rs 递归删除）
+│       ├── text/           # 文本与字符串处理：head、tail、wc、grep、printf、echo、basename、dirname（+ util.rs 输入遍历）
 │       └── sys/            # 系统信息与进程工具：true、false、pwd、uname、date、sleep、env
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接

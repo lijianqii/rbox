@@ -7,29 +7,66 @@ pub struct Wc;
 pub static WC: &Wc = &Wc;
 
 impl Applet for Wc {
-    fn name(&self) -> &'static str { "wc" }
-    fn help(&self) -> &'static str { "wc [-l] [-w] [-c] [file] - count lines/words/bytes" }
+    fn name(&self) -> &'static str {
+        "wc"
+    }
+    fn help(&self) -> &'static str {
+        "wc [-l] [-w] [-c] [file] - count lines/words/bytes"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
-        let mut count_lines = true;
-        let mut count_words = true;
-        let mut count_bytes = true;
+        // 启用式解析：指定任一选项则只统计指定的；未指定默认全部
+        let mut count_lines = false;
+        let mut count_words = false;
+        let mut count_bytes = false;
+        let mut any_specified = false;
         let mut files: Vec<&String> = Vec::new();
 
         for a in args {
             match a.as_str() {
-                "-l" => { count_words = false; count_bytes = false; }
-                "-w" => { count_lines = false; count_bytes = false; }
-                "-c" => { count_lines = false; count_words = false; }
-                "-lw" | "-wl" => { count_bytes = false; }
-                "-lc" | "-cl" => { count_words = false; }
-                "-wc" | "-cw" => { count_lines = false; }
-                "-lwc" | "-lcw" | "-wlc" | "-wcl" | "-clw" | "-cwl" => {}
+                "-l" => {
+                    count_lines = true;
+                    any_specified = true;
+                }
+                "-w" => {
+                    count_words = true;
+                    any_specified = true;
+                }
+                "-c" => {
+                    count_bytes = true;
+                    any_specified = true;
+                }
+                "-lw" | "-wl" => {
+                    count_lines = true;
+                    count_words = true;
+                    any_specified = true;
+                }
+                "-lc" | "-cl" => {
+                    count_lines = true;
+                    count_bytes = true;
+                    any_specified = true;
+                }
+                "-wc" | "-cw" => {
+                    count_words = true;
+                    count_bytes = true;
+                    any_specified = true;
+                }
+                "-lwc" | "-lcw" | "-wlc" | "-wcl" | "-clw" | "-cwl" => {
+                    count_lines = true;
+                    count_words = true;
+                    count_bytes = true;
+                    any_specified = true;
+                }
                 "-" => {}
                 s if s.starts_with('-') && s.len() > 1 => {
                     eprintln!("wc: unknown option: {}", s);
                 }
                 _ => files.push(a),
             }
+        }
+        if !any_specified {
+            count_lines = true;
+            count_words = true;
+            count_bytes = true;
         }
 
         let mut out = std::io::stdout().lock();
@@ -64,7 +101,16 @@ impl Applet for Wc {
                 }
             }
             if files.len() > 1 {
-                print_wc(total_l, total_w, total_b, "total", count_lines, count_words, count_bytes, &mut out);
+                print_wc(
+                    total_l,
+                    total_w,
+                    total_b,
+                    "total",
+                    count_lines,
+                    count_words,
+                    count_bytes,
+                    &mut out,
+                );
             }
         }
         ExitCode::SUCCESS
@@ -72,14 +118,25 @@ impl Applet for Wc {
 }
 
 fn print_wc(
-    l: usize, w: usize, b: usize, name: &str,
-    cl: bool, cw: bool, cb: bool,
+    l: usize,
+    w: usize,
+    b: usize,
+    name: &str,
+    cl: bool,
+    cw: bool,
+    cb: bool,
     out: &mut std::io::StdoutLock,
 ) {
     let mut parts: Vec<String> = Vec::new();
-    if cl { parts.push(format!("{:>7}", l)); }
-    if cw { parts.push(format!("{:>7}", w)); }
-    if cb { parts.push(format!("{:>7}", b)); }
+    if cl {
+        parts.push(format!("{:>7}", l));
+    }
+    if cw {
+        parts.push(format!("{:>7}", w));
+    }
+    if cb {
+        parts.push(format!("{:>7}", b));
+    }
     if name.is_empty() {
         let _ = writeln!(out, "{}", parts.join(" "));
     } else {

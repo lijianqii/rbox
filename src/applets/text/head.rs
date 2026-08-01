@@ -1,62 +1,27 @@
 //! `head` - 输出文件前 N 行。
 use crate::applet::Applet;
-use std::io::{Read, Write};
+use crate::applets::text::util::{each_input, parse_n_files};
+use std::io::Write;
 use std::process::ExitCode;
 
 pub struct Head;
 pub static HEAD: &Head = &Head;
 
 impl Applet for Head {
-    fn name(&self) -> &'static str { "head" }
-    fn help(&self) -> &'static str { "head [-n N] [file] - print first N lines (default 10)" }
+    fn name(&self) -> &'static str {
+        "head"
+    }
+    fn help(&self) -> &'static str {
+        "head [-n N] [file] - print first N lines (default 10)"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
-        let mut n: usize = 10;
-        let mut files: Vec<&String> = Vec::new();
-
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "-n" => {
-                    i += 1;
-                    if i < args.len() {
-                        n = args[i].parse().unwrap_or(10);
-                    }
-                }
-                s if s.starts_with("-n") && s.len() > 2 => {
-                    n = s[2..].parse().unwrap_or(10);
-                }
-                "-" => { /* stdin */ }
-                s if s.starts_with('-') && s.len() > 1 => {
-                    eprintln!("head: unknown option: {}", s);
-                }
-                _ => files.push(&args[i]),
-            }
-            i += 1;
-        }
-
+        let (n, files) = parse_n_files(args, "head");
         let mut out = std::io::stdout().lock();
-        let print_lines = |content: &str, n: usize, out: &mut std::io::StdoutLock| {
+        each_input(&files, "head", &mut out, |content, out| {
             for line in content.lines().take(n) {
                 let _ = writeln!(out, "{}", line);
             }
-        };
-
-        if files.is_empty() {
-            let mut buf = String::new();
-            if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
-                print_lines(&buf, n, &mut out);
-            }
-        } else {
-            for f in &files {
-                if files.len() > 1 {
-                    let _ = writeln!(out, "==> {} <==", f);
-                }
-                match std::fs::read_to_string(f) {
-                    Ok(content) => print_lines(&content, n, &mut out),
-                    Err(e) => eprintln!("head: {}: {}", f, e),
-                }
-            }
-        }
+        });
         ExitCode::SUCCESS
     }
 }

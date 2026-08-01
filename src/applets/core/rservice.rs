@@ -1,17 +1,14 @@
-//! `rservice` - 服务管理：列出/启动/停止/重启服务。
+//! `rservice` - 服务管理：列出/启动/停止/重启/重载服务。
 //!
 //! 通过 unix socket (/tmp/rbox.sock) 与 PID 1 通信：
 //! - `rservice` / `rservice list`             列出所有服务状态
 //! - `rservice status [unit]`                 查询单个服务
-//! - `rservice start|stop|restart <unit>`     启动/停止/重启服务
+//! - `rservice start|stop|restart|reload <unit>` 管理服务
 
 use crate::applet::Applet;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use crate::applets::core::control::send_request;
+use std::io::Write;
 use std::process::ExitCode;
-
-/// 与 init.rs 的 STATUS_SOCKET 保持一致。
-const STATUS_SOCKET: &str = "/tmp/rbox.sock";
 
 pub struct Rservice;
 pub static RSERVICE: &Rservice = &Rservice;
@@ -46,27 +43,15 @@ impl Applet for Rservice {
             return ExitCode::from(2);
         };
 
-        let mut stream = match UnixStream::connect(STATUS_SOCKET) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("rservice: cannot connect to init: {}", e);
-                return ExitCode::from(1);
-            }
-        };
-        if stream.write_all(format!("{}\n", req).as_bytes()).is_err() {
-            eprintln!("rservice: write failed");
-            return ExitCode::from(1);
-        }
-        let mut resp = String::new();
-        match stream.read_to_string(&mut resp) {
-            Ok(_) => {
+        match send_request(&req) {
+            Ok(resp) => {
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(resp.as_bytes());
                 let _ = out.flush();
                 ExitCode::SUCCESS
             }
             Err(e) => {
-                eprintln!("rservice: read error: {}", e);
+                eprintln!("rservice: {}", e);
                 ExitCode::from(1)
             }
         }

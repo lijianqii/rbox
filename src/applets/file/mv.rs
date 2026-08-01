@@ -4,6 +4,7 @@
 //!       mv SOURCE... DIRECTORY
 
 use crate::applet::Applet;
+use crate::applets::file::util::remove_recursive;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -97,22 +98,6 @@ fn copy_recursive(src: &str, dest: &std::path::Path) -> io::Result<()> {
         let mut f_in = fs::File::open(src)?;
         let mut f_out = fs::File::create(dest)?;
         io::copy(&mut f_in, &mut f_out)?;
-    }
-    Ok(())
-}
-
-/// 简单递归删除（跨文件系统 mv 用）。
-fn remove_recursive(src: &str) -> io::Result<()> {
-    let meta = fs::metadata(src)?;
-    if meta.is_dir() {
-        for entry in fs::read_dir(src)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            remove_recursive(&Path::new(src).join(&name).to_string_lossy())?;
-        }
-        fs::remove_dir(src)?;
-    } else {
-        fs::remove_file(src)?;
     }
     Ok(())
 }
