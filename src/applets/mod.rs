@@ -27,3 +27,4 @@ pub mod printf;
 pub mod basename;
 pub mod dirname;
 pub mod status;
+pub mod rservice;

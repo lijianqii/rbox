@@ -1,0 +1,9 @@
+[Unit]
+Description = "Long-running test service (rservice start/stop/restart)"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sleep 100"
+
+[Install]
+WantedBy = ["default.target"]

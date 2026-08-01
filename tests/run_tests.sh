@@ -24,15 +24,15 @@ cp tests/units/*.toml "$UNITS_DIR"/
 
 cleanup() {
     rm -f "$TEST_INITRD"
-    rm -f "$UNITS_DIR/hello.service.toml" "$UNITS_DIR/restart-test.service.toml"
+    rm -f "$UNITS_DIR/hello.service.toml" "$UNITS_DIR/restart-test.service.toml" "$UNITS_DIR/longrun.service.toml"
 }
 trap cleanup EXIT
 
 # 单次 QEMU 运行所有测试命令
-# 命令序列本身约 25 秒，超时需留足内核启动余量（负载高时启动会变慢）
-OUT=$(timeout 90 bash -c '
+# 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
+OUT=$(timeout 120 bash -c '
 {
-  sleep 8
+  sleep 12
   # 基本 applet
   printf "uname -m\n"; sleep 0.5
   printf "pwd\n"; sleep 0.5
@@ -56,6 +56,11 @@ OUT=$(timeout 90 bash -c '
   # 服务管理：env 注入、status 查询、Restart=on-failure
   printf "rbox status\n"; sleep 0.5
   printf "rbox status hello.service\n"; sleep 0.5
+  # rservice：stop/start/restart/list
+  printf "rservice stop longrun.service\n"; sleep 0.5
+  printf "rservice start longrun.service\n"; sleep 0.5
+  printf "rservice restart longrun.service\n"; sleep 0.5
+  printf "rservice list\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
@@ -114,6 +119,14 @@ assert_contains "status 列出 console" "console-shell.service"
 assert_contains "status 列出重启服务" "restart-test.service"
 assert_contains "status 单服务查询" "hello.service"
 assert_contains "status 显示重启策略" "restart=on-failure"
+
+
+echo ""
+echo "[rservice 管理]"
+assert_contains "rservice stop" "longrun.service stopped"
+assert_contains "rservice start" "longrun.service started"
+assert_contains "rservice restart" "longrun.service started"
+assert_contains "rservice list 显示服务" "longrun.service"
 
 
 echo ""

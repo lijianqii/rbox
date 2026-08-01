@@ -49,4 +49,5 @@ pub static APPLETS: &[&dyn Applet] = &[
     crate::applets::basename::BASENAME,
     crate::applets::dirname::DIRNAME,
     crate::applets::status::STATUS,
+    crate::applets::rservice::RSERVICE,
 ];

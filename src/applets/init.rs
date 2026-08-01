@@ -130,6 +130,8 @@ struct ServiceInstance {
     /// 服务环境变量（已解析的 VAR=value 对）
     env: Vec<(String, String)>,
     restart_on_failure: bool,
+    /// stop 请求后标记：禁止自动重启（Restart=on-failure 也不重启）
+    stopped: bool,
 }
 
 impl ServiceInstance {
@@ -142,7 +144,10 @@ impl ServiceInstance {
         };
         match &self.child {
             Some(c) => format!("{} running pid={}{}\n", self.name, c.id(), restart),
-            None => format!("{} exited{}\n", self.name, restart),
+            None => {
+                let state = if self.stopped { "stopped" } else { "exited" };
+                format!("{} {}{}\n", self.name, state, restart)
+            }
         }
     }
 }
@@ -178,7 +183,14 @@ impl Applet for Init {
             }
             Err(e) => {
                 log(&format!("rbox init: failed to load units: {}", e));
-                return reap_with_shutdown(None, "console-shell.service", &mut Vec::new(), None);
+                let empty: HashMap<String, Unit> = HashMap::new();
+                return reap_with_shutdown(
+                    None,
+                    "console-shell.service",
+                    &mut Vec::new(),
+                    &empty,
+                    None,
+                );
             }
         };
 
@@ -190,7 +202,14 @@ impl Applet for Init {
             }
             Err(e) => {
                 log(&format!("rbox init: dependency error: {}", e));
-                return reap_with_shutdown(None, "console-shell.service", &mut Vec::new(), None);
+                let empty: HashMap<String, Unit> = HashMap::new();
+                return reap_with_shutdown(
+                    None,
+                    "console-shell.service",
+                    &mut Vec::new(),
+                    &empty,
+                    None,
+                );
             }
         };
 
@@ -238,9 +257,15 @@ impl Applet for Init {
 
         log("rbox init: startup complete");
 
-        // 5. 主循环：回收子进程、响应 status 查询，等待关机标志
+        // 5. 主循环：回收子进程、响应控制请求，等待关机标志
         let status_listener = create_status_listener();
-        reap_with_shutdown(console_child, &console_name, &mut services, status_listener)
+        reap_with_shutdown(
+            console_child,
+            &console_name,
+            &mut services,
+            &units,
+            status_listener,
+        )
     }
 }
 
@@ -257,11 +282,12 @@ fn install_signal_handlers() {
 }
 
 /// 主循环：管理 console shell（退出则 respawn）、回收/重启服务、
-/// 响应 status 查询，检测关机标志。
+/// 响应 rservice/rbox status 控制请求，检测关机标志。
 fn reap_with_shutdown(
     mut console: Option<std::process::Child>,
     console_name: &str,
-    services: &mut [ServiceInstance],
+    services: &mut Vec<ServiceInstance>,
+    units: &HashMap<String, Unit>,
     status_listener: Option<UnixListener>,
 ) -> ExitCode {
     loop {
@@ -296,8 +322,10 @@ fn reap_with_shutdown(
                         svc.name,
                         status.code()
                     ));
-                    let restart =
-                        svc.restart_on_failure && !status.success() && !shutdown_requested();
+                    let restart = svc.restart_on_failure
+                        && !status.success()
+                        && !shutdown_requested()
+                        && !svc.stopped;
                     svc.child = None;
                     if restart {
                         log(&format!(
@@ -310,10 +338,10 @@ fn reap_with_shutdown(
             }
         }
 
-        // 2.5 响应 status 查询（rbox status）
+        // 2.5 响应控制请求（rbox status / rservice）
         if let Some(listener) = &status_listener {
             if let Ok((stream, _)) = listener.accept() {
-                handle_status_connection(stream, console_name, console.as_ref(), services);
+                handle_control_connection(stream, console_name, console.as_ref(), services, units);
             }
         }
 
@@ -331,38 +359,11 @@ fn reap_with_shutdown(
     }
 }
 
-/// 执行有序关机：逆序执行 ExecStop，终止服务进程，杀残留进程，再 power off。
+/// 执行有序关机：逆序停止服务，杀残留进程，再 power off。
 fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
     log("rbox init: shutting down");
     for svc in services.iter_mut().rev() {
-        if let Some(stop_cmd) = &svc.exec_stop {
-            log(&format!("rbox init: stopping {}: {}", svc.name, stop_cmd));
-            let argv = parse_cmdline(stop_cmd);
-            if !argv.is_empty() {
-                let _ = std::process::Command::new(&argv[0])
-                    .args(&argv[1..])
-                    .status();
-            }
-        }
-        // 优雅终止：向整个进程组发 SIGTERM 等 1 秒，超时 SIGKILL
-        if let Some(mut child) = svc.child.take() {
-            let _ = kill_process_group(child.id(), libc::SIGTERM);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => {
-                        if std::time::Instant::now() >= deadline {
-                            let _ = kill_process_group(child.id(), libc::SIGKILL);
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                    Err(_) => break,
-                }
-            }
-            let _ = child.wait();
-        }
+        stop_service_instance(svc);
     }
     log("rbox init: sending SIGTERM to all processes");
     let _ = kill_all(libc::SIGTERM);
@@ -651,6 +652,7 @@ fn start_service(unit: &Unit, cmd: &str, env: &[(String, String)]) -> Option<Ser
         exec_start: cmd.to_string(),
         env: env.to_vec(),
         restart_on_failure: unit.service.restart == "on-failure",
+        stopped: false,
     })
 }
 
@@ -690,21 +692,177 @@ fn create_status_listener() -> Option<UnixListener> {
     }
 }
 
-/// 处理一次 status 查询连接：读一行请求，回写状态文本，关闭。
+/// 处理一次控制连接：读一行请求，分发到 status/start/stop/restart，回写响应，关闭。
 /// 读请求带 100ms 超时，避免异常客户端挂住主循环。
-fn handle_status_connection(
+fn handle_control_connection(
     mut stream: UnixStream,
     console_name: &str,
     console: Option<&std::process::Child>,
-    services: &[ServiceInstance],
+    services: &mut Vec<ServiceInstance>,
+    units: &HashMap<String, Unit>,
 ) {
     let mut req = String::new();
     if let Ok(peer) = stream.try_clone() {
         let mut reader = std::io::BufReader::new(peer);
         let _ = reader.read_line(&mut req);
     }
-    let resp = format_status(&req, console_name, console, services);
+    let resp = match parse_control_request(&req) {
+        Ok(r) => execute_control_request(r, console_name, console, services, units),
+        Err(e) => format!("error: {}\n", e),
+    };
     let _ = stream.write_all(resp.as_bytes());
+}
+
+/// 控制请求：status 查询或服务管理命令。
+#[derive(Debug, PartialEq)]
+enum ControlRequest<'a> {
+    /// status [unit]：unit 为 None 时列出全部
+    Status(Option<&'a str>),
+    Start(&'a str),
+    Stop(&'a str),
+    Restart(&'a str),
+}
+
+/// 解析控制请求行；空行等价于 status（列出全部）。
+fn parse_control_request(req: &str) -> Result<ControlRequest<'_>, String> {
+    let req = req.trim();
+    let mut parts = req.splitn(2, ' ');
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
+    match cmd {
+        "" | "status" => Ok(ControlRequest::Status(arg)),
+        "start" | "stop" | "restart" => match arg {
+            Some(unit) => Ok(match cmd {
+                "start" => ControlRequest::Start(unit),
+                "stop" => ControlRequest::Stop(unit),
+                _ => ControlRequest::Restart(unit),
+            }),
+            None => Err(format!("usage: {} <unit>", cmd)),
+        },
+        other => Err(format!("unknown command: {}", other)),
+    }
+}
+
+/// 执行控制请求，返回响应文本。
+fn execute_control_request(
+    req: ControlRequest<'_>,
+    console_name: &str,
+    console: Option<&std::process::Child>,
+    services: &mut Vec<ServiceInstance>,
+    units: &HashMap<String, Unit>,
+) -> String {
+    match req {
+        ControlRequest::Status(unit) => {
+            format_status(unit.unwrap_or(""), console_name, console, services)
+        }
+        ControlRequest::Start(name) => do_start(name, services, units),
+        ControlRequest::Stop(name) => do_stop(name, console_name, services),
+        ControlRequest::Restart(name) => {
+            let stop_out = do_stop(name, console_name, services);
+            if stop_out.starts_with("unknown") || stop_out.contains("console") {
+                return stop_out;
+            }
+            let start_out = do_start(name, services, units);
+            format!("{}{}", stop_out, start_out)
+        }
+    }
+}
+
+/// 启动服务：已在 services 中的重新拉起；否则从单元文件新建实例。
+fn do_start(
+    name: &str,
+    services: &mut Vec<ServiceInstance>,
+    units: &HashMap<String, Unit>,
+) -> String {
+    if let Some(svc) = services.iter_mut().find(|s| s.name == name) {
+        if svc.child.is_some() {
+            return format!("{} already running\n", name);
+        }
+        svc.stopped = false;
+        return match spawn_unit_command(&svc.name, &svc.exec_start, &svc.env) {
+            Some(c) => {
+                svc.child = Some(c);
+                format!("{} started\n", name)
+            }
+            None => format!("failed to start {}\n", name),
+        };
+    }
+    let unit = match units.get(name) {
+        Some(u) => u,
+        None => return format!("unknown unit: {}\n", name),
+    };
+    if unit.is_target {
+        return format!("{} is a target, not a service\n", name);
+    }
+    let cmd = match &unit.service.exec_start {
+        Some(c) => c.clone(),
+        None => return format!("{} has no ExecStart\n", name),
+    };
+    let env = parse_environment(&unit.service.environment);
+    match spawn_unit_command(name, &cmd, &env) {
+        Some(child) => {
+            services.push(ServiceInstance {
+                name: name.to_string(),
+                child: Some(child),
+                exec_stop: unit.service.exec_stop.clone(),
+                exec_start: cmd,
+                env,
+                restart_on_failure: unit.service.restart == "on-failure",
+                stopped: false,
+            });
+            format!("{} started\n", name)
+        }
+        None => format!("failed to start {}\n", name),
+    }
+}
+
+/// 停止服务：执行 ExecStop 并终止进程组，标记 stopped（禁止自动重启）。
+fn do_stop(name: &str, console_name: &str, services: &mut [ServiceInstance]) -> String {
+    if name == console_name {
+        return format!("cannot manage console service: {}\n", name);
+    }
+    let svc = match services.iter_mut().find(|s| s.name == name) {
+        Some(s) => s,
+        None => return format!("unknown unit: {}\n", name),
+    };
+    svc.stopped = true;
+    if svc.child.is_none() {
+        return format!("{} already stopped\n", name);
+    }
+    stop_service_instance(svc);
+    format!("{} stopped\n", name)
+}
+
+/// 执行 ExecStop 并终止服务进程组：SIGTERM 等 1 秒，超时 SIGKILL。
+/// 供关机流程与 stop/restart 命令复用。
+fn stop_service_instance(svc: &mut ServiceInstance) {
+    if let Some(stop_cmd) = &svc.exec_stop {
+        log(&format!("rbox init: stopping {}: {}", svc.name, stop_cmd));
+        let argv = parse_cmdline(stop_cmd);
+        if !argv.is_empty() {
+            let _ = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .status();
+        }
+    }
+    if let Some(mut child) = svc.child.take() {
+        let _ = kill_process_group(child.id(), libc::SIGTERM);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = kill_process_group(child.id(), libc::SIGKILL);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.wait();
+    }
 }
 
 /// 生成 status 响应文本。请求为空时列出全部；`status <unit>` 查单个。
@@ -974,6 +1132,7 @@ mod tests {
             exec_start: "/bin/rbox false".to_string(),
             env: Vec::new(),
             restart_on_failure,
+            stopped: false,
         }
     }
 
@@ -1007,5 +1166,37 @@ mod tests {
     fn format_status_unknown_unit() {
         let out = format_status("status ghost.service", "console-shell.service", None, &[]);
         assert!(out.contains("unknown unit: ghost.service"), "out: {}", out);
+    }
+
+    #[test]
+    fn parse_control_request_status() {
+        assert_eq!(parse_control_request(""), Ok(ControlRequest::Status(None)));
+        assert_eq!(parse_control_request("status"), Ok(ControlRequest::Status(None)));
+        assert_eq!(
+            parse_control_request("status hello.service"),
+            Ok(ControlRequest::Status(Some("hello.service")))
+        );
+    }
+
+    #[test]
+    fn parse_control_request_service_cmds() {
+        assert_eq!(
+            parse_control_request("start hello.service"),
+            Ok(ControlRequest::Start("hello.service"))
+        );
+        assert_eq!(
+            parse_control_request("stop  hello.service "),
+            Ok(ControlRequest::Stop("hello.service"))
+        );
+        assert_eq!(
+            parse_control_request("restart hello.service"),
+            Ok(ControlRequest::Restart("hello.service"))
+        );
+    }
+
+    #[test]
+    fn parse_control_request_errors() {
+        assert!(parse_control_request("start").unwrap_err().contains("usage"));
+        assert!(parse_control_request("frobnicate x").unwrap_err().contains("unknown"));
     }
 }

@@ -83,6 +83,7 @@ rbox/
 │       ├── init.rs         # PID 1 系统初始化（systemd 风格，TOML 配置）
 │       ├── shell.rs        # 命令解释器（管道 + 重定向 + 内置命令）
 │       ├── status.rs       # status [unit]（unix socket 查询 init 服务状态）
+│       ├── rservice.rs     # rservice（unix socket 管理 init 服务：start/stop/restart）
 │       ├── true_.rs        # true
 │       ├── false_.rs       # false
 │       ├── echo.rs         # echo [-n]
@@ -108,7 +109,6 @@ rbox/
 │       ├── printf.rs       # printf FORMAT [args]
 │       ├── basename.rs     # basename PATH [SUFFIX]
 │       ├── dirname.rs      # dirname PATH
-│       └── status.rs       # status [unit]（unix socket 查询 init 服务状态）
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接
 │   ├── bin/
@@ -175,7 +175,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 28 个 applet：
+共 29 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -207,6 +207,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 26 | basename | basename PATH [SUFFIX] | 取文件名部分 |
 | 27 | dirname | dirname PATH | 取目录部分 |
 | 28 | status | status [unit] | 通过 unix socket 查询 init 服务状态 |
+| 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
 ## Shell
 
 文件：src/applets/shell.rs（含单元测试）
@@ -291,12 +292,26 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
 5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop；`Console = true` 的服务作为前台 console 等待
-6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；通过 `/tmp/rbox.sock` 响应 `rbox status` 查询；检测关机标志
+6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`，供 rbox status / rservice 使用）；检测关机标志
 
 `Type=` 目前仅支持 `simple`，遇到其他值会打印警告并按 simple 处理。
 `Restart=` 目前仅支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
 
 关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。
+
+### 控制协议（/tmp/rbox.sock）
+
+单行请求，文本响应：
+
+| 请求 | 说明 |
+|------|------|
+| `status` / 空 | 列出全部服务状态（init、console、各服务） |
+| `status <unit>` | 查询单个单元 |
+| `start <unit>` | 启动服务（已停止的重新拉起；未启动过的从单元文件新建） |
+| `stop <unit>` | 停止服务（执行 ExecStop + SIGTERM 进程组，超时 SIGKILL；标记 stopped 禁止自动重启） |
+| `restart <unit>` | 停止后重新启动 |
+
+客户端：`rbox status` / `rservice`（list/status/start/stop/restart）。console 服务由 init 独占管理，不接受 stop/restart。
 
 ### 关机/重启流程
 
@@ -340,7 +355,7 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 | default.target.toml | target | 启动根节点 |
 | console-shell.service.toml | service | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
 
-测试专用服务（hello.service：Environment/ExecStop；restart-test.service：Restart=on-failure）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
+测试专用服务（hello.service：Environment/ExecStop；restart-test.service：Restart=on-failure；longrun.service：rservice 管理用长驻服务）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
 
 ### fstab 挂载表
 
@@ -426,8 +441,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 | 管道与重定向 | 管道 cat\|cat、追加写入 | 3 |
 | init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
 | 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
+| rservice 管理 | stop、start、restart、list | 4 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **24** |
+| **合计** | | **28** |
 
 ### 运行测试
 
@@ -448,8 +464,8 @@ make unittest
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
 | shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知） | 17 |
-| **合计** | | **28** |
+| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/错误） | 20 |
+| **合计** | | **31** |
 
 测试结果示例：
 
@@ -590,6 +606,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | Environment= | 服务环境变量 | ✅ 已实现 |
 | 前台/后台服务区分 | Console=true 显式标记 | ✅ 已实现 |
 | 服务状态查询 | rbox status / status <unit>（unix socket） | ✅ 已实现 |
+| 服务管理命令 | rservice start/stop/restart（unix socket 控制协议） | ✅ 已实现 |
 | 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
 | Type=forking | 支持 forking 类型服务（等待 PID 文件） | 未实现 |
 | ExecReload | 重新加载配置 | 未实现 |
