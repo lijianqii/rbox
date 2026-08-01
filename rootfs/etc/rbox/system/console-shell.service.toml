@@ -1,0 +1,11 @@
+[Unit]
+Description = "Console shell"
+After = []
+Requires = []
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox shell"
+
+[Install]
+WantedBy = ["default.target"]

@@ -37,6 +37,7 @@ build:
 
 # ─── 构建 rootfs ─────────────────────────────────
 rootfs: build
+	mkdir -p $(ROOTFS)/bin
 	# 拷贝 rbox 二进制
 	cp target/$(TARGET)/$(PROFILE)/rbox $(ROOTFS)/bin/rbox
 	# 创建 applet 符号链接（bin/<applet> -> rbox）

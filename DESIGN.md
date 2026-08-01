@@ -456,7 +456,9 @@ rbox 集成测试
 ```
 ## rootfs 布局
 
-rootfs/ 是最终打包进 initramfs 的根文件系统目录树：
+rootfs/ 是最终打包进 initramfs 的根文件系统目录树。
+
+**版本库跟踪策略**：仅 `rootfs/etc/`（fstab、hostname、TOML 单元文件）由 git 跟踪；`bin/`、`lib/`、`init` 链接等构建产物由 `make rootfs` 生成，不入库。全新 clone 后直接 `make all` 即可重建完整 rootfs。
 
 ```
 rootfs/

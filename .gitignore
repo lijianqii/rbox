@@ -2,8 +2,11 @@
 /target
 
 # rbox 构建产物（由 make rootfs/initramfs 生成）
-/rootfs
 /initramfs.cpio.gz
+
+# rootfs：仅跟踪手工维护的配置（etc/），bin/lib/init 链接等构建产物忽略
+/rootfs/*
+!/rootfs/etc/
 
 # Linux 内核源码与编译产物（体积大，由 make kernel 从源码包构建）
 /kernel
