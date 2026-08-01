@@ -1,0 +1,12 @@
+[Unit]
+Description = "User downgrade test (User=nobody + LogFile)"
+Name = "usertest"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox cat /proc/self/status"
+User = "nobody"
+LogFile = "/tmp/usertest.log"
+
+[Install]
+WantedBy = ["default.target"]

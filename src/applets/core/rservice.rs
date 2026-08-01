@@ -21,21 +21,28 @@ impl Applet for Rservice {
         "rservice"
     }
     fn help(&self) -> &'static str {
-        "rservice [list|status [unit]|start|stop|restart <unit>] - manage services"
+        "rservice [list|status [unit]|start|stop|restart|reload <unit>] - manage services"
     }
     fn run(&self, args: &[String]) -> ExitCode {
         // 构造请求行
         let req = if args.is_empty() || (args.len() == 1 && args[0] == "list") {
             "status".to_string()
         } else if args.len() == 2
-            && matches!(args[0].as_str(), "start" | "stop" | "restart" | "status")
+            && matches!(
+                args[0].as_str(),
+                "start" | "stop" | "restart" | "reload" | "status"
+            )
         {
             format!("{} {}", args[0], args[1])
-        } else if args.len() == 1 && matches!(args[0].as_str(), "start" | "stop" | "restart") {
+        } else if args.len() == 1
+            && matches!(args[0].as_str(), "start" | "stop" | "restart" | "reload")
+        {
             eprintln!("rservice: {} requires a unit name", args[0]);
             return ExitCode::from(2);
         } else {
-            eprintln!("rservice: usage: rservice [list|status [unit]|start|stop|restart <unit>]");
+            eprintln!(
+                "rservice: usage: rservice [list|status [unit]|start|stop|restart|reload <unit>]"
+            );
             return ExitCode::from(2);
         };
 

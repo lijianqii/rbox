@@ -1,0 +1,11 @@
+[Unit]
+Description = "Forking timeout test (Type=forking, never daemonizes)"
+Name = "forktimeout"
+
+[Service]
+Type = "forking"
+ExecStart = "/bin/rbox sleep 100"
+TimeoutStartSec = 2
+
+[Install]
+WantedBy = ["default.target"]

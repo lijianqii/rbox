@@ -18,7 +18,7 @@ use std::io::{BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 全局关机标志：SIGTERM 信号处理器设置，主循环检查。
@@ -102,18 +102,59 @@ struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "ExecStop")]
     exec_stop: Option<String>,
+    /// rservice reload 时执行的命令
+    #[serde(default)]
+    #[serde(rename = "ExecReload")]
+    exec_reload: Option<String>,
     /// 重启策略："" / "no"（默认）或 "on-failure"
     #[serde(default)]
     #[serde(rename = "Restart")]
     restart: String,
+    /// 自动重启间隔（秒，默认 1）
+    #[serde(default = "default_restart_sec")]
+    #[serde(rename = "RestartSec")]
+    restart_sec: u64,
+    /// 连续失败重启上限（默认 5，达到后停止重启）
+    #[serde(default = "default_start_limit_burst")]
+    #[serde(rename = "StartLimitBurst")]
+    start_limit_burst: u32,
+    /// Type=forking 时等待父进程退出的超时（秒，默认 10）
+    #[serde(default = "default_timeout_start")]
+    #[serde(rename = "TimeoutStartSec")]
+    timeout_start_sec: u64,
+    /// Type=forking 的 daemon PID 文件（可选）
+    #[serde(default)]
+    #[serde(rename = "PIDFile")]
+    pidfile: Option<String>,
     /// 服务环境变量：["VAR=value", ...]
     #[serde(default)]
     #[serde(rename = "Environment")]
     environment: Vec<String>,
+    /// stdout/stderr 重定向文件（可选）
+    #[serde(default)]
+    #[serde(rename = "LogFile")]
+    logfile: Option<String>,
+    /// 以指定用户/组运行（可选）
+    #[serde(default)]
+    #[serde(rename = "User")]
+    user: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "Group")]
+    group: Option<String>,
     /// 前台 console 服务（如交互 shell），退出后自动 respawn
     #[serde(default)]
     #[serde(rename = "Console")]
     console: bool,
+}
+
+fn default_restart_sec() -> u64 {
+    1
+}
+fn default_start_limit_burst() -> u32 {
+    5
+}
+fn default_timeout_start() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -128,12 +169,30 @@ struct InstallSection {
 struct ServiceInstance {
     name: String,
     child: Option<std::process::Child>,
+    /// Type=forking 的 daemon pid（被 init 收养，退出时由孤儿收割匹配）
+    tracked_pid: Option<u32>,
     exec_stop: Option<String>,
+    exec_reload: Option<String>,
     /// ExecStart 原文，Restart=on-failure 时用于重新拉起
     exec_start: String,
     /// 服务环境变量（已解析的 VAR=value 对）
     env: Vec<(String, String)>,
+    /// 重启时保留的 spawn 配置
+    logfile: Option<String>,
+    user: Option<String>,
+    group: Option<String>,
+    /// Type=forking 相关（重启时重新走 daemon 化流程）
+    is_forking: bool,
+    pidfile: Option<String>,
+    timeout_start_sec: u64,
     restart_on_failure: bool,
+    /// 自动重启间隔与连续失败上限
+    restart_sec: u64,
+    start_limit_burst: u32,
+    /// 连续失败次数（成功退出或手动 start 时清零）
+    fail_count: u32,
+    /// 待重启时间点（RestartSec 退避调度）
+    next_restart_at: Option<std::time::Instant>,
     /// stop 请求后标记：禁止自动重启（Restart=on-failure 也不重启）
     stopped: bool,
 }
@@ -146,6 +205,9 @@ impl ServiceInstance {
         } else {
             ""
         };
+        if let Some(pid) = self.tracked_pid {
+            return format!("{} running pid={}{}\n", self.name, pid, restart);
+        }
         match &self.child {
             Some(c) => format!("{} running pid={}{}\n", self.name, c.id(), restart),
             None => {
@@ -174,10 +236,11 @@ impl Applet for Init {
             log("rbox init: running in test mode (not PID 1)");
         }
 
-        // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载 + 主机名）
+        // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载 + 主机名 + sysctl）
         setup_environment();
         mount_all_fs();
         setup_hostname();
+        apply_sysctl("/etc/sysctl.conf");
         log("rbox init: basic filesystems mounted");
 
         // 2. 解析所有单元文件
@@ -229,7 +292,10 @@ impl Applet for Init {
                     continue;
                 }
                 if let Some(cmd) = &unit.service.exec_start {
-                    if !unit.service.typ.is_empty() && unit.service.typ != "simple" {
+                    if !unit.service.typ.is_empty()
+                        && unit.service.typ != "simple"
+                        && unit.service.typ != "forking"
+                    {
                         log(&format!(
                             "rbox init: warning: {} Type={:?} unsupported, treating as simple",
                             unit_name, unit.service.typ
@@ -252,7 +318,12 @@ impl Applet for Init {
                     let env = parse_environment(&unit.service.environment);
                     if unit.service.console {
                         console_name = unit.name.clone();
-                        console_child = spawn_unit_command(&unit.name, cmd, &env);
+                        let cfg = SpawnConfig::from_unit(unit);
+                        console_child = spawn_unit_command(&unit.name, cmd, &env, &cfg);
+                    } else if unit.service.typ == "forking" {
+                        if let Some(inst) = start_forking_service(unit, cmd, &env) {
+                            services.push(inst);
+                        }
                     } else if let Some(inst) = start_service(unit, cmd, &env) {
                         services.push(inst);
                     }
@@ -324,7 +395,7 @@ fn reap_with_shutdown(
             }
         }
 
-        // 2. 回收已退出的服务进程；Restart=on-failure 且非零退出时重新拉起
+        // 2. 回收已退出的服务进程；Restart=on-failure 且非零退出时安排重启（退避 + 上限）
         for svc in services.iter_mut() {
             if let Some(child) = svc.child.as_mut() {
                 let (exited, failed) = match child.try_wait() {
@@ -341,16 +412,20 @@ fn reap_with_shutdown(
                     Ok(None) => (false, false),
                 };
                 if exited {
-                    let restart =
-                        svc.restart_on_failure && failed && !shutdown_requested() && !svc.stopped;
                     svc.child = None;
-                    if restart {
-                        log(&format!(
-                            "rbox init: restarting {} (Restart=on-failure)",
-                            svc.name
-                        ));
-                        svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env);
-                    }
+                    schedule_restart(svc, failed);
+                }
+            }
+            // 2a. 到达 RestartSec 退避时间点则重新拉起
+            if let Some(at) = svc.next_restart_at {
+                if std::time::Instant::now() >= at && !shutdown_requested() && !svc.stopped {
+                    svc.next_restart_at = None;
+                    log(&format!(
+                        "rbox init: restarting {} (Restart=on-failure, attempt {})",
+                        svc.name,
+                        svc.fail_count + 1
+                    ));
+                    respawn_service(svc);
                 }
             }
         }
@@ -398,6 +473,14 @@ fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::proc
             }
         }
         for svc in services.iter_mut() {
+            // forking daemon 退出（被收养的 daemon 由这里匹配并触发重启调度）
+            if svc.tracked_pid == Some(pid) {
+                log(&format!("rbox init: service {} (daemon) exited", svc.name));
+                svc.tracked_pid = None;
+                let failed = !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0;
+                schedule_restart(svc, failed);
+                break;
+            }
             if let Some(child) = svc.child.as_mut() {
                 if child.id() == pid {
                     log(&format!("rbox init: service {} reaped", svc.name));
@@ -450,6 +533,25 @@ fn spawn_fresh_shell() -> Option<std::process::Child> {
         .ok()
 }
 
+/// spawn 附加配置（LogFile/User/Group）。
+struct SpawnConfig<'a> {
+    /// stdout/stderr 重定向文件
+    logfile: Option<&'a str>,
+    /// 降权用户/组名
+    user: Option<&'a str>,
+    group: Option<&'a str>,
+}
+
+impl SpawnConfig<'_> {
+    fn from_unit(unit: &Unit) -> SpawnConfig<'_> {
+        SpawnConfig {
+            logfile: unit.service.logfile.as_deref(),
+            user: unit.service.user.as_deref(),
+            group: unit.service.group.as_deref(),
+        }
+    }
+}
+
 /// 解析 ExecStart 命令并 spawn 子进程，返回子进程句柄。
 /// ExecStart 以 `rbox` 或 `/bin/rbox` 开头时统一走 /bin/rbox。
 /// 服务放入独立进程组（process_group），关机时可按组清理其后代进程。
@@ -457,6 +559,7 @@ fn spawn_unit_command(
     name: &str,
     cmd: &str,
     env: &[(String, String)],
+    cfg: &SpawnConfig<'_>,
 ) -> Option<std::process::Child> {
     let argv = parse_cmdline(cmd);
     if argv.is_empty() {
@@ -471,6 +574,57 @@ fn spawn_unit_command(
     command.args(args);
     command.envs(env.iter().cloned());
     command.process_group(0);
+    // 输出重定向到日志文件（追加），否则继承 console
+    if let Some(path) = cfg.logfile {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(f) => match f.try_clone() {
+                Ok(f2) => {
+                    let _ = command.stdout(Stdio::from(f));
+                    let _ = command.stderr(Stdio::from(f2));
+                }
+                Err(_) => {
+                    let _ = command.stdout(Stdio::from(f));
+                }
+            },
+            Err(e) => {
+                log(&format!(
+                    "rbox init: cannot open log file {} for {}: {}",
+                    path, name, e
+                ));
+                return None;
+            }
+        }
+    }
+    // 降权：User=/Group=（getpwnam/getgrnam 解析，失败则拒绝启动）
+    if let Some(user) = cfg.user {
+        match lookup_uid(user) {
+            Some(uid) => {
+                command.uid(uid);
+            }
+            None => {
+                log(&format!("rbox init: unknown user '{}' for {}", user, name));
+                return None;
+            }
+        }
+    }
+    if let Some(group) = cfg.group {
+        match lookup_gid(group) {
+            Some(gid) => {
+                command.gid(gid);
+            }
+            None => {
+                log(&format!(
+                    "rbox init: unknown group '{}' for {}",
+                    group, name
+                ));
+                return None;
+            }
+        }
+    }
     match command.spawn() {
         Ok(child) => {
             log(&format!("rbox init: started {} (pid {})", name, child.id()));
@@ -479,6 +633,36 @@ fn spawn_unit_command(
         Err(e) => {
             log(&format!("rbox init: failed to start {}: {}", name, e));
             None
+        }
+    }
+}
+
+/// 通过 /etc/passwd 解析用户名 -> uid。
+fn lookup_uid(name: &str) -> Option<u32> {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return None;
+    };
+    unsafe {
+        let pwd = libc::getpwnam(c.as_ptr());
+        if pwd.is_null() {
+            None
+        } else {
+            Some((*pwd).pw_uid)
+        }
+    }
+}
+
+/// 通过 /etc/group 解析组名 -> gid。
+fn lookup_gid(name: &str) -> Option<u32> {
+    let Ok(c) = std::ffi::CString::new(name) else {
+        return None;
+    };
+    unsafe {
+        let grp = libc::getgrnam(c.as_ptr());
+        if grp.is_null() {
+            None
+        } else {
+            Some((*grp).gr_gid)
         }
     }
 }
@@ -585,6 +769,41 @@ fn setup_hostname() {
             "rbox init: sethostname failed: {}",
             std::io::Error::last_os_error()
         ));
+    }
+}
+
+/// 解析 sysctl.conf 内容为 (key, value) 对；跳过空行/注释/格式错误行。
+fn parse_sysctl_conf(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            let value = value.trim();
+            if key.is_empty() {
+                return None;
+            }
+            Some((key.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+/// 应用 /etc/sysctl.conf：key 的点号转 /proc/sys/ 路径并写入。
+/// 文件缺失时静默跳过；单个条目失败只记日志。
+fn apply_sysctl(path: &str) {
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    for (key, value) in parse_sysctl_conf(&content) {
+        let proc_path = format!("/proc/sys/{}", key.replace('.', "/"));
+        match fs::write(&proc_path, value.as_bytes()) {
+            Ok(()) => log(&format!("rbox init: sysctl {} = {}", key, value)),
+            Err(e) => log(&format!("rbox init: sysctl {} failed: {}", key, e)),
+        }
     }
 }
 
@@ -730,18 +949,93 @@ fn compute_start_order(units: &HashMap<String, Unit>, root: &str) -> Result<Vec<
     Ok(order)
 }
 
-/// 启动一个服务（simple 类型），返回运行时实例。
+/// 启动一个 simple 类型服务，返回运行时实例。
 fn start_service(unit: &Unit, cmd: &str, env: &[(String, String)]) -> Option<ServiceInstance> {
-    let child = spawn_unit_command(&unit.name, cmd, env)?;
-    Some(ServiceInstance {
+    let cfg = SpawnConfig::from_unit(unit);
+    let child = spawn_unit_command(&unit.name, cmd, env, &cfg)?;
+    Some(new_service_instance(unit, cmd, env, Some(child), None))
+}
+
+/// 启动一个 forking 类型服务：等父进程退出完成 daemon 化，
+/// 有 PIDFile 时跟踪 daemon pid（被 init 收养，退出由孤儿收割匹配）。
+fn start_forking_service(
+    unit: &Unit,
+    cmd: &str,
+    env: &[(String, String)],
+) -> Option<ServiceInstance> {
+    let cfg = SpawnConfig::from_unit(unit);
+    let mut child = spawn_unit_command(&unit.name, cmd, env, &cfg)?;
+    // 等待父进程退出（daemon 化完成），超时 TimeoutStartSec
+    let timeout = unit.service.timeout_start_sec;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        if shutdown_requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    log(&format!(
+                        "rbox init: {} did not daemonize within {}s, killing",
+                        unit.name, timeout
+                    ));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    // 读 PID 文件获取 daemon pid（可选）
+    let tracked_pid = unit.service.pidfile.as_deref().and_then(read_pid_file);
+    if unit.service.pidfile.is_some() && tracked_pid.is_none() {
+        log(&format!(
+            "rbox init: {} daemonized but PIDFile unreadable, not tracking",
+            unit.name
+        ));
+    }
+    Some(new_service_instance(unit, cmd, env, None, tracked_pid))
+}
+
+/// 读取 PID 文件并解析 pid。
+fn read_pid_file(path: &str) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+/// 从单元配置构造运行时实例（公共字段）。
+fn new_service_instance(
+    unit: &Unit,
+    cmd: &str,
+    env: &[(String, String)],
+    child: Option<std::process::Child>,
+    tracked_pid: Option<u32>,
+) -> ServiceInstance {
+    ServiceInstance {
         name: unit.name.clone(),
-        child: Some(child),
+        child,
+        tracked_pid,
         exec_stop: unit.service.exec_stop.clone(),
+        exec_reload: unit.service.exec_reload.clone(),
         exec_start: cmd.to_string(),
         env: env.to_vec(),
         restart_on_failure: unit.service.restart == "on-failure",
+        restart_sec: unit.service.restart_sec,
+        start_limit_burst: unit.service.start_limit_burst,
+        fail_count: 0,
+        next_restart_at: None,
+        logfile: unit.service.logfile.clone(),
+        user: unit.service.user.clone(),
+        group: unit.service.group.clone(),
+        is_forking: unit.service.typ == "forking",
+        pidfile: unit.service.pidfile.clone(),
+        timeout_start_sec: unit.service.timeout_start_sec,
         stopped: false,
-    })
+    }
 }
 
 /// 将命令字符串切分为 argv（简单空格切分，支持双引号）。
@@ -809,6 +1103,7 @@ enum ControlRequest<'a> {
     Start(&'a str),
     Stop(&'a str),
     Restart(&'a str),
+    Reload(&'a str),
 }
 
 /// 解析控制请求行；空行等价于 status（列出全部）。
@@ -819,10 +1114,11 @@ fn parse_control_request(req: &str) -> Result<ControlRequest<'_>, String> {
     let arg = parts.next().map(str::trim).filter(|s| !s.is_empty());
     match cmd {
         "" | "status" => Ok(ControlRequest::Status(arg)),
-        "start" | "stop" | "restart" => match arg {
+        "start" | "stop" | "restart" | "reload" => match arg {
             Some(unit) => Ok(match cmd {
                 "start" => ControlRequest::Start(unit),
                 "stop" => ControlRequest::Stop(unit),
+                "reload" => ControlRequest::Reload(unit),
                 _ => ControlRequest::Restart(unit),
             }),
             None => Err(format!("usage: {} <unit>", cmd)),
@@ -845,6 +1141,7 @@ fn execute_control_request(
         }
         ControlRequest::Start(name) => do_start(name, services, units),
         ControlRequest::Stop(name) => do_stop(name, console_name, services),
+        ControlRequest::Reload(name) => do_reload(name, services),
         ControlRequest::Restart(name) => {
             let stop_out = do_stop(name, console_name, services);
             if stop_out.starts_with("unknown") || stop_out.contains("console") {
@@ -856,6 +1153,88 @@ fn execute_control_request(
     }
 }
 
+/// 重载服务：执行 ExecReload 命令（不重启进程）。
+fn do_reload(name: &str, services: &mut [ServiceInstance]) -> String {
+    let svc = match services.iter_mut().find(|s| s.name == name) {
+        Some(s) => s,
+        None => return format!("unknown unit: {}\n", name),
+    };
+    if svc.child.is_none() && svc.tracked_pid.is_none() {
+        return format!("{} not running\n", name);
+    }
+    match &svc.exec_reload {
+        Some(cmd) => {
+            let argv = parse_cmdline(cmd);
+            if argv.is_empty() {
+                return format!("{} has empty ExecReload\n", name);
+            }
+            let _ = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .status();
+            format!("{} reloaded\n", name)
+        }
+        None => format!("{} has no ExecReload\n", name),
+    }
+}
+
+/// 服务退出后调度重启：失败计数 +1（成功退出清零），
+/// 达到 StartLimitBurst 上限后放弃；否则按 RestartSec 退避。
+fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
+    if failed {
+        svc.fail_count += 1;
+    } else {
+        svc.fail_count = 0;
+    }
+    if !svc.restart_on_failure || !failed || svc.stopped || shutdown_requested() {
+        return;
+    }
+    if svc.fail_count >= svc.start_limit_burst {
+        log(&format!(
+            "rbox init: {} failed {} times, giving up (StartLimitBurst={})",
+            svc.name, svc.fail_count, svc.start_limit_burst
+        ));
+        return;
+    }
+    svc.next_restart_at =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(svc.restart_sec));
+}
+
+/// 重新拉起服务（自动重启与手动 start 共用）。
+/// simple：直接 spawn；forking：重新走 daemon 化流程并重读 PIDFile。
+fn respawn_service(svc: &mut ServiceInstance) {
+    let cfg = SpawnConfig {
+        logfile: svc.logfile.as_deref(),
+        user: svc.user.as_deref(),
+        group: svc.group.as_deref(),
+    };
+    if !svc.is_forking {
+        svc.tracked_pid = None;
+        svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg);
+        return;
+    }
+    let mut child = match spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg) {
+        Some(c) => c,
+        None => return,
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_start_sec);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => break,
+        }
+    }
+    svc.child = None;
+    svc.tracked_pid = svc.pidfile.as_deref().and_then(read_pid_file);
+}
+
 /// 启动服务：已在 services 中的重新拉起；否则从单元文件新建实例。
 fn do_start(
     name: &str,
@@ -863,16 +1242,17 @@ fn do_start(
     units: &HashMap<String, Unit>,
 ) -> String {
     if let Some(svc) = services.iter_mut().find(|s| s.name == name) {
-        if svc.child.is_some() {
+        if svc.child.is_some() || svc.tracked_pid.is_some() {
             return format!("{} already running\n", name);
         }
         svc.stopped = false;
-        return match spawn_unit_command(&svc.name, &svc.exec_start, &svc.env) {
-            Some(c) => {
-                svc.child = Some(c);
-                format!("{} started\n", name)
-            }
-            None => format!("failed to start {}\n", name),
+        svc.fail_count = 0;
+        svc.next_restart_at = None;
+        respawn_service(svc);
+        return if svc.child.is_some() || svc.tracked_pid.is_some() {
+            format!("{} started\n", name)
+        } else {
+            format!("failed to start {}\n", name)
         };
     }
     let unit = match units.get(name) {
@@ -887,17 +1267,14 @@ fn do_start(
         None => return format!("{} has no ExecStart\n", name),
     };
     let env = parse_environment(&unit.service.environment);
-    match spawn_unit_command(name, &cmd, &env) {
-        Some(child) => {
-            services.push(ServiceInstance {
-                name: name.to_string(),
-                child: Some(child),
-                exec_stop: unit.service.exec_stop.clone(),
-                exec_start: cmd,
-                env,
-                restart_on_failure: unit.service.restart == "on-failure",
-                stopped: false,
-            });
+    let inst = if unit.service.typ == "forking" {
+        start_forking_service(unit, &cmd, &env)
+    } else {
+        start_service(unit, &cmd, &env)
+    };
+    match inst {
+        Some(inst) => {
+            services.push(inst);
             format!("{} started\n", name)
         }
         None => format!("failed to start {}\n", name),
@@ -922,7 +1299,7 @@ fn do_stop(name: &str, console_name: &str, services: &mut [ServiceInstance]) -> 
 }
 
 /// 执行 ExecStop 并终止服务进程组：SIGTERM 等 1 秒，超时 SIGKILL。
-/// 供关机流程与 stop/restart 命令复用。
+/// 供关机流程与 stop/restart 命令复用；forking 服务额外终止 daemon pid。
 fn stop_service_instance(svc: &mut ServiceInstance) {
     if let Some(stop_cmd) = &svc.exec_stop {
         log(&format!("rbox init: stopping {}: {}", svc.name, stop_cmd));
@@ -950,6 +1327,24 @@ fn stop_service_instance(svc: &mut ServiceInstance) {
             }
         }
         let _ = child.wait();
+    }
+    // forking daemon：向 daemon pid 发信号并等待其退出（init 收养后 waitpid 可收割）
+    if let Some(pid) = svc.tracked_pid.take() {
+        let _ = kill_process(pid, libc::SIGTERM);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            if r == pid as i32 {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = kill_process(pid, libc::SIGKILL);
+                unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -988,14 +1383,32 @@ fn format_status(
     out
 }
 
-/// 往 console 输出日志。
+/// 输出日志：优先写入内核环形缓冲（/dev/kmsg，内核自动回显到 console，
+/// 带时间戳且不重复）；kmsg 不可用时（如 devtmpfs 挂载前）回退 console stderr。
+/// 注意：kmsg 每次 write 调用产生一条消息，必须整条一次性写入，
+/// 否则会被拆成多行（每行带时间戳前缀）。
 fn log(msg: &str) {
+    if let Ok(mut kmsg) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        let line = format!("rbox: {}\n", msg);
+        let _ = kmsg.write_all(line.as_bytes());
+        return;
+    }
     let mut stderr = std::io::stderr();
     let _ = writeln!(stderr, "{}", msg);
     let _ = stderr.flush();
 }
 
 // ─── 系统调用封装（使用 libc crate）──────────────────
+
+/// 发送信号给指定进程。
+fn kill_process(pid: u32, sig: i32) -> std::io::Result<()> {
+    let rc = unsafe { libc::kill(pid as i32, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 /// 发送信号给进程组（pgid 由组首进程 pid 表示，kill 负 pid）。
 fn kill_process_group(pgid: u32, sig: i32) -> std::io::Result<()> {
@@ -1058,8 +1471,16 @@ mod tests {
                 typ: "simple".to_string(),
                 exec_start: None,
                 exec_stop: None,
+                exec_reload: None,
                 restart: String::new(),
+                restart_sec: 1,
+                start_limit_burst: 5,
+                timeout_start_sec: 10,
+                pidfile: None,
                 environment: Vec::new(),
+                logfile: None,
+                user: None,
+                group: None,
                 console: false,
             },
             install: InstallSection {
@@ -1217,10 +1638,22 @@ mod tests {
         ServiceInstance {
             name: name.to_string(),
             child: None,
+            tracked_pid: None,
             exec_stop: None,
+            exec_reload: None,
             exec_start: "/bin/rbox false".to_string(),
             env: Vec::new(),
+            logfile: None,
+            user: None,
+            group: None,
+            is_forking: false,
+            pidfile: None,
+            timeout_start_sec: 10,
             restart_on_failure,
+            restart_sec: 1,
+            start_limit_burst: 5,
+            fail_count: 0,
+            next_restart_at: None,
             stopped: false,
         }
     }
@@ -1260,7 +1693,10 @@ mod tests {
     #[test]
     fn parse_control_request_status() {
         assert_eq!(parse_control_request(""), Ok(ControlRequest::Status(None)));
-        assert_eq!(parse_control_request("status"), Ok(ControlRequest::Status(None)));
+        assert_eq!(
+            parse_control_request("status"),
+            Ok(ControlRequest::Status(None))
+        );
         assert_eq!(
             parse_control_request("status hello.service"),
             Ok(ControlRequest::Status(Some("hello.service")))
@@ -1308,5 +1744,32 @@ mod tests {
         assert!(is_target_file("default.target"));
         assert!(!is_target_file("default"));
         assert!(!is_target_file("hello.service"));
+    }
+
+    #[test]
+    fn parse_sysctl_conf_basic() {
+        let entries = parse_sysctl_conf(
+            "# comment\n\nkernel.panic = 10\nnet.ipv4.ip_forward=1\nbroken-line\n",
+        );
+        assert_eq!(
+            entries,
+            vec![
+                ("kernel.panic".to_string(), "10".to_string()),
+                ("net.ipv4.ip_forward".to_string(), "1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_control_request_reload() {
+        assert_eq!(
+            parse_control_request("reload hello"),
+            Ok(ControlRequest::Reload("hello"))
+        );
+        assert!(
+            parse_control_request("reload")
+                .unwrap_err()
+                .contains("usage")
+        );
     }
 }

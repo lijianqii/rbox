@@ -4,6 +4,7 @@ Name = "longrun"
 
 [Service]
 Type = "simple"
+ExecReload = "/bin/rbox echo reloaded-ok"
 ExecStart = "/bin/rbox sleep 100"
 
 [Install]

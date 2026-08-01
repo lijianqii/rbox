@@ -254,11 +254,19 @@ After = ["network.service"]        # 可选：在此服务之后启动
 Requires = ["network.service"]     # 可选：硬依赖
 
 [Service]
-Type = "simple"                    # 仅支持 simple
+Type = "simple"                    # simple（默认）/ forking（daemon 化）
 ExecStart = "/bin/rbox echo hello" # 启动命令
 ExecStop = "/bin/rbox echo bye"    # 可选：关机时执行的停止命令
+ExecReload = "/bin/rbox echo ok"   # 可选：rservice reload 执行的命令
 Environment = ["HELLO=world"]      # 可选：服务环境变量
 Restart = "on-failure"             # 可选：非零退出自动重启（默认 no）
+RestartSec = 1                      # 可选：重启间隔秒（默认 1）
+StartLimitBurst = 5                 # 可选：连续失败上限（默认 5，达到后放弃）
+TimeoutStartSec = 10                # 可选：forking 等待父进程退出超时（默认 10）
+PIDFile = "/var/run/x.pid"         # 可选：forking 的 daemon PID 文件
+LogFile = "/var/log/x.log"         # 可选：stdout/stderr 重定向文件
+User = "nobody"                    # 可选：降权用户（getpwnam）
+Group = "nogroup"                  # 可选：降权组（getgrnam）
 Console = true                     # 可选：前台 console 服务（如交互 shell，退出自动 respawn）
 
 [Install]
@@ -294,8 +302,9 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 | `start <unit>` | 启动服务（已停止的重新拉起；未启动过的从单元文件新建） |
 | `stop <unit>` | 停止服务（执行 ExecStop + SIGTERM 进程组，超时 SIGKILL；标记 stopped 禁止自动重启） |
 | `restart <unit>` | 停止后重新启动 |
+| `reload <unit>` | 执行 ExecReload 命令（不重启进程） |
 
-客户端：`rbox status` / `rservice`（list/status/start/stop/restart）。console 服务由 init 独占管理，不接受 stop/restart。
+客户端：`rbox status` / `rservice`（list/status/start/stop/restart/reload）。console 服务由 init 独占管理，不接受 stop/restart。
 
 ### 关机/重启流程
 
@@ -341,7 +350,7 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 | default.target.toml | target | default.target | 启动根节点（无 Name 字段，回退文件名） |
 | console-shell.service.toml | service | console-shell | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
 
-测试专用服务（hello、restart-test、longrun）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
+测试专用服务（hello、restart-test、longrun、forktest、forktimeout、usertest）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
 
 ### fstab 挂载表
 
@@ -428,8 +437,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 | init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
 | 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
 | rservice 管理 | stop、start、restart、list | 4 |
+| init 增强 | ExecReload、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 6 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **29** |
+| **合计** | | **35** |
 
 ### 运行测试
 
@@ -450,8 +460,8 @@ make unittest
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
 | shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/错误）、resolve_unit_name/is_target_file | 22 |
-| **合计** | | **33** |
+| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/reload/错误）、resolve_unit_name/is_target_file、parse_sysctl_conf | 24 |
+| **合计** | | **35** |
 
 测试结果示例：
 
@@ -589,15 +599,29 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | Restart=on-failure | 服务退出后自动重启 | ✅ 已实现 |
+| RestartSec / StartLimitBurst | 重启退避间隔与连续失败上限（防 crash-loop 刷屏） | ✅ 已实现 |
+| Type=forking | daemon 化服务：等待父进程退出 + PIDFile 跟踪 + TimeoutStartSec 超时 | ✅ 已实现 |
+| ExecReload | rservice reload <unit> 执行 ExecReload 命令（不重启） | ✅ 已实现 |
+| 服务输出重定向 | LogFile= 将 stdout/stderr 写入日志文件 | ✅ 已实现 |
+| User=/Group= 降权 | 以指定用户/组运行（getpwnam/getgrnam 解析） | ✅ 已实现 |
+| sysctl 支持 | 启动时应用 /etc/sysctl.conf（写 /proc/sys/*） | ✅ 已实现 |
+| 日志写 /dev/kmsg | init 日志进入内核环形缓冲（dmesg/console 回显可见） | ✅ 已实现 |
 | Environment= | 服务环境变量 | ✅ 已实现 |
 | 前台/后台服务区分 | Console=true 显式标记 | ✅ 已实现 |
 | 服务状态查询 | rbox status / status <unit>（unix socket） | ✅ 已实现 |
-| 服务管理命令 | rservice start/stop/restart（unix socket 控制协议） | ✅ 已实现 |
+| 服务管理命令 | rservice start/stop/restart/reload（unix socket 控制协议） | ✅ 已实现 |
 | 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
-| Type=forking | 支持 forking 类型服务（等待 PID 文件） | 未实现 |
-| ExecReload | 重新加载配置 | 未实现 |
-| 多 target 切换 | boot.target / multi-user.target / rescue.target | 未实现 |
-| 依赖更精细控制 | Wants= / Requisite= / Before= | 未实现 |
+| 多 target 切换 | boot.target / multi-user.target / rescue.target | TODO |
+| 依赖更精细控制 | Wants= / Requisite= / Before= | TODO |
+| ExecStartPre/Post 钩子 | 启动前/后执行额外命令 | TODO |
+| 内核 cmdline 解析 | single/emergency（跳过服务直接进 shell）、quiet | TODO |
+| 启动失败降级 | default.target 失败 → 自动进入 rescue | TODO |
+| 看门狗喂狗 | /dev/watchdog 周期性喂狗，挂死自动重启 | TODO |
+| 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
+| SIGCHLD 驱动回收 | 信号触发立即 try_wait，替代 200ms 轮询 | TODO |
+| ExecStop 超时 | ExecStop 命令超时限制 | TODO |
+| fstab pass 字段 | 按 dump/pass 决定挂载顺序 | TODO |
+| head 字符设备兼容 | head 读取 /dev/kmsg 等设备文件（当前 EINVAL） | TODO |
 
 ### 第四优先级：工程化进阶
 

@@ -6,6 +6,7 @@ Name = "hello"
 Type = "simple"
 ExecStart = "/bin/rbox env"
 Environment = ["HELLO=world"]
+ExecReload = "/bin/rbox echo reloaded-ok"
 ExecStop = "/bin/rbox echo hello-service-stopping"
 
 [Install]
