@@ -22,7 +22,9 @@ impl Applet for Rservice {
     }
     fn run(&self, args: &[String]) -> ExitCode {
         // 构造请求行
-        let req = if args.is_empty() || (args.len() == 1 && args[0] == "list") {
+        let req = if args.is_empty()
+            || (args.len() == 1 && (args[0] == "list" || args[0] == "status"))
+        {
             "status".to_string()
         } else if args.len() == 2
             && matches!(
