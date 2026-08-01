@@ -1,0 +1,102 @@
+//! rbox - 一个类似 busybox 的多合一二进制。
+//!
+//! 分发逻辑：
+//! - 取 argv[0] 的 basename。
+//! - 若 basename 为 `rbox`，则用 argv[1] 作为子命令，argv[2..] 作为参数。
+//! - 若 basename 是已注册 applet 名（如通过 symlink `ln -s rbox echo`），
+//!   则直接以该 applet 执行，参数为 argv[1..]。
+//! - 未命中则打印 usage。
+
+mod applet;
+mod applets;
+
+use crate::applet::Applet;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.is_empty() {
+        eprintln!("rbox: no argv[0]");
+        return ExitCode::FAILURE;
+    }
+
+    let argv0 = &raw_args[0];
+    let basename = std::path::Path::new(argv0)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| argv0.clone());
+
+    // 根据分发方式确定"命令名"和"参数"。
+    let (cmd, args): (&str, &[String]) = if basename == "rbox" {
+        // subcommand 模式：rbox <applet> [args...]
+        if raw_args.len() < 2 {
+            return print_usage();
+        }
+        let sub = &raw_args[1];
+        // 内置元命令
+        match sub.as_str() {
+            "--list" | "list" => return print_list(),
+            "--help" | "-h" | "help" => return print_usage(),
+            "--version" | "-V" | "version" => return print_version(),
+            _ => {}
+        }
+        (sub.as_str(), &raw_args[2..])
+    } else {
+        // argv[0] 分发模式：basename 即命令名（如 bin/echo -> rbox）
+        return match applet_for(&basename) {
+            Some(app) => app.run(&raw_args[1..]),
+            None => {
+                eprintln!("rbox: unknown command '{}'", basename);
+                print_usage()
+            }
+        };
+    };
+
+    // subcommand 模式查找
+    match applet_for(cmd) {
+        Some(app) => app.run(args),
+        None => {
+            eprintln!("rbox: unknown command '{}'", cmd);
+            print_usage()
+        }
+    }
+}
+
+/// 按命令名查找 applet。`sh` 是 shell 的常见别名（rootfs/bin/sh -> rbox）。
+fn applet_for(name: &str) -> Option<&'static dyn Applet> {
+    let lookup = if name == "sh" { "shell" } else { name };
+    applet::APPLETS.iter().find(|a| a.name() == lookup).copied()
+}
+
+fn print_usage() -> ExitCode {
+    eprintln!("rbox v{} - a busybox-like multi-binary", env!("CARGO_PKG_VERSION"));
+    eprintln!();
+    eprintln!("Usage:");
+    eprintln!("  rbox <applet> [args...]   run an applet");
+    eprintln!("  <applet> [args...]         via symlink (argv[0] dispatch)");
+    eprintln!("  rbox --list                list all applets");
+    eprintln!("  rbox --version             show version");
+    eprintln!();
+    eprintln!("Applets ({}):", applet::APPLETS.len());
+    for app in applet::APPLETS {
+        let h = app.help();
+        if h.is_empty() {
+            eprintln!("  {}", app.name());
+        } else {
+            eprintln!("  {:12} {}", app.name(), h);
+        }
+    }
+    ExitCode::FAILURE
+}
+
+fn print_list() -> ExitCode {
+    for app in applet::APPLETS {
+        println!("{}", app.name());
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_version() -> ExitCode {
+    println!("rbox {}", env!("CARGO_PKG_VERSION"));
+    ExitCode::SUCCESS
+}

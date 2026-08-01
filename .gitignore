@@ -1,0 +1,10 @@
+# Rust / cargo 构建产物
+/target
+
+# rbox 构建产物（由 make rootfs/initramfs 生成）
+/rootfs
+/initramfs.cpio.gz
+
+# Linux 内核源码与编译产物（体积大，由 make kernel 从源码包构建）
+/kernel
+/linux-*.tar.xz
