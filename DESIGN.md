@@ -269,11 +269,11 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 ### 启动流程
 
 1. **信号处理**：安装 SIGTERM/SIGINT 处理器（SIGTERM 设关机标志，SIGINT 设重启标志）
-2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）
+2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）；读取 /etc/hostname 设置主机名（sethostname）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
 5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop；`Console = true` 的服务作为前台 console 等待
-6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`，供 rbox status / rservice 使用）；检测关机标志
+6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`，供 rbox status / rservice 使用）；检测关机标志
 
 `Type=` 目前仅支持 `simple`，遇到其他值会打印警告并按 simple 处理。
 `Restart=` 目前仅支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
@@ -319,6 +319,8 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 | 函数 | 用途 | 使用位置 |
 |------|------|----------|
 | libc::mount | 挂载 /etc/fstab 列出的文件系统 | init.rs |
+| libc::sethostname | 设置主机名（/etc/hostname） | init.rs |
+| libc::waitpid | 收割收养的孤儿进程（WNOHANG） | init.rs |
 | libc::sigaction | 注册 SIGTERM/SIGINT 处理器（SA_RESTART） | init.rs |
 | libc::kill | 向进程/所有进程发送信号 | init.rs, shutdown.rs, reboot.rs |
 | libc::sync | 刷新文件系统缓冲 | init.rs |
@@ -417,14 +419,14 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 | 类别 | 测试项 | 数量 |
 |------|--------|------|
-| 基本 applet | uname -m、pwd、echo、cat | 4 |
+| 基本 applet | uname -m、uname -n（主机名）、pwd、echo、cat | 5 |
 | 文件操作 | 重定向写入、cp、ls | 3 |
 | 管道与重定向 | 管道 cat\|cat、追加写入 | 3 |
 | init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
 | 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
 | rservice 管理 | stop、start、restart、list | 4 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **28** |
+| **合计** | | **29** |
 
 ### 运行测试
 
@@ -491,7 +493,7 @@ rootfs/
 │       ├── libc.so.6            # glibc
 │       └── libgcc_s.so.1        # GCC 运行时
 └── etc/
-    ├── hostname                 # 测试文件
+    ├── hostname                 # 主机名（init 启动时读取）
     ├── fstab                    # init 挂载表
     └── rbox/
         └── system/              # init TOML 单元文件（生产：仅 default.target + console-shell）

@@ -35,6 +35,7 @@ OUT=$(timeout 120 bash -c '
   sleep 12
   # 基本 applet
   printf "uname -m\n"; sleep 0.5
+  printf "uname -n\n"; sleep 0.5
   printf "pwd\n"; sleep 0.5
   printf "echo hello\n"; sleep 0.5
   printf "cat /etc/hostname\n"; sleep 0.5
@@ -67,11 +68,11 @@ OUT=$(timeout 120 bash -c '
   -kernel '"$KERNEL"' -initrd '"$TEST_INITRD"' -append "'"$APPEND"'"
 ' 2>&1) || true
 
-# 断言输出包含某字符串
+# 断言输出包含某字符串（QEMU 串口输出为 CRLF，先去除 \r 再匹配）
 assert_contains() {
     local desc="$1"
     local pattern="$2"
-    if echo "$OUT" | grep -q "$pattern"; then
+    if echo "$OUT" | tr -d '\r' | grep -q "$pattern"; then
         echo "  PASS  $desc"
         PASS=$((PASS + 1))
     else
@@ -87,9 +88,10 @@ echo ""
 
 echo "[基本 applet]"
 assert_contains "uname -m -> aarch64" "aarch64"
+assert_contains "uname -n -> 主机名" "^rbox$"
 assert_contains "pwd -> /" "^/"
 assert_contains "echo hello -> hello" "hello"
-assert_contains "cat /etc/hostname" "hello from"
+assert_contains "cat /etc/hostname" "^rbox$"
 
 echo ""
 echo "[文件操作]"

@@ -170,9 +170,10 @@ impl Applet for Init {
             log("rbox init: running in test mode (not PID 1)");
         }
 
-        // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载）
+        // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载 + 主机名）
         setup_environment();
         mount_all_fs();
+        setup_hostname();
         log("rbox init: basic filesystems mounted");
 
         // 2. 解析所有单元文件
@@ -293,7 +294,13 @@ fn reap_with_shutdown(
     loop {
         // 1. console shell：运行中则检查退出，退出后标记待 respawn
         if let Some(child) = console.as_mut() {
-            if let Ok(Some(_)) = child.try_wait() {
+            let exited = match child.try_wait() {
+                Ok(Some(_)) => true,
+                // 竞态：恰在孤儿收割（waitpid -1）之后退出，状态已被取走
+                Err(_) => true,
+                Ok(None) => false,
+            };
+            if exited {
                 if shutdown_requested() {
                     return do_shutdown(services);
                 }
@@ -316,16 +323,22 @@ fn reap_with_shutdown(
         // 2. 回收已退出的服务进程；Restart=on-failure 且非零退出时重新拉起
         for svc in services.iter_mut() {
             if let Some(child) = svc.child.as_mut() {
-                if let Ok(Some(status)) = child.try_wait() {
-                    log(&format!(
-                        "rbox init: service {} exited (code {:?})",
-                        svc.name,
-                        status.code()
-                    ));
-                    let restart = svc.restart_on_failure
-                        && !status.success()
-                        && !shutdown_requested()
-                        && !svc.stopped;
+                let (exited, failed) = match child.try_wait() {
+                    Ok(Some(status)) => {
+                        log(&format!(
+                            "rbox init: service {} exited (code {:?})",
+                            svc.name,
+                            status.code()
+                        ));
+                        (true, !status.success())
+                    }
+                    // 竞态：状态已被孤儿收割取走，视为退出但不触发重启
+                    Err(_) => (true, false),
+                    Ok(None) => (false, false),
+                };
+                if exited {
+                    let restart =
+                        svc.restart_on_failure && failed && !shutdown_requested() && !svc.stopped;
                     svc.child = None;
                     if restart {
                         log(&format!(
@@ -337,6 +350,9 @@ fn reap_with_shutdown(
                 }
             }
         }
+
+        // 2.1 收割收养的孤儿进程（waitpid -1），防止僵尸累积
+        reap_orphans(services, &mut console);
 
         // 2.5 响应控制请求（rbox status / rservice）
         if let Some(listener) = &status_listener {
@@ -356,6 +372,36 @@ fn reap_with_shutdown(
         }
 
         std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// 收割收养的孤儿进程（waitpid -1, WNOHANG），防止僵尸累积。
+/// 已知服务/console 的子进程由 try_wait 先行处理；
+/// 若恰在 try_wait 之后退出被这里收割（竞态），同步其状态。
+fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::process::Child>) {
+    loop {
+        let mut status: libc::c_int = 0;
+        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+        if pid <= 0 {
+            break; // 0 = 无已退出子进程，-1 = 无子进程
+        }
+        let pid = pid as u32;
+        if let Some(c) = console.as_mut() {
+            if c.id() == pid {
+                log("rbox init: console shell reaped");
+                *console = None;
+                continue;
+            }
+        }
+        for svc in services.iter_mut() {
+            if let Some(child) = svc.child.as_mut() {
+                if child.id() == pid {
+                    log(&format!("rbox init: service {} reaped", svc.name));
+                    svc.child = None;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -512,6 +558,29 @@ fn setup_environment() {
     if std::env::var_os("PATH").is_none() {
         // SAFETY: init 是单线程 PID 1，无并发修改环境变量风险
         unsafe { std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin") };
+    }
+}
+
+/// 读取 /etc/hostname（取第一行）并设置主机名；文件缺失或为空时静默跳过。
+fn setup_hostname() {
+    let Ok(content) = fs::read_to_string("/etc/hostname") else {
+        return;
+    };
+    let hostname = content.lines().next().unwrap_or("").trim();
+    if hostname.is_empty() {
+        return;
+    }
+    let Ok(c) = std::ffi::CString::new(hostname) else {
+        return;
+    };
+    let rc = unsafe { libc::sethostname(c.as_ptr(), hostname.len()) };
+    if rc == 0 {
+        log(&format!("rbox init: hostname set to {}", hostname));
+    } else {
+        log(&format!(
+            "rbox init: sethostname failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
 }
 
