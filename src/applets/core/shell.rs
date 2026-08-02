@@ -140,7 +140,7 @@ impl Applet for Shell {
                     let b = byte_buf[0];
                     match b {
                         0x1b => {
-                            // ESC 序列：读取 [ 和方向键字母
+                            // ESC 序列：读取后续字节（方向键、Home/End 等）
                             let mut seq = [0u8; 2];
                             if input.read(&mut seq[..1]).unwrap_or(0) == 1 && seq[0] == b'[' {
                                 if input.read(&mut seq[1..2]).unwrap_or(0) == 1 {
@@ -207,8 +207,100 @@ impl Applet for Shell {
                                                 let _ = io::stdout().flush();
                                             }
                                         }
+                                        b'H' => {
+                                            // Home：跳到行首
+                                            cursor = 0;
+                                            redraw(&pending_line, &line, cursor);
+                                        }
+                                        b'F' => {
+                                            // End：跳到行末
+                                            cursor = line.len();
+                                            redraw(&pending_line, &line, cursor);
+                                        }
+                                        b'1' | b'7' => {
+                                            // Home 的另一种编码：ESC[1~ 或 ESC[7~
+                                            let mut dummy = [0u8; 1];
+                                            let _ = input.read(&mut dummy);
+                                            cursor = 0;
+                                            redraw(&pending_line, &line, cursor);
+                                        }
+                                        b'4' | b'8' => {
+                                            // End 的另一种编码：ESC[4~ 或 ESC[8~
+                                            let mut dummy = [0u8; 1];
+                                            let _ = input.read(&mut dummy);
+                                            cursor = line.len();
+                                            redraw(&pending_line, &line, cursor);
+                                        }
+                                        b'3' => {
+                                            // Delete 键：ESC[3~
+                                            let mut dummy = [0u8; 1];
+                                            let _ = input.read(&mut dummy);
+                                            if cursor < line.len() {
+                                                // 删除光标处字符
+                                                let mut end = cursor + 1;
+                                                while end < line.len()
+                                                    && !line.is_char_boundary(end)
+                                                {
+                                                    end += 1;
+                                                }
+                                                line.replace_range(cursor..end, "");
+                                                redraw(&pending_line, &line, cursor);
+                                            }
+                                        }
                                         _ => {}
                                     }
+                                }
+                            }
+                        }
+                        0x03 => {
+                            // Ctrl-C：中断当前行，新起一行
+                            let _ = writeln!(io::stdout(), "^C");
+                            line.clear();
+                            cursor = 0;
+                            pending_line.clear();
+                            hist_idx = None;
+                            let _ = write!(io::stdout(), "rbox# ");
+                            let _ = io::stdout().flush();
+                        }
+                        0x0c => {
+                            // Ctrl-L：清屏并重绘当前行
+                            let _ = write!(io::stdout(), "\x1b[2J\x1b[H");
+                            redraw(&pending_line, &line, cursor);
+                        }
+                        0x01 => {
+                            // Ctrl-A：跳到行首
+                            cursor = 0;
+                            redraw(&pending_line, &line, cursor);
+                        }
+                        0x05 => {
+                            // Ctrl-E：跳到行末
+                            cursor = line.len();
+                            redraw(&pending_line, &line, cursor);
+                        }
+                        0x15 => {
+                            // Ctrl-U：删除光标前的所有内容
+                            if cursor > 0 {
+                                line.drain(..cursor);
+                                cursor = 0;
+                                redraw(&pending_line, &line, cursor);
+                            }
+                        }
+                        0x17 => {
+                            // Ctrl-W：删除光标前一个单词
+                            if cursor > 0 {
+                                let mut i = cursor;
+                                // 跳过空格
+                                while i > 0 && line.as_bytes()[i - 1] == b' ' {
+                                    i -= 1;
+                                }
+                                // 删除到前一个空格或行首
+                                while i > 0 && line.as_bytes()[i - 1] != b' ' {
+                                    i -= 1;
+                                }
+                                if i < cursor {
+                                    line.drain(i..cursor);
+                                    cursor = i;
+                                    redraw(&pending_line, &line, cursor);
                                 }
                             }
                         }
@@ -263,6 +355,13 @@ impl Applet for Shell {
 
                             let _ = write!(io::stdout(), "rbox# ");
                             let _ = io::stdout().flush();
+                        }
+                        0x0b => {
+                            // Ctrl-K：删除光标后的所有内容
+                            if cursor < line.len() {
+                                line.truncate(cursor);
+                                redraw(&pending_line, &line, cursor);
+                            }
                         }
                         0x7f | 0x08 => {
                             // 退格（DEL 或 BS）：删除光标前一个字符
