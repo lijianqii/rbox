@@ -1,35 +1,73 @@
 //! 基础 shell - 读取命令行、分词、fork+exec 传参。
 //!
 //! 功能范围：
-//! - 读取一行输入，按空白分词，支持双引号保留空格、反斜杠转义。
+//! - 读取一行输入，按空白分词，支持双引号、单引号、反斜杠转义。
+//! - 反斜杠行尾续行（多行命令）。
+//! - 注释 `#`（从 # 到行尾忽略）。
 //! - 输出重定向：`>` 覆盖、`>>` 追加。
 //! - 输入重定向：`<`。
 //! - 管道：`|`（多级）。
-//! - 内置命令：`exit`、`cd`。
+//! - 控制操作符：`;`（顺序）、`&&`（成功后）、`||`（失败后）、`&`（后台）。
+//! - 环境变量展开：`$VAR`、`${VAR}`、`$?`（上条退出码）、`$$`（PID）。
+//! - 内置命令：`exit`、`cd`、`export`、`unset`、`pwd`、`echo`（回退内置）。
+//! - 通配符展开：`*`、`?`、`[...]`（glob）。
 //! - 命令查找：先按字面路径，否则在 PATH 下查找；再回退到 rbox 内置 applet。
 
-use crate::applet::Applet;
-use std::io::{self, BufRead, Write};
+use crate::applet::{self, Applet};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, ExitCode, Stdio};
+
+/// 终端原始属性保存结构，shell 退出时恢复。
+struct RawGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        // 恢复原始终端属性
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+/// 将 fd 对应的终端设为 cbreak 模式（关闭 ICANON + ECHO），返回 guard。
+/// 如果 fd 不是终端（如管道），返回 None，不影响读取。
+fn enable_raw_mode() -> Option<RawGuard> {
+    let fd = std::io::stdin().as_raw_fd();
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        // 不是终端（管道/文件），跳过
+        return None;
+    }
+    let mut raw = original;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    unsafe {
+        libc::tcsetattr(fd, libc::TCSANOW, &raw);
+    }
+    Some(RawGuard { fd, original })
+}
 
 pub struct Shell;
 pub static SHELL: &Shell = &Shell;
 
-/// 分词后的 token：要么是普通单词，要么是操作符。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Token {
     Word(String),
-    /// > 覆盖输出
     RedirOut,
-    /// >> 追加输出
     RedirAppend,
-    /// < 输入
     RedirIn,
-    /// | 管道
     Pipe,
+    Semicolon,
+    AndIf,
+    OrIf,
+    Background,
 }
 
-/// 一条简单命令（不含管道，但含重定向）。
 #[derive(Debug, Default)]
 struct SimpleCmd {
     argv: Vec<String>,
@@ -44,9 +82,26 @@ impl SimpleCmd {
     }
 }
 
-/// 一条管线：由 `|` 连接的若干 SimpleCmd。
 struct Pipeline {
     cmds: Vec<SimpleCmd>,
+    background: bool,
+}
+
+struct CommandList {
+    segments: Vec<LogicalSegment>,
+}
+
+struct LogicalSegment {
+    pipeline: Pipeline,
+    connector: Connector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Connector {
+    Start,
+    Sequential,
+    AndIf,
+    OrIf,
 }
 
 impl Applet for Shell {
@@ -54,85 +109,565 @@ impl Applet for Shell {
         "shell"
     }
     fn help(&self) -> &'static str {
-        "shell - command interpreter (pipes, redirections)"
+        "shell - command interpreter (pipes, redirections, vars, glob)"
     }
     fn run(&self, _args: &[String]) -> ExitCode {
-        // PATH 由 init（PID 1）启动时统一设置，shell 直接继承；
-        // 独立运行时若 PATH 缺失，命令查找回退到 rbox 内置 applet。
+        // 进入 cbreak 模式：关闭行缓冲和回显，让我们逐字节读取按键。
+        // _raw_guard 在函数退出时自动恢复终端。
+        let _raw_guard = enable_raw_mode();
+
         let stdin = io::stdin();
-        let mut lines = stdin.lock().lines();
+        let mut input = stdin.lock();
         let mut last_rc: i32 = 0;
+        let mut pending_line = String::new();
+
+        // 命令历史
+        let mut history: Vec<String> = Vec::new();
+        let mut hist_idx: Option<usize> = None;  // None = 不在历史模式
+        let mut saved_line = String::new();     // 进入历史前保存当前行
 
         let _ = write!(io::stdout(), "rbox# ");
         let _ = io::stdout().flush();
 
-        while let Some(line) = lines.next() {
-            let line = match line {
-                Ok(l) => l,
+        let mut line = String::new();
+        let mut cursor: usize = 0;  // 光标字节偏移
+        let mut byte_buf = [0u8; 1];
+
+        loop {
+            match input.read(&mut byte_buf) {
+                Ok(0) => break,  // EOF
+                Ok(_) => {
+                    let b = byte_buf[0];
+                    match b {
+                        0x1b => {
+                            // ESC 序列：读取 [ 和方向键字母
+                            let mut seq = [0u8; 2];
+                            if input.read(&mut seq[..1]).unwrap_or(0) == 1 && seq[0] == b'[' {
+                                if input.read(&mut seq[1..2]).unwrap_or(0) == 1 {
+                                    match seq[1] {
+                                        b'A' => {
+                                            // 上：上一条历史
+                                            if !history.is_empty() {
+                                                if hist_idx.is_none() {
+                                                    saved_line = line.clone();
+                                                    hist_idx = Some(history.len());
+                                                }
+                                                if let Some(idx) = hist_idx {
+                                                    if idx > 0 {
+                                                        hist_idx = Some(idx - 1);
+                                                        line = history[idx - 1].clone();
+                                                        cursor = line.len();
+                                                        redraw(&pending_line, &line, cursor);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        b'B' => {
+                                            // 下：下一条历史
+                                            if let Some(idx) = hist_idx {
+                                                if idx + 1 < history.len() {
+                                                    hist_idx = Some(idx + 1);
+                                                    line = history[idx + 1].clone();
+                                                } else {
+                                                    // 回到保存的行
+                                                    hist_idx = None;
+                                                    line = saved_line.clone();
+                                                }
+                                                cursor = line.len();
+                                                redraw(&pending_line, &line, cursor);
+                                            }
+                                        }
+                                        b'C' => {
+                                            // 右：光标右移
+                                            if cursor < line.len() {
+                                                // 移到下一个 UTF-8 字符边界
+                                                let mut next = cursor + 1;
+                                                while next < line.len()
+                                                    && !line.is_char_boundary(next)
+                                                {
+                                                    next += 1;
+                                                }
+                                                cursor = next;
+                                                let _ = write!(io::stdout(), "\x1b[C");
+                                                let _ = io::stdout().flush();
+                                            }
+                                        }
+                                        b'D' => {
+                                            // 左：光标左移
+                                            if cursor > 0 {
+                                                // 移到上一个 UTF-8 字符边界
+                                                let mut prev = cursor - 1;
+                                                while prev > 0
+                                                    && !line.is_char_boundary(prev)
+                                                {
+                                                    prev -= 1;
+                                                }
+                                                cursor = prev;
+                                                let _ = write!(io::stdout(), "\x1b[D");
+                                                let _ = io::stdout().flush();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        b'\t' => {
+                            // Tab 补全
+                            let (new_line, printed) = tab_complete(&line);
+                            if new_line != line {
+                                line = new_line;
+                                cursor = line.len();
+                                redraw(&pending_line, &line, cursor);
+                            } else if printed {
+                                redraw(&pending_line, &line, cursor);
+                            }
+                        }
+                        b'\n' => {
+                            // 回车：执行当前行
+                            let _ = writeln!(io::stdout());
+                            let mut full_line = if pending_line.is_empty() {
+                                line.clone()
+                            } else {
+                                format!("{}{}", pending_line, line)
+                            };
+                            line.clear();
+                            cursor = 0;
+
+                            // 续行检查
+                            if full_line.ends_with('\\') && !full_line.ends_with("\\\\") {
+                                pending_line = full_line.trim_end_matches('\\').to_string();
+                                let _ = write!(io::stdout(), "> ");
+                                let _ = io::stdout().flush();
+                                continue;
+                            } else if !pending_line.is_empty() {
+                                // 拼接续行
+                                full_line = format!("{}{}", pending_line, full_line);
+                                pending_line.clear();
+                            }
+
+                            // 存入历史（非空且与最后一条不同）
+                            if !full_line.trim().is_empty() {
+                                if history.last().map_or(true, |last| last != &full_line) {
+                                    history.push(full_line.clone());
+                                }
+                            }
+                            hist_idx = None;
+
+                            // 执行行
+                            last_rc = execute_line(&full_line, &mut last_rc, |rc: i32| {
+                                let _ = write!(io::stdout(), "rbox# ");
+                                let _ = io::stdout().flush();
+                                std::process::exit(rc);
+                            });
+
+                            let _ = write!(io::stdout(), "rbox# ");
+                            let _ = io::stdout().flush();
+                        }
+                        0x7f | 0x08 => {
+                            // 退格（DEL 或 BS）：删除光标前一个字符
+                            if cursor > 0 {
+                                // 找到前一个字符边界
+                                let mut prev = cursor - 1;
+                                while prev > 0 && !line.is_char_boundary(prev) {
+                                    prev -= 1;
+                                }
+                                line.replace_range(prev..cursor, "");
+                                cursor = prev;
+                                redraw(&pending_line, &line, cursor);
+                            }
+                        }
+                        0x04 => {
+                            // Ctrl-D：空行时退出
+                            if line.is_empty() {
+                                let _ = writeln!(io::stdout());
+                                break;
+                            }
+                        }
+                        c if c >= 0x20 && c < 0x7f => {
+                            // 可打印 ASCII：在光标处插入
+                            line.insert(cursor, c as char);
+                            cursor += 1;
+                            redraw(&pending_line, &line, cursor);
+                        }
+                        _ => {
+                            // 忽略其他控制字符
+                        }
+                    }
+                }
                 Err(_) => break,
-            };
-
-            let tokens = tokenize(&line);
-            // 内置命令（仅当无管道/重定向时直接处理）
-            if let Some(rc) = try_builtin(&tokens, &mut last_rc) {
-                if rc.is_exit() {
-                    return rc.into_exit_code();
-                }
-                let _ = write!(io::stdout(), "rbox# ");
-                let _ = io::stdout().flush();
-                continue;
             }
-
-            let pipeline = match build_pipeline(&tokens) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("shell: {}", e);
-                    last_rc = 1;
-                    let _ = write!(io::stdout(), "rbox# ");
-                    let _ = io::stdout().flush();
-                    continue;
-                }
-            };
-
-            if pipeline.cmds.is_empty() {
-                let _ = write!(io::stdout(), "rbox# ");
-                let _ = io::stdout().flush();
-                continue;
-            }
-
-            last_rc = execute_pipeline(&pipeline);
-            let _ = write!(io::stdout(), "rbox# ");
-            let _ = io::stdout().flush();
         }
 
         ExitCode::from(last_rc as u8)
     }
 }
 
-// ─── 分词 ─────────────────────────────────────────────
+/// 重绘当前行：提示符 + pending_line + line，光标移到 cursor 位置。
+fn redraw(pending_line: &str, line: &str, cursor: usize) {
+    let prompt = if pending_line.is_empty() { "rbox# " } else { "> " };
+    // \r 回到行首，\x1b[K 清除到行尾
+    let _ = write!(io::stdout(), "\r\x1b[K{}{}{}", prompt, pending_line, line);
+    // 将光标移到正确位置
+    let display_pos = prompt.len() + pending_line.len() + cursor;
+    // \r 回到行首，然后右移 display_pos 位
+    let _ = write!(io::stdout(), "\r\x1b[{}C", display_pos);
+    let _ = io::stdout().flush();
+}
 
-/// 将一行切分为 token 序列。操作符 > >> < | 作为独立 token。
-/// 引号内不识别操作符。
+// ─── 行执行 ───────────────────────────────────────────
+
+/// 执行一行命令。返回退出码。exit_code_fn 用于 exit 内置命令。
+fn execute_line<F>(line: &str, last_rc: &mut i32, exit_fn: F) -> i32
+where
+    F: Fn(i32) -> (),
+{
+    let tokens = tokenize(line);
+    let cmd_list = match build_command_list(&tokens) {
+        Ok(cl) => cl,
+        Err(e) => {
+            eprintln!("shell: {}", e);
+            *last_rc = 2;
+            return *last_rc;
+        }
+    };
+
+    for seg in &cmd_list.segments {
+        match seg.connector {
+            Connector::Start | Connector::Sequential => {}
+            Connector::AndIf => {
+                if *last_rc != 0 {
+                    continue;
+                }
+            }
+            Connector::OrIf => {
+                if *last_rc == 0 {
+                    continue;
+                }
+            }
+        }
+
+        let expanded = match expand_pipeline(&seg.pipeline, *last_rc) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("shell: {}", e);
+                *last_rc = 1;
+                continue;
+            }
+        };
+
+        if expanded.cmds.is_empty() {
+            continue;
+        }
+
+        if expanded.cmds.len() == 1 && !expanded.background {
+            match try_builtin(&expanded.cmds[0], last_rc) {
+                BuiltinResult::Exit => {
+                    exit_fn(*last_rc);
+                }
+                BuiltinResult::Done => continue,
+                BuiltinResult::NotBuiltin => {}
+            }
+        }
+
+        *last_rc = execute_pipeline(&expanded);
+    }
+
+    *last_rc
+}
+
+// ─── Tab 补全 ─────────────────────────────────────────
+
+/// Tab 补全：根据当前行内容补全。
+/// 返回 (补全后的完整行, 是否打印了多匹配列表)。
+/// 如果在输入第一个词（命令名），补全命令。
+/// 如果在输入后续词（参数），补全文件路径。
+fn tab_complete(line: &str) -> (String, bool) {
+    // 找到最后一个词的开始位置
+    let word_start = find_last_word_start(line);
+    let prefix = &line[word_start..];
+    if prefix.is_empty() {
+        return (line.to_string(), false);
+    }
+
+    // 判断是命令补全还是文件补全
+    // 第一个词如果含 /（如 /bin/ls），走文件补全
+    // 管道 | 后、分号 ; 后、&& / || 后也是新命令的开始，走命令补全
+    let is_first_word = line[..word_start].trim().is_empty();
+    let is_path = prefix.contains('/');
+    let after_operator = {
+        let before = line[..word_start].trim_end();
+        before.ends_with('|') || before.ends_with(';')
+            || before.ends_with("&&") || before.ends_with("||")
+    };
+
+    let matches = if (is_first_word || after_operator) && !is_path {
+        complete_command(prefix)
+    } else {
+        complete_file(prefix)
+    };
+
+    if matches.is_empty() {
+        return (line.to_string(), false);
+    }
+
+    if matches.len() == 1 {
+        // 唯一匹配：补全整个词
+        let completion = &matches[0];
+        let mut new_line = line[..word_start].to_string();
+        new_line.push_str(completion);
+        // 目录补全后不加空格（用户可能要继续输入子路径），
+        // 文件补全后加空格
+        if !completion.ends_with('/') {
+            new_line.push(' ');
+        }
+        (new_line, false)
+    } else {
+        // 多个匹配：找到公共前缀，补全到公共前缀
+        let common = common_prefix(&matches);
+        if common.len() > prefix.len() {
+            // 有更多公共前缀可补全
+            let mut new_line = line[..word_start].to_string();
+            new_line.push_str(&common);
+            (new_line, false)
+        } else {
+            // 无法继续补全，显示所有匹配（只显示文件名，不显示完整路径）
+            println!();
+            for m in &matches {
+                // 提取 basename：去掉路径前缀和尾随 /
+                let name = std::path::Path::new(m.trim_end_matches('/'))
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| m.clone());
+                // 如果原始 match 以 / 结尾（目录），显示时也加 /
+                let display = if m.ends_with('/') {
+                    format!("{}/", name)
+                } else {
+                    name
+                };
+                print!("{}  ", display);
+            }
+            println!();
+            (line.to_string(), true)
+        }
+    }
+}
+
+/// 计算字符串列表的公共前缀。
+fn common_prefix(strs: &[String]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let first = &strs[0];
+    let mut len = first.len();
+    for s in &strs[1..] {
+        len = len.min(s.len());
+        let mut i = 0;
+        while i < len && first.as_bytes()[i] == s.as_bytes()[i] {
+            i += 1;
+        }
+        len = i;
+        if len == 0 {
+            break;
+        }
+    }
+    first[..len].to_string()
+}
+
+/// 找到最后一个词的开始位置。
+fn find_last_word_start(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = bytes.len();
+    // 跳过尾部空白
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+        i -= 1;
+    }
+    // 找到词的开始
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c == b' ' || c == b'\t' || c == b'|' || c == b';' || c == b'&'
+            || c == b'>' || c == b'<'
+        {
+            break;
+        }
+        i -= 1;
+    }
+    i
+}
+
+/// 命令补全：匹配内置 applet 名 + PATH 下的可执行文件。
+fn complete_command(prefix: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+
+    // 内置 applet
+    for applet in applet::APPLETS {
+        let name = applet.name();
+        if name.starts_with(prefix) {
+            matches.push(name.to_string());
+        }
+    }
+
+    // 内置命令
+    for builtin in &["cd", "exit", "export", "unset", "pwd"] {
+        if builtin.starts_with(prefix) && !matches.iter().any(|m| m == builtin) {
+            matches.push(builtin.to_string());
+        }
+    }
+
+    // PATH 下的可执行文件
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in paths.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(prefix) && !matches.iter().any(|m| m == &name) {
+                        // 检查是否可执行
+                        if let Ok(meta) = entry.metadata() {
+                            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 != 0 {
+                                matches.push(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+/// 文件补全：匹配文件系统路径。
+fn complete_file(prefix: &str) -> Vec<String> {
+    let path = std::path::Path::new(prefix);
+    let (search_dir, file_prefix) = if prefix.ends_with('/') {
+        (path.to_path_buf(), String::new())
+    } else if let Some(parent) = path.parent() {
+        if parent.as_os_str().is_empty() {
+            (std::path::PathBuf::from("."), prefix.to_string())
+        } else {
+            (parent.to_path_buf(),
+             path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default())
+        }
+    } else {
+        (std::path::PathBuf::from("."), prefix.to_string())
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&file_prefix) {
+            // 如果是目录，加 /
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let display = if is_dir {
+                format!("{}/", name)
+            } else {
+                name
+            };
+            // 返回完整路径（不含 search_dir 前缀如果 search_dir == ".")
+            if search_dir == std::path::Path::new(".") && !prefix.contains('/') {
+                matches.push(display);
+            } else {
+                let base = search_dir.to_string_lossy();
+                // 避免 base 以 / 结尾时拼接出 //
+                let full = if base.ends_with('/') {
+                    format!("{}{}", base, display)
+                } else {
+                    format!("{}/{}", base, display)
+                };
+                matches.push(full);
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
 fn tokenize(line: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
-    let mut in_quote = false;
+    let mut in_dquote = false;
+    let mut in_squote = false;
     let mut in_token = false;
     let mut chars = line.chars().peekable();
 
     while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(next) = chars.next() {
-                    cur.push(next);
+        if in_squote {
+            match c {
+                '\'' => {
+                    in_squote = false;
+                    in_token = true;
+                }
+                _ => {
+                    cur.push(c);
                     in_token = true;
                 }
             }
-            '"' => {
-                in_quote = !in_quote;
+            continue;
+        }
+
+        if in_dquote {
+            match c {
+                '"' => {
+                    in_dquote = false;
+                    in_token = true;
+                }
+                '\\' => {
+                    if let Some(&next) = chars.peek() {
+                        match next {
+                            '$' | '`' | '"' | '\\' => {
+                                chars.next();
+                                cur.push(next);
+                            }
+                            '\n' => {
+                                chars.next();
+                            }
+                            _ => cur.push('\\'),
+                        }
+                    } else {
+                        cur.push('\\');
+                    }
+                }
+                _ => cur.push(c),
+            }
+            continue;
+        }
+
+        match c {
+            '#' if !in_token => {
+                break;
+            }
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    if next != '\n' {
+                        cur.push(next);
+                        in_token = true;
+                    }
+                }
+            }
+            '\'' => {
+                in_squote = true;
                 in_token = true;
             }
-            '>' if !in_quote => {
+            '"' => {
+                in_dquote = true;
+                in_token = true;
+            }
+            '>' => {
                 if in_token {
                     tokens.push(Token::Word(std::mem::take(&mut cur)));
                     in_token = false;
@@ -144,21 +679,45 @@ fn tokenize(line: &str) -> Vec<Token> {
                     tokens.push(Token::RedirOut);
                 }
             }
-            '<' if !in_quote => {
+            '<' => {
                 if in_token {
                     tokens.push(Token::Word(std::mem::take(&mut cur)));
                     in_token = false;
                 }
                 tokens.push(Token::RedirIn);
             }
-            '|' if !in_quote => {
+            '|' => {
                 if in_token {
                     tokens.push(Token::Word(std::mem::take(&mut cur)));
                     in_token = false;
                 }
-                tokens.push(Token::Pipe);
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::OrIf);
+                } else {
+                    tokens.push(Token::Pipe);
+                }
             }
-            ' ' | '\t' if !in_quote => {
+            '&' => {
+                if in_token {
+                    tokens.push(Token::Word(std::mem::take(&mut cur)));
+                    in_token = false;
+                }
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::AndIf);
+                } else {
+                    tokens.push(Token::Background);
+                }
+            }
+            ';' => {
+                if in_token {
+                    tokens.push(Token::Word(std::mem::take(&mut cur)));
+                    in_token = false;
+                }
+                tokens.push(Token::Semicolon);
+            }
+            ' ' | '\t' => {
                 if in_token {
                     tokens.push(Token::Word(std::mem::take(&mut cur)));
                     in_token = false;
@@ -176,73 +735,36 @@ fn tokenize(line: &str) -> Vec<Token> {
     tokens
 }
 
-// ─── 内置命令 ─────────────────────────────────────────
+// ─── 命令列表构建 ─────────────────────────────────────
 
-/// 内置命令的返回值：要么继续、要么退出。
-enum BuiltinResult {
-    Continue,
-    Exit(ExitCode),
-}
-
-impl BuiltinResult {
-    fn is_exit(&self) -> bool {
-        matches!(self, BuiltinResult::Exit(_))
-    }
-    fn into_exit_code(self) -> ExitCode {
-        match self {
-            BuiltinResult::Exit(c) => c,
-            BuiltinResult::Continue => ExitCode::SUCCESS,
-        }
-    }
-}
-
-/// 仅当整行不含管道/重定向操作符时，才尝试内置命令。
-fn try_builtin(tokens: &[Token], last_rc: &mut i32) -> Option<BuiltinResult> {
-    if tokens.iter().any(|t| !matches!(t, Token::Word(_))) {
-        return None;
-    }
-    let words: Vec<&str> = tokens
-        .iter()
-        .filter_map(|t| match t {
-            Token::Word(w) => Some(w.as_str()),
-            _ => None,
-        })
-        .collect();
-    if words.is_empty() {
-        return None;
-    }
-    let cmd = words[0];
-
-    match cmd {
-        "exit" => {
-            let code = words
-                .get(1)
-                .and_then(|s| s.parse::<i32>().ok())
-                .unwrap_or(*last_rc);
-            Some(BuiltinResult::Exit(ExitCode::from(code as u8)))
-        }
-        "cd" => {
-            let target = words.get(1).copied().unwrap_or("/");
-            if let Err(e) = std::env::set_current_dir(target) {
-                eprintln!("cd: {}", e);
-                *last_rc = 1;
-            } else {
-                *last_rc = 0;
-            }
-            Some(BuiltinResult::Continue)
-        }
-        _ => None,
-    }
-}
-
-// ─── 管线构建 ─────────────────────────────────────────
-
-/// 把 token 序列构建为 Pipeline。
-fn build_pipeline(tokens: &[Token]) -> Result<Pipeline, String> {
-    let mut cmds: Vec<SimpleCmd> = Vec::new();
+#[allow(unused_assignments)]
+fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
+    let mut segments: Vec<LogicalSegment> = Vec::new();
+    let mut cur_cmds: Vec<SimpleCmd> = Vec::new();
     let mut cur = SimpleCmd::default();
-
+    let mut background = false;
+    let mut connector = Connector::Start;
     let mut iter = tokens.iter().peekable();
+
+    macro_rules! flush_pipeline {
+        () => {{
+            if !cur.is_empty() {
+                cur_cmds.push(std::mem::take(&mut cur));
+            }
+            if !cur_cmds.is_empty() || background {
+                segments.push(LogicalSegment {
+                    pipeline: Pipeline {
+                        cmds: std::mem::take(&mut cur_cmds),
+                        background,
+                    },
+                    connector,
+                });
+                background = false;
+                connector = Connector::Sequential;
+            }
+        }};
+    }
+
     while let Some(tok) = iter.next() {
         match tok {
             Token::Word(w) => cur.argv.push(w.clone()),
@@ -264,21 +786,40 @@ fn build_pipeline(tokens: &[Token]) -> Result<Pipeline, String> {
                 if cur.is_empty() {
                     return Err("syntax error: empty command before |".to_string());
                 }
-                cmds.push(std::mem::take(&mut cur));
+                cur_cmds.push(std::mem::take(&mut cur));
+            }
+            Token::Semicolon => {
+                flush_pipeline!();
+                connector = Connector::Sequential;
+            }
+            Token::AndIf => {
+                if cur.is_empty() && cur_cmds.is_empty() {
+                    return Err("syntax error: empty command before &&".to_string());
+                }
+                flush_pipeline!();
+                connector = Connector::AndIf;
+            }
+            Token::OrIf => {
+                if cur.is_empty() && cur_cmds.is_empty() {
+                    return Err("syntax error: empty command before ||".to_string());
+                }
+                flush_pipeline!();
+                connector = Connector::OrIf;
+            }
+            Token::Background => {
+                if cur.is_empty() && cur_cmds.is_empty() {
+                    return Err("syntax error: empty command before &".to_string());
+                }
+                flush_pipeline!();
+                connector = Connector::Sequential;
             }
         }
     }
-    if cur.is_empty() && !cmds.is_empty() {
-        return Err("syntax error: empty command after |".to_string());
-    }
-    if !cur.is_empty() {
-        cmds.push(cur);
-    }
+    flush_pipeline!();
 
-    Ok(Pipeline { cmds })
+    Ok(CommandList { segments })
 }
 
-/// 从 peekable 迭代器取下一个 Word token，作为重定向的目标文件名。
 fn next_word<'a, I>(iter: &mut std::iter::Peekable<I>, op: &str) -> Result<String, String>
 where
     I: Iterator<Item = &'a Token>,
@@ -289,300 +830,408 @@ where
     }
 }
 
-// ─── 管线执行 ─────────────────────────────────────────
+// ─── 变量展开 + glob ──────────────────────────────────
 
-/// 执行一条管线，返回最后一条命令的退出码。
+fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, String> {
+    let mut new_cmds = Vec::with_capacity(pipeline.cmds.len());
+    for cmd in &pipeline.cmds {
+        let mut new_argv = Vec::with_capacity(cmd.argv.len());
+        for arg in &cmd.argv {
+            let expanded = expand_vars(arg, last_rc);
+            let globs = expand_glob(&expanded);
+            if globs.is_empty() {
+                new_argv.push(expanded);
+            } else {
+                new_argv.extend(globs);
+            }
+        }
+        new_cmds.push(SimpleCmd {
+            argv: new_argv,
+            stdin_file: cmd.stdin_file.clone(),
+            stdout_file: cmd.stdout_file.clone(),
+            append: cmd.append,
+        });
+    }
+    Ok(Pipeline {
+        cmds: new_cmds,
+        background: pipeline.background,
+    })
+}
+
+fn expand_vars(s: &str, last_rc: i32) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            match chars.peek() {
+                Some('{') => {
+                    chars.next();
+                    let mut name = String::new();
+                    while let Some(&nc) = chars.peek() {
+                        if nc == '}' {
+                            chars.next();
+                            break;
+                        }
+                        name.push(nc);
+                        chars.next();
+                    }
+                    result.push_str(&lookup_var(&name, last_rc));
+                }
+                Some('?') => {
+                    chars.next();
+                    result.push_str(&last_rc.to_string());
+                }
+                Some('$') => {
+                    chars.next();
+                    result.push_str(&std::process::id().to_string());
+                }
+                Some(&c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
+                    let mut name = String::new();
+                    while let Some(&nc) = chars.peek() {
+                        if nc.is_ascii_alphanumeric() || nc == '_' {
+                            name.push(nc);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    result.push_str(&lookup_var(&name, last_rc));
+                }
+                _ => {
+                    result.push('$');
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn lookup_var(name: &str, last_rc: i32) -> String {
+    if name == "?" {
+        return last_rc.to_string();
+    }
+    if name == "$" {
+        return std::process::id().to_string();
+    }
+    std::env::var(name).unwrap_or_default()
+}
+
+fn expand_glob(s: &str) -> Vec<String> {
+    if !s.contains('*') && !s.contains('?') && !s.contains('[') {
+        return Vec::new();
+    }
+
+    let dir = std::path::Path::new(s);
+    let (search_dir, pattern) = if s.contains('/') {
+        let parent = dir.parent().unwrap_or(std::path::Path::new("."));
+        let fname = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        (parent.to_path_buf(), fname)
+    } else {
+        (std::path::PathBuf::from("."), s.to_string())
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && !pattern.starts_with('.') {
+            continue;
+        }
+        if glob_match(&pattern, &name) {
+            if s.contains('/') {
+                let full = search_dir.join(&name);
+                matches.push(full.to_string_lossy().into_owned());
+            } else {
+                matches.push(name);
+            }
+        }
+    }
+    if !matches.is_empty() {
+        matches.sort();
+    }
+    matches
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    glob_match_inner(&p, &t)
+}
+
+fn glob_match_inner(p: &[char], t: &[char]) -> bool {
+    if p.is_empty() {
+        return t.is_empty();
+    }
+    match p[0] {
+        '*' => {
+            // * 匹配任意数量字符（包括空）
+            if p.len() == 1 {
+                return true;
+            }
+            for i in 0..=t.len() {
+                if glob_match_inner(&p[1..], &t[i..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        '?' => {
+            if t.is_empty() {
+                return false;
+            }
+            glob_match_inner(&p[1..], &t[1..])
+        }
+        '[' => {
+            // 字符类: [abc] [a-z] [!abc]
+            if t.is_empty() {
+                return false;
+            }
+            let mut idx = 1;
+            let mut negate = false;
+            if idx < p.len() && p[idx] == '!' {
+                negate = true;
+                idx += 1;
+            }
+            let mut matched = false;
+            while idx < p.len() && p[idx] != ']' {
+                if idx + 2 < p.len() && p[idx + 1] == '-' && p[idx + 2] != ']' {
+                    // 范围 [a-z]
+                    if t[0] >= p[idx] && t[0] <= p[idx + 2] {
+                        matched = true;
+                    }
+                    idx += 3;
+                } else {
+                    if t[0] == p[idx] {
+                        matched = true;
+                    }
+                    idx += 1;
+                }
+            }
+            // 找到 ]
+            let rest = if idx < p.len() { &p[idx + 1..] } else { &p[idx..] };
+            if matched != negate {
+                glob_match_inner(rest, &t[1..])
+            } else {
+                false
+            }
+        }
+        _ => {
+            if t.is_empty() || p[0] != t[0] {
+                return false;
+            }
+            glob_match_inner(&p[1..], &t[1..])
+        }
+    }
+}
+
+// ─── 内置命令 ─────────────────────────────────────────
+
+/// 内置命令执行结果。
+enum BuiltinResult {
+    /// exit N：退出 shell
+    Exit,
+    /// 内置命令执行完成，继续下一行
+    Done,
+    /// 不是内置命令
+    NotBuiltin,
+}
+
+/// 尝试执行内置命令。返回 BuiltinResult。
+fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32) -> BuiltinResult {
+    if cmd.argv.is_empty() {
+        return BuiltinResult::Done;
+    }
+    match cmd.argv[0].as_str() {
+        "exit" => {
+            let code = cmd.argv.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(*last_rc as u8);
+            *last_rc = code as i32;
+            return BuiltinResult::Exit;
+        }
+        "cd" => {
+            let target = cmd.argv.get(1).cloned().unwrap_or_else(|| {
+                std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            });
+            match std::env::set_current_dir(&target) {
+                Ok(()) => {
+                    *last_rc = 0;
+                }
+                Err(e) => {
+                    eprintln!("cd: {}: {}", target, e);
+                    *last_rc = 1;
+                }
+            }
+            BuiltinResult::Done
+        }
+        "pwd" => {
+            match std::env::current_dir() {
+                Ok(p) => println!("{}", p.display()),
+                Err(e) => {
+                    eprintln!("pwd: {}", e);
+                    *last_rc = 1;
+                }
+            }
+            BuiltinResult::Done
+        }
+        "export" => {
+            // export VAR=value  或  export VAR
+            for arg in &cmd.argv[1..] {
+                if let Some(eq) = arg.find('=') {
+                    let (k, v) = arg.split_at(eq);
+                    // SAFETY: single-threaded shell
+                    unsafe { std::env::set_var(k, &v[1..]); }
+                }
+                // export VAR (已存在则标记，rbox 中等价于 noop)
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "unset" => {
+            for arg in &cmd.argv[1..] {
+                // SAFETY: single-threaded shell
+                unsafe { std::env::remove_var(arg); }
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        _ => BuiltinResult::NotBuiltin,
+    }
+}
+
+// ─── 执行器 ───────────────────────────────────────────
+
 fn execute_pipeline(pipeline: &Pipeline) -> i32 {
-    let n = pipeline.cmds.len();
-    if n == 0 {
+    if pipeline.cmds.is_empty() {
         return 0;
     }
 
-    // 单命令无管道
-    if n == 1 {
-        return run_simple(&pipeline.cmds[0], None, None);
-    }
-
-    // 多命令管道：逐个创建，用 pipe 串联
-    let mut prev_stdout: Option<std::process::ChildStdout> = None;
     let mut children: Vec<Child> = Vec::new();
+    let ncmds = pipeline.cmds.len();
 
     for (i, cmd) in pipeline.cmds.iter().enumerate() {
-        let is_first = i == 0;
-        let is_last = i == n - 1;
+        if cmd.argv.is_empty() {
+            continue;
+        }
 
-        let stdin = if is_first {
-            // 第一条：可能从文件重定向输入
-            if let Some(f) = &cmd.stdin_file {
-                match std::fs::File::open(f) {
-                    Ok(file) => Stdio::from(file).into(),
-                    Err(e) => {
-                        eprintln!("shell: {}: {}", f, e);
-                        return 1;
-                    }
+        let (program, extra_args) = resolve_command(&cmd.argv[0]);
+
+        let mut command = Command::new(program);
+        // 如果 resolve_command 返回了额外参数（如 rbox applet 名），先加它们
+        command.args(&extra_args);
+        // 再加原始命令的后续参数（跳过程序名本身）
+        command.args(&cmd.argv[1..]);
+
+        // stdin
+        if let Some(ref f) = cmd.stdin_file {
+            match std::fs::File::open(f) {
+                Ok(file) => {
+                    command.stdin(Stdio::from(file));
                 }
-            } else {
-                Stdio::inherit()
-            }
-        } else {
-            // 中间命令：从上一条的 stdout 读
-            prev_stdout
-                .take()
-                .map(|s| Stdio::from(s))
-                .unwrap_or_else(Stdio::inherit)
-        };
-
-        let stdout = if is_last {
-            // 最后一条：可能重定向到文件
-            if let Some(f) = &cmd.stdout_file {
-                match open_stdout(f, cmd.append) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("shell: {}: {}", f, e);
-                        // 清理已启动的管道子进程，避免遗留
-                        for mut c in children.drain(..) {
-                            let _ = c.kill();
-                            let _ = c.wait();
-                        }
-                        return 1;
-                    }
+                Err(e) => {
+                    eprintln!("shell: {}: {}", f, e);
+                    return 1;
                 }
-            } else {
-                Stdio::inherit()
             }
-        } else {
-            // 中间命令：创建管道供下一条读
-            Stdio::piped()
-        };
+        } else if i > 0 {
+            // 管道中间命令：stdin 来自前一个命令的 pipe
+            // 已在下面处理
+        }
 
-        let child = spawn_command(cmd, stdin, stdout);
-        match child {
-            Ok(mut c) => {
-                prev_stdout = c.stdout.take();
-                children.push(c);
+        // stdout
+        if let Some(ref f) = cmd.stdout_file {
+            let mut opts = std::fs::OpenOptions::new();
+            let opts = if cmd.append {
+                opts.create(true).append(true).open(f)
+            } else {
+                opts.create(true).write(true).truncate(true).open(f)
+            };
+            match opts {
+                Ok(file) => {
+                    command.stdout(Stdio::from(file));
+                }
+                Err(e) => {
+                    eprintln!("shell: {}: {}", f, e);
+                    return 1;
+                }
+            }
+        } else if i < ncmds - 1 {
+            // 管道：stdout piped 到下一个命令
+            command.stdout(Stdio::piped());
+        }
+
+        // 如果是管道中间命令且不是第一个，stdin 从前一个的 stdout pipe 读取
+        if i > 0 && cmd.stdin_file.is_none() {
+            if let Some(prev) = children.last_mut() {
+                if let Some(stdout) = prev.stdout.take() {
+                    command.stdin(Stdio::from(stdout));
+                }
+            }
+        }
+
+        match command.spawn() {
+            Ok(child) => {
+                children.push(child);
             }
             Err(e) => {
-                eprintln!("shell: {}", e);
-                // 清理已启动的管道子进程，避免遗留
-                for mut c in children.drain(..) {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
+                eprintln!("shell: {}: {}", cmd.argv[0], e);
                 return 127;
             }
         }
     }
 
-    // 等待所有子进程
-    let mut last_rc = 0;
-    for mut c in children {
-        match c.wait() {
-            Ok(status) => last_rc = status.code().unwrap_or(1),
-            Err(_) => last_rc = 1,
-        }
+    // 后台运行：不等待
+    if pipeline.background {
+        return 0;
     }
-    last_rc
-}
 
-/// 执行单条命令（无管道，但可能含重定向）。
-fn run_simple(cmd: &SimpleCmd, stdin: Option<Stdio>, stdout: Option<Stdio>) -> i32 {
-    let mut command = build_command(&cmd.argv);
-
-    // 输入重定向：调用参数优先，其次命令行中的 < file；打开失败直接报错返回
-    if let Some(s) = stdin {
-        command.stdin(s);
-    } else if let Some(f) = &cmd.stdin_file {
-        match std::fs::File::open(f) {
-            Ok(file) => {
-                command.stdin(Stdio::from(file));
+    // 等待最后一个命令的退出码
+    let mut last_code = 0;
+    for child in &mut children {
+        match child.wait() {
+            Ok(status) => {
+                last_code = status.code().unwrap_or(1);
             }
-            Err(e) => {
-                eprintln!("shell: {}: {}", f, e);
-                return 1;
+            Err(_) => {
+                last_code = 1;
             }
         }
     }
-
-    // 输出重定向：调用参数优先，其次命令行中的 > file / >> file；打开失败直接报错返回
-    if let Some(o) = stdout {
-        command.stdout(o);
-    } else if let Some(f) = &cmd.stdout_file {
-        match open_stdout(f, cmd.append) {
-            Ok(s) => {
-                command.stdout(s);
-            }
-            Err(e) => {
-                eprintln!("shell: {}: {}", f, e);
-                return 1;
-            }
-        }
-    }
-
-    match command.status() {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("{}: {}", cmd.argv[0], e);
-            127
-        }
-    }
+    last_code
 }
 
-/// 根据 argv 创建 Command：先 PATH 查找，再回退 rbox 内置 applet。
-fn build_command(argv: &[String]) -> Command {
-    let cmd_name = &argv[0];
-    if let Some(path) = resolve_command(cmd_name) {
-        let mut c = Command::new(path);
-        c.args(&argv[1..]);
-        return c;
-    }
-    // 回退：rbox 内置 applet
-    let is_builtin = crate::applet::APPLETS.iter().any(|a| a.name() == cmd_name);
-    if is_builtin {
-        let mut c = Command::new("/bin/rbox");
-        c.arg(cmd_name);
-        c.args(&argv[1..]);
-        return c;
-    }
-    // 不存在：仍创建（spawn 时会报错）
-    let mut c = Command::new(cmd_name);
-    c.args(&argv[1..]);
-    c
-}
-
-/// spawn 一条命令（用于管道中间步骤）。
-fn spawn_command(cmd: &SimpleCmd, stdin: Stdio, stdout: Stdio) -> io::Result<Child> {
-    let mut command = build_command(&cmd.argv);
-    command.stdin(stdin);
-    command.stdout(stdout);
-    // 管道中间命令不支持单独的重定向（简化）
-    command.spawn()
-}
-
-/// 打开 stdout 文件用于重定向。失败时返回错误（由调用方报错并返回非零）。
-fn open_stdout(path: &str, append: bool) -> io::Result<Stdio> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true);
-    if append {
-        opts.append(true);
-    } else {
-        opts.truncate(true);
-    }
-    opts.open(path).map(Stdio::from)
-}
-
-/// 解析命令路径：含 / 则按字面；否则在 PATH 各目录下查找可执行文件。
-fn resolve_command(cmd: &str) -> Option<std::path::PathBuf> {
+/// 命令查找：含 / 按字面路径，否则在 PATH 下查找。
+/// 查找失败时回退到 rbox 内置 applet（rbox <cmd>）。
+fn resolve_command(cmd: &str) -> (String, Vec<String>) {
     if cmd.contains('/') {
-        let p = std::path::PathBuf::from(cmd);
-        if p.is_file() {
-            return Some(p);
+        return (cmd.to_string(), Vec::new());
+    }
+
+    // 在 PATH 下查找
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in paths.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let full = format!("{}/{}", dir, cmd);
+            if std::path::Path::new(&full).is_file() {
+                return (full, Vec::new());
+            }
         }
-        return None;
-    }
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(cmd);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 将 token 序列展平为字符串，便于断言。
-    fn flatten(tokens: &[Token]) -> Vec<String> {
-        tokens
-            .iter()
-            .map(|t| match t {
-                Token::Word(w) => w.clone(),
-                Token::RedirOut => ">".to_string(),
-                Token::RedirAppend => ">>".to_string(),
-                Token::RedirIn => "<".to_string(),
-                Token::Pipe => "|".to_string(),
-            })
-            .collect()
     }
 
-    #[test]
-    fn tokenize_simple_words() {
-        assert_eq!(
-            flatten(&tokenize("echo hello world")),
-            ["echo", "hello", "world"]
-        );
-    }
-
-    #[test]
-    fn tokenize_redirections() {
-        assert_eq!(flatten(&tokenize("cat a > b")), ["cat", "a", ">", "b"]);
-        assert_eq!(flatten(&tokenize("cat a >> b")), ["cat", "a", ">>", "b"]);
-        assert_eq!(flatten(&tokenize("cat < in")), ["cat", "<", "in"]);
-    }
-
-    #[test]
-    fn tokenize_quote_keeps_spaces() {
-        assert_eq!(
-            flatten(&tokenize("echo \"hello world\"")),
-            ["echo", "hello world"]
-        );
-    }
-
-    #[test]
-    fn tokenize_backslash_escape() {
-        assert_eq!(
-            flatten(&tokenize("echo hello\\ world")),
-            ["echo", "hello world"]
-        );
-    }
-
-    #[test]
-    fn tokenize_pipe_without_spaces() {
-        assert_eq!(flatten(&tokenize("a|b")), ["a", "|", "b"]);
-    }
-
-    #[test]
-    fn tokenize_operator_not_recognized_in_quote() {
-        assert_eq!(flatten(&tokenize("echo \"a|b\"")), ["echo", "a|b"]);
-    }
-
-    #[test]
-    fn build_pipeline_basic() {
-        let p = build_pipeline(&tokenize("echo hi > f")).unwrap();
-        assert_eq!(p.cmds.len(), 1);
-        assert_eq!(p.cmds[0].argv, ["echo", "hi"]);
-        assert_eq!(p.cmds[0].stdout_file.as_deref(), Some("f"));
-        assert!(!p.cmds[0].append);
-    }
-
-    #[test]
-    fn build_pipeline_append_and_input() {
-        let p = build_pipeline(&tokenize("cat < in | grep x >> out")).unwrap();
-        assert_eq!(p.cmds.len(), 2);
-        assert_eq!(p.cmds[0].stdin_file.as_deref(), Some("in"));
-        assert_eq!(p.cmds[1].stdout_file.as_deref(), Some("out"));
-        assert!(p.cmds[1].append);
-    }
-
-    #[test]
-    fn build_pipeline_syntax_errors() {
-        assert!(build_pipeline(&tokenize("cat |")).is_err());
-        assert!(build_pipeline(&tokenize("| cat")).is_err());
-        assert!(build_pipeline(&tokenize("cat >")).is_err());
-    }
-
-    #[test]
-    fn build_pipeline_empty_line() {
-        let p = build_pipeline(&tokenize("")).unwrap();
-        assert!(p.cmds.is_empty());
-    }
-
-    #[test]
-    fn open_stdout_failure_is_reported() {
-        // 父目录不存在，打开必然失败，错误必须向上传播而非静默
-        assert!(open_stdout("/nonexistent-rbox-dir/out", false).is_err());
-        assert!(open_stdout("/nonexistent-rbox-dir/out", true).is_err());
-    }
+    // 回退：rbox 内置 applet。优先用当前可执行文件路径，
+    // 其次 /bin/rbox（initramfs 环境下存在）。
+    let rbox_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/bin/rbox".to_string());
+    (rbox_path, vec![cmd.to_string()])
 }

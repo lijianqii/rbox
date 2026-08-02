@@ -66,10 +66,15 @@ run: initramfs
 	@if [ ! -f $(KERNEL)/arch/arm64/boot/Image ]; then \
 		echo "错误: 内核镜像不存在，请先 make kernel" >&2; exit 1; \
 	fi
+	@if [ -t 0 ]; then saved_tty=$$(stty -g 2>/dev/null); \
+		stty -echo -icanon min 1 time 0 2>/dev/null; \
+		trap 'stty $$saved_tty 2>/dev/null' EXIT INT; \
+	fi
 	$(QEMU) $(QEMU_OPTS) \
 		-kernel $(KERNEL)/arch/arm64/boot/Image \
 		-initrd $(INITRD) \
 		-append "$(QEMU_KCMD)"
+	@if [ -t 0 ]; then stty sane 2>/dev/null; fi
 
 # ─── 单元测试（宿主机）──────────────────────────
 unittest:

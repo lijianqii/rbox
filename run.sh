@@ -22,7 +22,13 @@ echo "  initrd: $INITRD"
 echo "  退出: Ctrl-A X"
 echo "----------------------------------------"
 
-exec qemu-system-aarch64 \
+# 设置终端为 raw 模式，使 Tab 补全等按键能立即传递给 QEMU
+if [ -t 0 ]; then
+    stty -echo -icanon min 1 time 0 2>/dev/null
+    trap 'stty sane 2>/dev/null' EXIT INT
+fi
+
+qemu-system-aarch64 \
     -M virt \
     -cpu cortex-a72 \
     -m 512M \
@@ -30,3 +36,5 @@ exec qemu-system-aarch64 \
     -kernel "$KERNEL" \
     -initrd "$INITRD" \
     -append "console=ttyAMA0 rdinit=/init"
+
+# QEMU 退出后 trap 会自动恢复终端

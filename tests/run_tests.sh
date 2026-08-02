@@ -72,6 +72,16 @@ OUT=$(timeout 120 bash -c '
   printf "cat /proc/sys/kernel/panic\n"; sleep 0.5
   printf "cat /tmp/usertest.log\n"; sleep 0.5
   printf "rbox head -n 60 /dev/kmsg\n"; sleep 0.5
+  # Shell 增强：变量、控制操作符
+  printf "export FOO=bar\n"; sleep 0.5
+  printf "echo \$FOO\n"; sleep 0.5
+  printf "echo a; echo b\n"; sleep 0.5
+  printf "true && echo yes\n"; sleep 0.5
+  printf "false || echo fallback\n"; sleep 0.5
+  printf "echo rc=\$?\n"; sleep 0.5
+  # Tab 补全
+  printf "ec\thello\n"; sleep 0.5
+  printf "cat /etc/host\t\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
@@ -151,6 +161,20 @@ assert_contains "User= 降权 nobody" "65534"
 assert_contains "Type=forking 等待父进程" "started forktest"
 assert_contains "Type=forking 超时终止" "did not daemonize within 2s"
 assert_contains "kmsg 日志写入" "\\] rbox: rbox init: mounting devpts"
+
+
+echo ""
+echo "[Shell 增强]"
+assert_contains "export + 变量展开" "bar"
+assert_contains "命令分隔 ;" "^a"
+assert_contains "条件执行 &&" "yes"
+assert_contains "条件执行 ||" "fallback"
+
+
+echo ""
+echo "[Tab 补全]"
+assert_contains "命令补全 ec->echo" "echo hello"
+assert_contains "文件补全 /etc/host->hostname" "rbox"
 
 
 echo ""

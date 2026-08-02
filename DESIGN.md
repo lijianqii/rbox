@@ -201,7 +201,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 
 文件：src/applets/core/shell.rs（含单元测试）
 
-一个极简的命令解释器，REPL 循环读取一行输入并执行。提示符：`rbox# `
+一个命令解释器，REPL 循环逐字节读取输入并执行。提示符：`rbox# `（续行时 `> `）
 
 ### 功能
 
@@ -214,16 +214,40 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 输入重定向 | cmd < file | 已实现 |
 | 内置命令 cd | cd /path | 已实现 |
 | 内置命令 exit | exit [code] | 已实现 |
+| 内置命令 export | export VAR=value | 已实现 |
+| 内置命令 unset | unset VAR | 已实现 |
+| 内置命令 pwd | pwd | 已实现 |
 | 双引号保留空格 | "hello world" | 已实现 |
+| 单引号原样保留 | 'a b c' | 已实现 |
 | 反斜杠转义 | hello\\ world | 已实现 |
-| 环境变量 $VAR | - | 未实现 |
-| 命令分隔 ; && \\|\\| | - | 未实现 |
-| 后台运行 & | - | 未实现 |
-| 通配符 * ? | - | 未实现 |
+| 反斜杠续行 | echo hello \\ + world | 已实现 |
+| 注释 | echo hello # comment | 已实现 |
+| 环境变量 $VAR | echo $VAR | 已实现 |
+| 花括号变量 ${VAR} | echo ${VAR}_x | 已实现 |
+| 退出码 $? | false; echo $? | 已实现 |
+| PID $$ | echo $$ | 已实现 |
+| 命令分隔 ; | echo a; echo b | 已实现 |
+| 条件执行 && | true && echo yes | 已实现 |
+| 条件执行 \|\| | false \|\| echo fb | 已实现 |
+| 后台运行 & | sleep 1 & echo done | 已实现 |
+| 通配符 * | ls *.txt | 已实现 |
+| 通配符 ? | ls x? | 已实现 |
+| 通配符 [] | ls [ab].txt | 已实现 |
+| Tab 补全（命令） | ec<Tab> -> echo | 已实现 |
+| Tab 补全（文件） | cat /etc/host<Tab> | 已实现 |
+| 命令历史（上/下键） | <Up> 回溯上一条命令 | 已实现 |
+| 光标移动（左/右键） | <Left>/<Right> 移动光标 | 已实现 |
+| 行内编辑 | 在光标处插入/删除字符 | 已实现 |
 
 ### 实现细节
 
-分词器（tokenize）将输入行切分为 Token 序列：
+**输入模式**：逐字节读取 stdin，检测 Tab（\t，触发补全）、\n（执行）、DEL/BS（退格）、Ctrl-D（空行退出）、ESC 序列（方向键）。支持全行编辑：光标可左右移动，字符可在光标处插入/删除。
+
+**命令历史**：`history: Vec<String>` 存储已执行命令（非空且与最后一条不同才入栈）。上键（\x1b[A）向上翻阅历史，下键（\x1b[B）向下翻阅，回到最新后恢复原始行。进入历史模式前保存当前行（`saved_line`），退出历史模式时恢复。
+
+**光标移动**：维护 `cursor: usize`（字节偏移），左键（\x1b[D）/右键（\x1b[C）移动时按 UTF-8 字符边界对齐。插入/删除字符在光标处操作，而非末尾。`redraw()` 用 `\r\x1b[K` 清除当前行后重绘，并用 `\x1b[NC` 将光标定位到正确位置。
+
+**分词器**（tokenize）将输入行切分为 Token 序列：
 
 ```rust
 enum Token {
@@ -232,17 +256,50 @@ enum Token {
     RedirAppend,      // >>
     RedirIn,          // <
     Pipe,             // |
+    Semicolon,        // ;
+    AndIf,            // &&
+    OrIf,             // ||
+    Background,       // &
 }
 ```
 
-`build_pipeline` 将 Token 序列构建为 Pipeline（若干 SimpleCmd）。`execute_pipeline` 用 `Stdio::piped()` 串联子进程。
+**命令列表构建**（build_command_list）：将 Token 序列解析为 CommandList，由多个 LogicalSegment 组成，每个含一条 Pipeline 和一个 Connector（Start/Sequential/AndIf/OrIf）。
 
-命令查找（resolve_command）：含 / 按字面路径，否则在 PATH 下查找可执行文件。查找失败时回退到 `rbox <cmd>` 内置 applet。
+**变量展开**（expand_vars）：在分词后、执行前展开 $VAR、${VAR}、$?（退出码）、$$（PID）。
+
+**通配符展开**（expand_glob）：对含 * ? [] 的词项执行 glob 匹配，隐藏文件不匹配 *（与 bash 一致）。展开后按字典序排序。
+
+**Tab 补全**（tab_complete）：
+- 判断当前词是命令位置还是参数位置
+- 命令位置：行首、管道 `|` 后、分号 `;` 后、`&&` / `||` 后——匹配内置 applet 名 + 内置命令（cd/exit/export/unset/pwd）+ PATH 下可执行文件
+- 参数位置：其他情况——匹配文件系统路径，目录自动追加 /，多匹配列表只显示文件名
+- 唯一匹配：补全 + 尾随空格（目录不加空格）
+- 多匹配：补全公共前缀；无公共前缀时列出所有选项
+- 路径形式（含 / 如 /bin/ls）：走文件补全而非命令补全
+
+**执行器**（execute_pipeline）：用 `Stdio::piped()` 串联子进程；后台运行（&）不等待子进程。
+
+命令查找（resolve_command）：含 / 按字面路径，否则在 PATH 下查找可执行文件。查找失败时回退到当前可执行文件路径 `rbox <cmd>` 内置 applet。
 
 重定向文件（`>`/`>>`/`<`）打开失败时打印错误并返回非零退出码，不会静默丢弃输出。
 
 默认 PATH 由 init（PID 1）启动时统一设置，shell 直接继承，不再自行设置。
-## Init
+
+### 终端模式（Tab 补全的前提）
+
+Tab 补全要求 shell 能逐字节读取按键，但默认终端处于 **canonical（行缓冲）模式**，按下 Tab 不会立即传递给进程。因此需要两层终端设置：
+
+1. **客户机侧（shell 启动时）**：`enable_raw_mode()` 通过 `libc::tcgetattr` 保存原始终端属性，`tcsetattr` 设置 cbreak 模式（关闭 `ICANON` + `ECHO`，`VMIN=1 VTIME=0`）。`RawGuard` 在 shell 退出时通过 `Drop` 自动恢复。管道输入时 `tcgetattr` 失败返回 `None`，不影响。
+2. **宿主机侧（make run / run.sh）**：`stty -echo -icanon min 1 time 0` 将宿主机终端设为 raw 模式，让按键立即传递给 QEMU。QEMU 退出后 `stty sane` 恢复。
+
+```rust
+struct RawGuard { fd: i32, original: libc::termios }
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original); }
+    }
+}
+```
 
 文件：src/applets/core/init.rs（含单元测试）
 
@@ -445,9 +502,11 @@ rbox 二进制本身支持的元命令（非 applet）：
 | init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
 | 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
 | rservice 管理 | stop、start、restart、list | 4 |
-| init 增强 | ExecReload、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 6 |
+| init 增强 | ExecReload、console reload、status 单查 console、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 8 |
+| Shell 增强 | export + 变量展开、命令分隔 ;、条件执行 &&、条件执行 \|\| | 4 |
+| Tab 补全 | 命令补全 ec->echo、文件补全 /etc/host->hostname | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **35** |
+| **合计** | | **43** |
 
 ### 运行测试
 
@@ -467,7 +526,7 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell.rs | tokenize（引号/转义/重定向/管道）、build_pipeline（重定向字段/语法错误）、open_stdout（失败传播） | 11 |
+| shell.rs | tokenize（引号/转义/重定向/管道/控制操作符）、build_command_list（逻辑段/语法错误）、expand_vars（$VAR/${VAR}/$?/$$）、expand_glob（* ? []）、tab_complete（命令/文件补全）、execute_pipeline（管道/后台） | 25 |
 | init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/reload/错误）、resolve_unit_name/is_target_file、parse_sysctl_conf | 24 |
 | **合计** | | **35** |
 
