@@ -338,20 +338,23 @@ impl Applet for Shell {
                                 pending_line.clear();
                             }
 
+                            hist_idx = None;
+
+                            // 执行行（历史扩展在 execute_line 内部完成）
+                            // 注意：push 在 execute_line 之后，避免 !! 替换为当前行本身
+                            last_rc = execute_line(&full_line, &mut last_rc, &history, |rc: i32| {
+                                let _ = write!(io::stdout(), "rbox# ");
+                                let _ = io::stdout().flush();
+                                std::process::exit(rc);
+                            });
+
                             // 存入历史（非空且与最后一条不同）
+                            // 存原始行（未扩展），与 bash 行为一致
                             if !full_line.trim().is_empty() {
                                 if history.last().map_or(true, |last| last != &full_line) {
                                     history.push(full_line.clone());
                                 }
                             }
-                            hist_idx = None;
-
-                            // 执行行
-                            last_rc = execute_line(&full_line, &mut last_rc, |rc: i32| {
-                                let _ = write!(io::stdout(), "rbox# ");
-                                let _ = io::stdout().flush();
-                                std::process::exit(rc);
-                            });
 
                             let _ = write!(io::stdout(), "rbox# ");
                             let _ = io::stdout().flush();
@@ -417,10 +420,14 @@ fn redraw(pending_line: &str, line: &str, cursor: usize) {
 // ─── 行执行 ───────────────────────────────────────────
 
 /// 执行一行命令。返回退出码。exit_code_fn 用于 exit 内置命令。
-fn execute_line<F>(line: &str, last_rc: &mut i32, exit_fn: F) -> i32
+fn execute_line<F>(line: &str, last_rc: &mut i32, history: &[String], exit_fn: F) -> i32
 where
     F: Fn(i32) -> (),
 {
+    // 历史扩展：!! -> 上一条命令，!n -> 第 n 条，!$ -> 上一条命令的最后一个参数
+    let expanded_line = expand_history(line, history);
+    let line = expanded_line.as_str();
+
     let tokens = tokenize(line);
     let cmd_list = match build_command_list(&tokens) {
         Ok(cl) => cl,
@@ -460,7 +467,7 @@ where
         }
 
         if expanded.cmds.len() == 1 && !expanded.background {
-            match try_builtin(&expanded.cmds[0], last_rc) {
+            match try_builtin(&expanded.cmds[0], last_rc, history) {
                 BuiltinResult::Exit => {
                     exit_fn(*last_rc);
                 }
@@ -937,6 +944,8 @@ fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, String
         let mut new_argv = Vec::with_capacity(cmd.argv.len());
         for arg in &cmd.argv {
             let expanded = expand_vars(arg, last_rc);
+            // ~ 展开（仅对第一个参数或 = 后的路径展开）
+            let expanded = expand_tilde(&expanded);
             let globs = expand_glob(&expanded);
             if globs.is_empty() {
                 new_argv.push(expanded);
@@ -1016,6 +1025,106 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
         return std::process::id().to_string();
     }
     std::env::var(name).unwrap_or_default()
+}
+
+/// 历史扩展：替换 !! !n !$ 等
+/// !! -> 上一条命令
+/// !n -> 第 n 条命令（1-based）
+/// !-n -> 倒数第 n 条
+/// !$ -> 上一条命令的最后一个参数
+fn expand_history(line: &str, history: &[String]) -> String {
+    if !line.contains('!') || history.is_empty() {
+        return line.to_string();
+    }
+
+    let mut result = String::new();
+    let bytes = line.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'!' && i + 1 < bytes.len() {
+            let next = bytes[i + 1];
+            match next {
+                b'!' => {
+                    // !! -> 上一条命令
+                    if let Some(last) = history.last() {
+                        result.push_str(last);
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'$' => {
+                    // !$ -> 上一条命令的最后一个参数
+                    if let Some(last) = history.last() {
+                        if let Some(arg) = last.split_whitespace().next_back() {
+                            result.push_str(arg);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'-' => {
+                    // !-n -> 倒数第 n 条
+                    let start = i + 2;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    if end > start {
+                        if let Ok(n) = std::str::from_utf8(&bytes[start..end]).unwrap().parse::<usize>() {
+                            // 倒数第 n 条 = history[len - n]
+                            if n > 0 && n <= history.len() {
+                                let idx = history.len() - n;
+                                result.push_str(&history[idx]);
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                c if c.is_ascii_digit() => {
+                    // !n -> 第 n 条命令（1-based）
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                    if let Ok(n) = std::str::from_utf8(&bytes[start..end]).unwrap().parse::<usize>() {
+                        if n > 0 && n <= history.len() {
+                            result.push_str(&history[n - 1]);
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+
+    result
+}
+
+/// ~ 展开：未引号包裹的 ~ 开头时展开为 $HOME
+/// ~ -> $HOME
+/// ~/path -> $HOME/path
+/// ~user -> 用户 user 的 home（rbox 中仅支持 ~ 本身）
+fn expand_tilde(s: &str) -> String {
+    if s.starts_with('~') {
+        // 检查 ~ 是否在引号内（简化检查：如果整个词被引号包裹则不展开）
+        // ~ 或 ~/...
+        if s == "~" || s.starts_with("~/") {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+            if s == "~" {
+                return home;
+            } else {
+                return format!("{}{}", home, &s[1..]);
+            }
+        }
+    }
+    s.to_string()
 }
 
 fn expand_glob(s: &str) -> Vec<String> {
@@ -1146,7 +1255,7 @@ enum BuiltinResult {
 }
 
 /// 尝试执行内置命令。返回 BuiltinResult。
-fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32) -> BuiltinResult {
+fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> BuiltinResult {
     if cmd.argv.is_empty() {
         return BuiltinResult::Done;
     }
@@ -1198,6 +1307,14 @@ fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32) -> BuiltinResult {
             for arg in &cmd.argv[1..] {
                 // SAFETY: single-threaded shell
                 unsafe { std::env::remove_var(arg); }
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "history" => {
+            // 列出命令历史（带编号）
+            for (i, h) in history.iter().enumerate() {
+                println!("  {}  {}", i + 1, h);
             }
             *last_rc = 0;
             BuiltinResult::Done

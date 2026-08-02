@@ -246,6 +246,12 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | Ctrl-K | 删除光标后所有内容 | 已实现 |
 | Ctrl-W | 删除光标前一个单词 | 已实现 |
 | Delete 键 | 删除光标处字符 | 已实现 |
+| history 内置命令 | history | 已实现 |
+| 历史扩展 !! | !! -> 上一条命令 | 已实现 |
+| 历史扩展 !n | !3 -> 第 3 条命令 | 已实现 |
+| 历史扩展 !-n | !-1 -> 倒数第 1 条 | 已实现 |
+| 历史扩展 !$ | !$ -> 上一条命令最后参数 | 已实现 |
+| ~ 展开 | cd ~ 或 echo ~/path | 已实现 |
 
 ### 实现细节
 
@@ -292,6 +298,14 @@ enum Token {
 **命令列表构建**（build_command_list）：将 Token 序列解析为 CommandList，由多个 LogicalSegment 组成，每个含一条 Pipeline 和一个 Connector（Start/Sequential/AndIf/OrIf）。
 
 **变量展开**（expand_vars）：在分词后、执行前展开 $VAR、${VAR}、$?（退出码）、$$（PID）。
+
+**历史扩展**（expand_history）：在分词前对原始行做文本替换。history 在 `execute_line` 之后入栈，保证 `!!` 引用上一条命令而非当前行。支持：
+- `!!` -> 上一条命令
+- `!n` -> 第 n 条命令（1-based）
+- `!-n` -> 倒数第 n 条
+- `!$` -> 上一条命令的最后一个参数
+
+**~ 展开**（expand_tilde）：在变量展开后、通配符展开前执行。`~` 或 `~/path` 展开为 $HOME。
 
 **通配符展开**（expand_glob）：对含 * ? [] 的词项执行 glob 匹配，隐藏文件不匹配 *（与 bash 一致）。展开后按字典序排序。
 
