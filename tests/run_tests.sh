@@ -33,7 +33,9 @@ trap cleanup EXIT
 
 # 单次 QEMU 运行所有测试命令
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
-OUT=$(timeout 120 bash -c '
+# 注意：整个命令块在外层 bash -c '...' 单引号中，内部 printf 必须用双引号，
+#       $ 需转义为 \$，单引号用 \x27 代替，避免破坏外层引号。
+OUT=$(timeout 150 bash -c '
 {
   sleep 12
   # 基本 applet
@@ -72,16 +74,63 @@ OUT=$(timeout 120 bash -c '
   printf "cat /proc/sys/kernel/panic\n"; sleep 0.5
   printf "cat /tmp/usertest.log\n"; sleep 0.5
   printf "rbox head -n 60 /dev/kmsg\n"; sleep 0.5
-  # Shell 增强：变量、控制操作符
+  # ── Shell 功能测试 ──
+  # 1. 引号与转义
+  printf "echo \"hello world\"\n"; sleep 0.5
+  printf "echo \x27single quoted\x27\n"; sleep 0.5
+  printf "echo hello\\\\ world\n"; sleep 0.5
+  printf "echo line1 \\\\\nmore\n"; sleep 0.5
+  printf "echo visible # hidden\n"; sleep 0.5
+  # 2. 变量展开
   printf "export FOO=bar\n"; sleep 0.5
   printf "echo \$FOO\n"; sleep 0.5
+  printf "echo \${FOO}_x\n"; sleep 0.5
+  printf "false; echo rc=\$?\n"; sleep 0.5
+  printf "echo pid=\$\$\n"; sleep 0.5
+  printf "unset FOO; echo [\$FOO]\n"; sleep 0.5
+  # 3. 控制操作符
   printf "echo a; echo b\n"; sleep 0.5
   printf "true && echo yes\n"; sleep 0.5
   printf "false || echo fallback\n"; sleep 0.5
-  printf "echo rc=\$?\n"; sleep 0.5
-  # Tab 补全
+  printf "true && echo ok1 || echo ok2\n"; sleep 0.5
+  printf "echo bg_start; sleep 1 & echo bg_done\n"; sleep 1
+  # 4. 重定向
+  printf "echo redir_out > /tmp/t_redir.txt\n"; sleep 0.5
+  printf "echo redir_append >> /tmp/t_redir.txt\n"; sleep 0.5
+  printf "cat < /tmp/t_redir.txt\n"; sleep 0.5
+  # 5. 多级管道
+  printf "echo p3_test | cat | cat\n"; sleep 0.5
+  printf "echo pipe_redir | cat > /tmp/t_pipe.txt\n"; sleep 0.5
+  printf "cat /tmp/t_pipe.txt\n"; sleep 0.5
+  # 6. 通配符
+  printf "mkdir -p /tmp/glob_test\n"; sleep 0.5
+  printf "touch /tmp/glob_test/a.txt\n"; sleep 0.5
+  printf "touch /tmp/glob_test/b.txt\n"; sleep 0.5
+  printf "touch /tmp/glob_test/c.log\n"; sleep 0.5
+  printf "ls /tmp/glob_test/*.txt\n"; sleep 0.5
+  printf "ls /tmp/glob_test/?.txt\n"; sleep 0.5
+  printf "ls /tmp/glob_test/[ab].txt\n"; sleep 0.5
+  # 7. 历史扩展
+  printf "echo hist_one\n"; sleep 0.5
+  printf "echo hist_two\n"; sleep 0.5
+  printf "!!\n"; sleep 0.5
+  printf "!1\n"; sleep 0.5
+  printf "echo last_arg one two three\n"; sleep 0.5
+  printf "echo copy:!$\n"; sleep 0.5
+  printf "history\n"; sleep 0.5
+  # 8. ~ 展开
+  printf "echo ~\n"; sleep 0.5
+  printf "cd ~ && pwd\n"; sleep 0.5
+  # 9. Tab 补全
   printf "ec\thello\n"; sleep 0.5
   printf "cat /etc/host\t\n"; sleep 0.5
+  printf "echo p | ec\thi\n"; sleep 0.5
+  # 10. 行编辑快捷键 (Ctrl-A 被 QEMU 截获，无法测试)
+  printf "echo abc\x05XX\n"; sleep 0.5
+  printf "echo hello\x15echo world\n"; sleep 0.5
+  printf "echo keep\x0b\n"; sleep 0.5
+  printf "echo word1 word2\x17\n"; sleep 0.5
+  printf "echo cancel\x03echo after_ctrl_c\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
@@ -160,22 +209,77 @@ assert_contains "sysctl kernel.panic" "^10$"
 assert_contains "User= 降权 nobody" "65534"
 assert_contains "Type=forking 等待父进程" "started forktest"
 assert_contains "Type=forking 超时终止" "did not daemonize within 2s"
-assert_contains "kmsg 日志写入" "\\] rbox: rbox init: mounting devpts"
+assert_contains "kmsg 日志写入" "\] rbox: rbox init: mounting devpts"
 
 
 echo ""
-echo "[Shell 增强]"
-assert_contains "export + 变量展开" "bar"
+echo "[Shell: 引号与转义]"
+assert_contains "双引号保留空格" "hello world"
+assert_contains "单引号原样保留" "single quoted"
+assert_contains "反斜杠转义" "hello world"
+assert_contains "续行拼接" "line1 more"
+assert_contains "注释不执行" "visible"
+
+echo ""
+echo "[Shell: 变量展开]"
+assert_contains "export + \$VAR" "^bar$"
+assert_contains "\${VAR}_x 展开" "bar_x"
+assert_contains "\$? 退出码" "rc=1"
+assert_contains "\$\$ PID 展开" "pid="
+assert_contains "unset 后为空" "^\[\]$"
+
+echo ""
+echo "[Shell: 控制操作符]"
 assert_contains "命令分隔 ;" "^a"
 assert_contains "条件执行 &&" "yes"
 assert_contains "条件执行 ||" "fallback"
-
+assert_contains "&&/|| 链式" "ok1"
+assert_contains "后台运行 &" "bg_done"
 
 echo ""
-echo "[Tab 补全]"
+echo "[Shell: 重定向]"
+assert_contains "输出重定向 >" "redir_out"
+assert_contains "追加写入 >>" "redir_append"
+assert_contains "输入重定向 <" "redir_out"
+
+echo ""
+echo "[Shell: 管道]"
+assert_contains "3级管道" "p3_test"
+assert_contains "管道+重定向写入" "pipe_redir"
+assert_contains "管道+重定向读回" "pipe_redir"
+
+echo ""
+echo "[Shell: 通配符]"
+assert_contains "通配符 * 列出a" "a.txt"
+assert_contains "通配符 * 列出b" "b.txt"
+assert_contains "通配符 ? " "a.txt"
+assert_contains "通配符 [] " "a.txt"
+
+echo ""
+echo "[Shell: 历史扩展]"
+assert_contains "!! 重复上一条" "hist_two"
+assert_contains "!n 第n条命令" "hist_one"
+assert_contains "!$ 最后参数" "copy:three"
+assert_contains "history 内置命令" "hist_one"
+
+echo ""
+echo "[Shell: ~ 展开]"
+assert_contains "echo ~ 输出 HOME" "^/$"
+assert_contains "cd ~ 后 pwd" "^/$"
+
+echo ""
+echo "[Shell: Tab 补全]"
 assert_contains "命令补全 ec->echo" "echo hello"
 assert_contains "文件补全 /etc/host->hostname" "rbox"
+assert_contains "管道后命令补全" "hi"
 
+echo ""
+echo "[Shell: 行编辑快捷键]"
+assert_contains "Ctrl-E 行末插入" "abcXX"
+assert_contains "Ctrl-U 删除行首" "world"
+assert_contains "Ctrl-K 行末不删除" "keep"
+assert_contains "Ctrl-W 删除单词" "echo word1"
+assert_contains "Ctrl-C 中断当前行" "after_ctrl_c"
 
 echo ""
 echo "[关机流程]"

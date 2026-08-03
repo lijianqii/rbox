@@ -318,11 +318,7 @@ impl Applet for Shell {
                         b'\n' => {
                             // 回车：执行当前行
                             let _ = writeln!(io::stdout());
-                            let mut full_line = if pending_line.is_empty() {
-                                line.clone()
-                            } else {
-                                format!("{}{}", pending_line, line)
-                            };
+                            let mut full_line = line.clone();
                             line.clear();
                             cursor = 0;
 
