@@ -772,7 +772,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 
 | 功能 | 说明 | 状态 |
 |------|------|------|
-| CI 流水线 | GitHub Actions 自动构建 + 测试 | ✅ 已实现 |
+| CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
 | 单元测试 | Rust #[test] 模块（130 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
