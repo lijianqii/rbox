@@ -533,23 +533,20 @@ fn tab_complete(line: &str) -> (String, bool) {
             new_line.push_str(&common);
             (new_line, false)
         } else {
-            // 无法继续补全，显示所有匹配（只显示文件名，不显示完整路径）
-            println!();
-            for m in &matches {
-                // 提取 basename：去掉路径前缀和尾随 /
+            // 无法继续补全，显示所有匹配（列格式排列）
+            // 提取每个匹配的显示名（basename + 目录尾随 /）
+            let displays: Vec<String> = matches.iter().map(|m| {
                 let name = std::path::Path::new(m.trim_end_matches('/'))
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| m.clone());
-                // 如果原始 match 以 / 结尾（目录），显示时也加 /
-                let display = if m.ends_with('/') {
+                if m.ends_with('/') {
                     format!("{}/", name)
                 } else {
                     name
-                };
-                print!("{}  ", display);
-            }
-            println!();
+                }
+            }).collect();
+            print_completions(&displays);
             (line.to_string(), true)
         }
     }
@@ -574,6 +571,32 @@ fn common_prefix(strs: &[String]) -> String {
         }
     }
     first[..len].to_string()
+}
+
+/// 以列格式打印补全选项（类似 bash compgen）。
+/// 自动计算列宽，按终端宽度（默认 80）排列为多列。
+fn print_completions(items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    println!();
+
+    // 计算最长项宽度
+    let max_len = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    // 列宽 = 最长项 + 2 个空格间距
+    let col_width = max_len + 2;
+    // 终端宽度（rbox 环境通常为 80）
+    let term_width = 80usize;
+    let cols = (term_width / col_width).max(1);
+
+    for (i, item) in items.iter().enumerate() {
+        let pad = col_width - item.chars().count();
+        print!("{}{}", item, " ".repeat(pad));
+        // 换行条件：最后一列或最后一个元素
+        if (i + 1) % cols == 0 || i == items.len() - 1 {
+            println!();
+        }
+    }
 }
 
 /// 找到最后一个词的开始位置。
