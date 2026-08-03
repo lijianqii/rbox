@@ -120,19 +120,37 @@ fn complete_command(prefix: &str) -> Vec<String> {
 fn complete_file(prefix: &str) -> Vec<String> {
     let path = std::path::Path::new(prefix);
 
-    let (search_dir, prefix_name) = if prefix.ends_with('/') {
-        (path.to_path_buf(), String::new())
+    let (search_dir, prefix_name, base) = if prefix.ends_with('/') {
+        // /proc/ -> 在 /proc/ 中搜索，空前缀
+        (path.to_path_buf(), String::new(), prefix.to_string())
     } else if let Some(parent) = path.parent() {
         if parent.as_os_str().is_empty() {
+            // pro -> 在 . 中搜索，前缀 pro
             (
                 std::path::PathBuf::from("."),
-                path.to_string_lossy().into_owned(),
+                prefix.to_string(),
+                String::new(),
             )
         } else {
-            (parent.to_path_buf(), path.to_string_lossy().into_owned())
+            // /pro -> 在 / 中搜索，前缀 pro，base /
+            // /bin/l -> 在 /bin 中搜索，前缀 l，base /bin/
+            let fname = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let b = if parent == std::path::Path::new("/") {
+                "/".to_string()
+            } else {
+                format!("{}/", parent.to_string_lossy())
+            };
+            (parent.to_path_buf(), fname, b)
         }
     } else {
-        (std::path::PathBuf::from("."), prefix.to_string())
+        (
+            std::path::PathBuf::from("."),
+            prefix.to_string(),
+            String::new(),
+        )
     };
 
     let entries = match std::fs::read_dir(&search_dir) {
@@ -140,27 +158,11 @@ fn complete_file(prefix: &str) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    let base = if prefix.ends_with('/') {
-        prefix.to_string()
-    } else if let Some(parent) = path.parent() {
-        if parent.as_os_str().is_empty() {
-            String::new()
-        } else {
-            format!("{}/", parent.to_string_lossy())
-        }
-    } else {
-        String::new()
-    };
-
     let mut matches: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with(&prefix_name) {
-            let full = if base.is_empty() {
-                name.clone()
-            } else {
-                format!("{}{}", base, name)
-            };
+            let full = format!("{}{}", base, name);
             // 目录加尾随 /
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 matches.push(format!("{}/", full));
@@ -334,5 +336,36 @@ mod tests {
     fn complete_after_semicolon() {
         let (line, _) = tab_complete("echo a; ec");
         assert_eq!(line, "echo a; echo ");
+    }
+
+    // ─── complete_file 路径补全 ─────────────────
+
+    #[test]
+    fn file_complete_root_prefix() {
+        // /pro -> 在 / 中搜索 pro
+        let matches = complete_file("/pro");
+        // 至少应该匹配到 /proc/
+        assert!(matches.iter().any(|m| m == "/proc/"));
+    }
+
+    #[test]
+    fn file_complete_nested_path() {
+        // /etc/pa -> 在 /etc 中搜索 pa
+        let matches = complete_file("/etc/pa");
+        // 应该至少匹配到 /etc/passwd
+        assert!(matches.iter().any(|m| m == "/etc/passwd"));
+    }
+
+    #[test]
+    fn file_complete_trailing_slash() {
+        // /bin/ -> 在 /bin 中搜索空前缀，列出所有文件
+        let matches = complete_file("/bin/");
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn file_complete_no_match() {
+        let matches = complete_file("/zzzznonexistent");
+        assert!(matches.is_empty());
     }
 }
