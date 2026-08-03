@@ -1,8 +1,8 @@
 //! 执行器：执行命令列表、管道、重定向、外部命令查找。
 
-use super::builtin::{try_builtin, BuiltinResult};
-use super::expander::expand_pipeline;
+use super::builtin::{BuiltinResult, try_builtin};
 use super::expander::expand_history;
+use super::expander::expand_pipeline;
 use super::parser::build_command_list;
 use super::tokenizer::tokenize;
 use super::types::*;
@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 /// 执行一行命令。返回退出码。exit_fn 用于 `exit` 内置命令。
 pub fn execute_line<F>(line: &str, last_rc: &mut i32, history: &[String], exit_fn: F) -> i32
 where
-    F: Fn(i32) -> (),
+    F: Fn(i32),
 {
     // 历史扩展：!! -> 上一条命令，!n -> 第 n 条，!$ -> 上一条命令的最后一个参数
     let expanded_line = expand_history(line, history);
@@ -130,12 +130,12 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         }
 
         // 管道中间命令的 stdin 来自前一个命令的 stdout
-        if i > 0 && cmd.stdin_file.is_none() {
-            if let Some(prev) = children.last_mut() {
-                if let Some(stdout) = prev.stdout.take() {
-                    command.stdin(Stdio::from(stdout));
-                }
-            }
+        if i > 0
+            && cmd.stdin_file.is_none()
+            && let Some(prev) = children.last_mut()
+            && let Some(stdout) = prev.stdout.take()
+        {
+            command.stdin(Stdio::from(stdout));
         }
 
         match command.spawn() {

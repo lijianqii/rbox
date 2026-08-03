@@ -120,10 +120,10 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
                     continue;
                 }
                 b'$' => {
-                    if let Some(last) = history.last() {
-                        if let Some(arg) = last.split_whitespace().next_back() {
-                            result.push_str(arg);
-                        }
+                    if let Some(last) = history.last()
+                        && let Some(arg) = last.split_whitespace().next_back()
+                    {
+                        result.push_str(arg);
                     }
                     i += 2;
                     continue;
@@ -135,17 +135,15 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
                     while end < bytes.len() && bytes[end].is_ascii_digit() {
                         end += 1;
                     }
-                    if end > start {
-                        if let Ok(n) = std::str::from_utf8(&bytes[start..end])
-                            .unwrap()
-                            .parse::<usize>()
-                        {
-                            if n > 0 && n <= history.len() {
-                                result.push_str(&history[history.len() - n]);
-                                i = end;
-                                continue;
-                            }
-                        }
+                    if end > start
+                        && let Ok(s) = std::str::from_utf8(&bytes[start..end])
+                        && let Ok(n) = s.parse::<usize>()
+                        && n > 0
+                        && n <= history.len()
+                    {
+                        result.push_str(&history[history.len() - n]);
+                        i = end;
+                        continue;
                     }
                 }
                 c if c.is_ascii_digit() => {
@@ -155,15 +153,14 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
                     while end < bytes.len() && bytes[end].is_ascii_digit() {
                         end += 1;
                     }
-                    if let Ok(n) = std::str::from_utf8(&bytes[start..end])
-                        .unwrap()
-                        .parse::<usize>()
+                    if let Ok(s) = std::str::from_utf8(&bytes[start..end])
+                        && let Ok(n) = s.parse::<usize>()
+                        && n > 0
+                        && n <= history.len()
                     {
-                        if n > 0 && n <= history.len() {
-                            result.push_str(&history[n - 1]);
-                            i = end;
-                            continue;
-                        }
+                        result.push_str(&history[n - 1]);
+                        i = end;
+                        continue;
                     }
                 }
                 _ => {}
@@ -289,7 +286,11 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
                     idx += 1;
                 }
             }
-            let rest = if idx < p.len() { &p[idx + 1..] } else { &p[idx..] };
+            let rest = if idx < p.len() {
+                &p[idx + 1..]
+            } else {
+                &p[idx..]
+            };
             if matched != negate {
                 glob_match_inner(rest, &t[1..])
             } else {
@@ -302,5 +303,167 @@ fn glob_match_inner(p: &[char], t: &[char]) -> bool {
             }
             glob_match_inner(&p[1..], &t[1..])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── 变量展开 ──────────────────────────────
+
+    #[test]
+    fn expand_simple_var() {
+        unsafe {
+            std::env::set_var("RBOX_TEST_VAR", "hello");
+        }
+        assert_eq!(expand_vars("$RBOX_TEST_VAR", 0), "hello");
+        unsafe {
+            std::env::remove_var("RBOX_TEST_VAR");
+        }
+    }
+
+    #[test]
+    fn expand_brace_var() {
+        unsafe {
+            std::env::set_var("RBOX_TEST_VAR", "world");
+        }
+        assert_eq!(expand_vars("${RBOX_TEST_VAR}_x", 0), "world_x");
+        unsafe {
+            std::env::remove_var("RBOX_TEST_VAR");
+        }
+    }
+
+    #[test]
+    fn expand_exit_code() {
+        assert_eq!(expand_vars("rc=$?", 42), "rc=42");
+    }
+
+    #[test]
+    fn expand_pid() {
+        let result = expand_vars("pid=$$", 0);
+        assert!(result.starts_with("pid="));
+        assert!(result.len() > 4);
+    }
+
+    #[test]
+    fn expand_unset_var() {
+        assert_eq!(expand_vars("$RBOX_NONEXIST", 0), "");
+    }
+
+    #[test]
+    fn expand_literal_dollar() {
+        assert_eq!(expand_vars("cost is $5", 0), "cost is $5");
+    }
+
+    // ─── 历史扩展 ──────────────────────────────
+
+    #[test]
+    fn hist_bang_bang() {
+        let history = vec!["echo hello".to_string()];
+        assert_eq!(expand_history("!!", &history), "echo hello");
+    }
+
+    #[test]
+    fn hist_bang_n() {
+        let history = vec!["echo a".to_string(), "echo b".to_string()];
+        assert_eq!(expand_history("!1", &history), "echo a");
+        assert_eq!(expand_history("!2", &history), "echo b");
+    }
+
+    #[test]
+    fn hist_bang_minus_n() {
+        let history = vec!["echo a".to_string(), "echo b".to_string()];
+        assert_eq!(expand_history("!-1", &history), "echo b");
+        assert_eq!(expand_history("!-2", &history), "echo a");
+    }
+
+    #[test]
+    fn hist_bang_dollar() {
+        let history = vec!["echo aaa bbb ccc".to_string()];
+        assert_eq!(expand_history("echo !$", &history), "echo ccc");
+    }
+
+    #[test]
+    fn hist_no_expansion_when_empty() {
+        assert_eq!(expand_history("!!", &[]), "!!");
+    }
+
+    #[test]
+    fn hist_no_bang() {
+        let history = vec!["echo hello".to_string()];
+        assert_eq!(expand_history("echo hi", &history), "echo hi");
+    }
+
+    // ─── Tilde 展开 ─────────────────────────────
+
+    #[test]
+    fn tilde_only() {
+        unsafe {
+            std::env::set_var("HOME", "/root");
+        }
+        assert_eq!(expand_tilde("~"), "/root");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn tilde_with_path() {
+        unsafe {
+            std::env::set_var("HOME", "/root");
+        }
+        assert_eq!(expand_tilde("~/dir/file"), "/root/dir/file");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    #[test]
+    fn tilde_not_at_start() {
+        assert_eq!(expand_tilde("echo ~"), "echo ~");
+    }
+
+    // ─── Glob 匹配 ────────────────────────────
+
+    #[test]
+    fn glob_star_match_all() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*.txt", "file.txt"));
+        assert!(!glob_match("*.txt", "file.rs"));
+    }
+
+    #[test]
+    fn glob_question_single_char() {
+        assert!(glob_match("?", "a"));
+        assert!(!glob_match("?", "ab"));
+        assert!(glob_match("a?c", "abc"));
+    }
+
+    #[test]
+    fn glob_bracket_set() {
+        assert!(glob_match("[abc]", "a"));
+        assert!(glob_match("[abc]", "b"));
+        assert!(!glob_match("[abc]", "d"));
+    }
+
+    #[test]
+    fn glob_bracket_range() {
+        assert!(glob_match("[0-9]", "5"));
+        assert!(!glob_match("[0-9]", "a"));
+        assert!(glob_match("[a-z]", "x"));
+    }
+
+    #[test]
+    fn glob_bracket_negate() {
+        assert!(!glob_match("[!abc]", "a"));
+        assert!(glob_match("[!abc]", "d"));
+    }
+
+    #[test]
+    fn glob_complex() {
+        assert!(glob_match("*.rs", "main.rs"));
+        assert!(glob_match("file[0-9]?", "file5a"));
+        assert!(!glob_match("file[0-9]?", "fileab"));
     }
 }

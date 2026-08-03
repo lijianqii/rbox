@@ -262,16 +262,18 @@ fn reap_with_shutdown(
                 }
             }
             // 2a. 到达 RestartSec 退避时间点则重新拉起
-            if let Some(at) = svc.next_restart_at {
-                if std::time::Instant::now() >= at && !shutdown_requested() && !svc.stopped {
-                    svc.next_restart_at = None;
-                    log(&format!(
-                        "rbox init: restarting {} (Restart=on-failure, attempt {})",
-                        svc.name,
-                        svc.fail_count + 1
-                    ));
-                    respawn_service(svc);
-                }
+            if let Some(at) = svc.next_restart_at
+                && std::time::Instant::now() >= at
+                && !shutdown_requested()
+                && !svc.stopped
+            {
+                svc.next_restart_at = None;
+                log(&format!(
+                    "rbox init: restarting {} (Restart=on-failure, attempt {})",
+                    svc.name,
+                    svc.fail_count + 1
+                ));
+                respawn_service(svc);
             }
         }
 
@@ -279,17 +281,17 @@ fn reap_with_shutdown(
         reap_orphans(services, &mut console);
 
         // 2.5 响应控制请求（rbox status / rservice）
-        if let Some(listener) = &status_listener {
-            if let Ok((stream, _)) = listener.accept() {
-                handle_control_connection(
-                    stream,
-                    console_name,
-                    console_reload,
-                    console.as_ref(),
-                    services,
-                    units,
-                );
-            }
+        if let Some(listener) = &status_listener
+            && let Ok((stream, _)) = listener.accept()
+        {
+            handle_control_connection(
+                stream,
+                console_name,
+                console_reload,
+                console.as_ref(),
+                services,
+                units,
+            );
         }
 
         // 3. 关机/重启标志
@@ -317,12 +319,12 @@ fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::proc
             break; // 0 = 无已退出子进程，-1 = 无子进程
         }
         let pid = pid as u32;
-        if let Some(c) = console.as_mut() {
-            if c.id() == pid {
-                log("rbox init: console shell reaped");
-                *console = None;
-                continue;
-            }
+        if let Some(c) = console.as_mut()
+            && c.id() == pid
+        {
+            log("rbox init: console shell reaped");
+            *console = None;
+            continue;
         }
         for svc in services.iter_mut() {
             // forking daemon 退出（被收养的 daemon 由这里匹配并触发重启调度）
@@ -333,12 +335,12 @@ fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::proc
                 schedule_restart(svc, failed);
                 break;
             }
-            if let Some(child) = svc.child.as_mut() {
-                if child.id() == pid {
-                    log(&format!("rbox init: service {} reaped", svc.name));
-                    svc.child = None;
-                    break;
-                }
+            if let Some(child) = svc.child.as_mut()
+                && child.id() == pid
+            {
+                log(&format!("rbox init: service {} reaped", svc.name));
+                svc.child = None;
+                break;
             }
         }
     }

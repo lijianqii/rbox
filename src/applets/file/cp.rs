@@ -5,9 +5,9 @@
 //! 不递归复制目录（保持简单）。
 
 use crate::applet::Applet;
+use crate::applets::file::util::{is_dir, resolve_dest};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::Path;
 use std::process::ExitCode;
 
 pub struct Cp;
@@ -21,7 +21,6 @@ impl Applet for Cp {
         "cp SOURCE DEST | cp SOURCE... DIR - copy files"
     }
     fn run(&self, args: &[String]) -> ExitCode {
-        // 跳过选项（暂不处理，保留扩展）
         let files: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         if files.len() < 2 {
             eprintln!("cp: missing operand");
@@ -29,16 +28,14 @@ impl Applet for Cp {
         }
 
         let dest = files[files.len() - 1];
-        let dest_meta = fs::metadata(dest);
-        let dest_is_dir = dest_meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let dest_is_dir = is_dir(dest);
 
         let mut had_error = false;
 
         if files.len() == 2 {
             // 单源
-            let src = files[0];
-            if let Err(e) = copy_one(src, dest, dest_is_dir) {
-                eprintln!("cp: {}: {}", src, e);
+            if let Err(e) = copy_one(files[0], dest, dest_is_dir) {
+                eprintln!("cp: {}: {}", files[0], e);
                 had_error = true;
             }
         } else {
@@ -66,17 +63,13 @@ impl Applet for Cp {
 fn copy_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
     let src_meta = fs::metadata(src)?;
     if src_meta.is_dir() {
-        // 不支持递归
-        return Err(io::Error::new(io::ErrorKind::Other, "omitting directory (not supported)"));
+        return Err(io::Error::other("omitting directory (not supported)"));
     }
 
     let dest_path = if dest_is_dir {
-        let name = Path::new(src)
-            .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "cannot determine filename"))?;
-        Path::new(dest).join(name)
+        resolve_dest(src, dest)?
     } else {
-        Path::new(dest).to_path_buf()
+        std::path::Path::new(dest).to_path_buf()
     };
 
     let mut f_in = fs::File::open(src)?;

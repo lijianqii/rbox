@@ -1,10 +1,10 @@
 //! 文件与目录操作 applet。
-pub mod ls;
+pub mod cat;
 pub mod cp;
+pub mod ln;
+pub mod ls;
+pub mod mkdir;
 pub mod mv;
 pub mod rm;
-pub mod mkdir;
 pub mod touch;
-pub mod ln;
-pub mod cat;
 pub(crate) mod util;

@@ -139,26 +139,26 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                match toml::from_str::<Unit>(&content) {
-                    Ok(mut unit) => {
-                        // 文件名去掉 .toml；单元名优先用 [Unit] Name，缺省回退文件名
-                        let file_stem = path
-                            .file_stem()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        unit.is_target = is_target_file(&file_stem);
-                        unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
-                        units.insert(unit.name.clone(), unit);
-                    }
-                    Err(e) => {
-                        crate::applets::core::log(&format!(
-                            "rbox init: parse error in {}: {}",
-                            path.display(),
-                            e
-                        ));
-                    }
+        if path.extension().and_then(|e| e.to_str()) == Some("toml")
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            match toml::from_str::<Unit>(&content) {
+                Ok(mut unit) => {
+                    // 文件名去掉 .toml；单元名优先用 [Unit] Name，缺省回退文件名
+                    let file_stem = path
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    unit.is_target = is_target_file(&file_stem);
+                    unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
+                    units.insert(unit.name.clone(), unit);
+                }
+                Err(e) => {
+                    crate::applets::core::log(&format!(
+                        "rbox init: parse error in {}: {}",
+                        path.display(),
+                        e
+                    ));
                 }
             }
         }

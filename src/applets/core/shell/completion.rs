@@ -89,10 +89,8 @@ fn complete_command(prefix: &str) -> Vec<String> {
 
     // 内置命令（shell builtin）
     for builtin in &["cd", "exit", "export", "unset", "pwd", "history"] {
-        if builtin.starts_with(prefix) {
-            if !matches.iter().any(|m| m == *builtin) {
-                matches.push(builtin.to_string());
-            }
+        if builtin.starts_with(prefix) && !matches.iter().any(|m| m == *builtin) {
+            matches.push(builtin.to_string());
         }
     }
 
@@ -105,10 +103,8 @@ fn complete_command(prefix: &str) -> Vec<String> {
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with(prefix) {
-                        if !matches.iter().any(|m| m == &name) {
-                            matches.push(name);
-                        }
+                    if name.starts_with(prefix) && !matches.iter().any(|m| m == &name) {
+                        matches.push(name);
                     }
                 }
             }
@@ -128,7 +124,10 @@ fn complete_file(prefix: &str) -> Vec<String> {
         (path.to_path_buf(), String::new())
     } else if let Some(parent) = path.parent() {
         if parent.as_os_str().is_empty() {
-            (std::path::PathBuf::from("."), path.to_string_lossy().into_owned())
+            (
+                std::path::PathBuf::from("."),
+                path.to_string_lossy().into_owned(),
+            )
         } else {
             (parent.to_path_buf(), path.to_string_lossy().into_owned())
         }
@@ -163,11 +162,7 @@ fn complete_file(prefix: &str) -> Vec<String> {
                 format!("{}{}", base, name)
             };
             // 目录加尾随 /
-            if entry
-                .file_type()
-                .map(|ft| ft.is_dir())
-                .unwrap_or(false)
-            {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 matches.push(format!("{}/", full));
             } else {
                 matches.push(full);
@@ -232,12 +227,112 @@ fn find_last_word_start(line: &str) -> usize {
     // 找到词的开始
     while i > 0 {
         let c = bytes[i - 1];
-        if c == b' ' || c == b'\t' || c == b'|' || c == b';' || c == b'&'
-            || c == b'>' || c == b'<'
+        if c == b' ' || c == b'\t' || c == b'|' || c == b';' || c == b'&' || c == b'>' || c == b'<'
         {
             break;
         }
         i -= 1;
     }
     i
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── find_last_word_start ────────────────────
+
+    #[test]
+    fn word_start_simple() {
+        assert_eq!(find_last_word_start("echo hel"), 5);
+    }
+
+    #[test]
+    fn word_start_first_word() {
+        assert_eq!(find_last_word_start("ech"), 0);
+    }
+
+    #[test]
+    fn word_start_after_pipe() {
+        assert_eq!(find_last_word_start("cat | gr"), 6);
+    }
+
+    #[test]
+    fn word_start_after_semicolon() {
+        assert_eq!(find_last_word_start("echo a; ec"), 8);
+    }
+
+    #[test]
+    fn word_start_after_redirect() {
+        assert_eq!(find_last_word_start("echo > f"), 7);
+    }
+
+    #[test]
+    fn word_start_trailing_space() {
+        // trailing space -> word_start at end (empty prefix)
+        assert_eq!(find_last_word_start("echo "), 0);
+    }
+
+    // ─── common_prefix ──────────────────────────
+
+    #[test]
+    fn common_prefix_basic() {
+        assert_eq!(common_prefix(&["abc".into(), "abd".into()]), "ab");
+    }
+
+    #[test]
+    fn common_prefix_identical() {
+        assert_eq!(common_prefix(&["abc".into(), "abc".into()]), "abc");
+    }
+
+    #[test]
+    fn common_prefix_no_common() {
+        assert_eq!(common_prefix(&["abc".into(), "xyz".into()]), "");
+    }
+
+    #[test]
+    fn common_prefix_single() {
+        assert_eq!(common_prefix(&["abc".into()]), "abc");
+    }
+
+    #[test]
+    fn common_prefix_empty() {
+        assert_eq!(common_prefix(&[]), "");
+    }
+
+    // ─── tab_complete ───────────────────────────
+
+    #[test]
+    fn complete_empty_line_noop() {
+        let (line, printed) = tab_complete("");
+        assert_eq!(line, "");
+        assert!(!printed);
+    }
+
+    #[test]
+    fn complete_command_echo() {
+        let (line, printed) = tab_complete("ec");
+        // Should complete to "echo " (with trailing space for file)
+        assert_eq!(line, "echo ");
+        assert!(!printed);
+    }
+
+    #[test]
+    fn complete_command_partial_no_match() {
+        let (line, _) = tab_complete("zzzz");
+        assert_eq!(line, "zzzz");
+    }
+
+    #[test]
+    fn complete_after_pipe() {
+        let (line, printed) = tab_complete("cat | ec");
+        assert_eq!(line, "cat | echo ");
+        assert!(!printed);
+    }
+
+    #[test]
+    fn complete_after_semicolon() {
+        let (line, _) = tab_complete("echo a; ec");
+        assert_eq!(line, "echo a; echo ");
+    }
 }

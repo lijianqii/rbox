@@ -1,11 +1,11 @@
 //! 系统核心 applet：init 与配套管理工具。
+pub(crate) mod control;
 pub mod init;
+pub mod reboot;
+pub mod rservice;
 pub mod shell;
 pub mod shutdown;
-pub mod reboot;
 pub mod status;
-pub mod rservice;
-pub(crate) mod control;
 
 use std::fs;
 use std::io::Write;

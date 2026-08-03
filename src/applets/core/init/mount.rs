@@ -141,9 +141,12 @@ pub(crate) fn apply_sysctl(path: &str) {
 
 fn run_mount(src: &str, tgt: &str, fstype: &str, options: &str) -> std::io::Result<()> {
     use std::ffi::CString;
-    let s = CString::new(src).unwrap();
-    let t = CString::new(tgt).unwrap();
-    let f = CString::new(fstype).unwrap();
+    let s =
+        CString::new(src).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let t =
+        CString::new(tgt).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let f = CString::new(fstype)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let rc = unsafe {
         libc::mount(
             s.as_ptr(),

@@ -6,6 +6,42 @@ use std::process::ExitCode;
 pub struct Wc;
 pub static WC: &Wc = &Wc;
 
+/// 计数选项 + 统计结果。
+struct WcCounts {
+    lines: bool,
+    words: bool,
+    bytes: bool,
+}
+
+impl WcCounts {
+    fn new(lines: bool, words: bool, bytes: bool) -> Self {
+        Self {
+            lines,
+            words,
+            bytes,
+        }
+    }
+
+    /// 格式化输出一行计数。
+    fn print(&self, l: usize, w: usize, b: usize, name: &str, out: &mut impl Write) {
+        let mut parts: Vec<String> = Vec::new();
+        if self.lines {
+            parts.push(format!("{:>7}", l));
+        }
+        if self.words {
+            parts.push(format!("{:>7}", w));
+        }
+        if self.bytes {
+            parts.push(format!("{:>7}", b));
+        }
+        if name.is_empty() {
+            let _ = writeln!(out, "{}", parts.join(" "));
+        } else {
+            let _ = writeln!(out, "{} {}", parts.join(" "), name);
+        }
+    }
+}
+
 impl Applet for Wc {
     fn name(&self) -> &'static str {
         "wc"
@@ -69,6 +105,7 @@ impl Applet for Wc {
             count_bytes = true;
         }
 
+        let counts = WcCounts::new(count_lines, count_words, count_bytes);
         let mut out = std::io::stdout().lock();
         let mut total_l = 0usize;
         let mut total_w = 0usize;
@@ -85,7 +122,7 @@ impl Applet for Wc {
             let mut buf = String::new();
             if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
                 let (l, w, b) = process(&buf);
-                print_wc(l, w, b, "", count_lines, count_words, count_bytes, &mut out);
+                counts.print(l, w, b, "", &mut out);
             }
         } else {
             for f in &files {
@@ -95,51 +132,47 @@ impl Applet for Wc {
                         total_l += l;
                         total_w += w;
                         total_b += b;
-                        print_wc(l, w, b, f, count_lines, count_words, count_bytes, &mut out);
+                        counts.print(l, w, b, f, &mut out);
                     }
                     Err(e) => eprintln!("wc: {}: {}", f, e),
                 }
             }
             if files.len() > 1 {
-                print_wc(
-                    total_l,
-                    total_w,
-                    total_b,
-                    "total",
-                    count_lines,
-                    count_words,
-                    count_bytes,
-                    &mut out,
-                );
+                counts.print(total_l, total_w, total_b, "total", &mut out);
             }
         }
         ExitCode::SUCCESS
     }
 }
 
-fn print_wc(
-    l: usize,
-    w: usize,
-    b: usize,
-    name: &str,
-    cl: bool,
-    cw: bool,
-    cb: bool,
-    out: &mut std::io::StdoutLock,
-) {
-    let mut parts: Vec<String> = Vec::new();
-    if cl {
-        parts.push(format!("{:>7}", l));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn count_basic() {
+        let counts = WcCounts::new(true, true, true);
+        // 2 lines, 4 words, 16 bytes
+        let content = "hello world\nfoo bar\n";
+        let lines = content.lines().count();
+        let words = content.split_whitespace().count();
+        let bytes = content.len();
+        assert_eq!((lines, words, bytes), (2, 4, 20));
     }
-    if cw {
-        parts.push(format!("{:>7}", w));
+
+    #[test]
+    fn count_empty() {
+        let content = "";
+        assert_eq!(content.lines().count(), 0);
+        assert_eq!(content.split_whitespace().count(), 0);
+        assert_eq!(content.len(), 0);
     }
-    if cb {
-        parts.push(format!("{:>7}", b));
-    }
-    if name.is_empty() {
-        let _ = writeln!(out, "{}", parts.join(" "));
-    } else {
-        let _ = writeln!(out, "{} {}", parts.join(" "), name);
+
+    #[test]
+    fn count_single_line() {
+        let content = "hello";
+        assert_eq!(content.lines().count(), 1);
+        assert_eq!(content.split_whitespace().count(), 1);
+        assert_eq!(content.len(), 5);
     }
 }

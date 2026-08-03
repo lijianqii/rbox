@@ -43,8 +43,16 @@ fn main() -> ExitCode {
         (sub.as_str(), &raw_args[2..])
     } else {
         // argv[0] 分发模式：basename 即命令名（如 bin/echo -> rbox）
+        let app_args = &raw_args[1..];
+        // 拦截 --help/-h
+        if app_args.first().is_some_and(|a| a == "--help" || a == "-h")
+            && let Some(app) = applet_for(&basename)
+        {
+            eprintln!("{}", app.help());
+            return ExitCode::SUCCESS;
+        }
         return match applet_for(&basename) {
-            Some(app) => app.run(&raw_args[1..]),
+            Some(app) => app.run(app_args),
             None => {
                 eprintln!("rbox: unknown command '{}'", basename);
                 print_usage(false)
@@ -53,6 +61,14 @@ fn main() -> ExitCode {
     };
 
     // subcommand 模式查找
+    // 拦截 --help/-h：打印该 applet 的帮助信息
+    if args.first().is_some_and(|a| a == "--help" || a == "-h")
+        && let Some(app) = applet_for(cmd)
+    {
+        eprintln!("{}", app.help());
+        return ExitCode::SUCCESS;
+    }
+
     match applet_for(cmd) {
         Some(app) => app.run(args),
         None => {

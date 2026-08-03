@@ -58,11 +58,11 @@ pub fn tokenize(line: &str) -> Vec<Token> {
         match c {
             '#' if !in_token => break,
             '\\' => {
-                if let Some(next) = chars.next() {
-                    if next != '\n' {
-                        cur.push(next);
-                        in_token = true;
-                    }
+                if let Some(next) = chars.next()
+                    && next != '\n'
+                {
+                    cur.push(next);
+                    in_token = true;
                 }
             }
             '\'' => {
@@ -128,5 +128,160 @@ fn flush_word(tokens: &mut Vec<Token>, cur: &mut String, in_token: &mut bool) {
     if *in_token {
         tokens.push(Token::Word(std::mem::take(cur)));
         *in_token = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_words() {
+        let tokens = tokenize("echo hello world");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hello".into()),
+                Token::Word("world".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_quotes() {
+        let tokens = tokenize("echo \"hello world\" ");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hello world".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quotes() {
+        let tokens = tokenize("echo 'a $B c'");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("a $B c".into()),]
+        );
+    }
+
+    #[test]
+    fn backslash_escape() {
+        let tokens = tokenize(r"echo a\ b");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("a b".into()),]
+        );
+    }
+
+    #[test]
+    fn pipe_operator() {
+        let tokens = tokenize("cat | grep foo");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("cat".into()),
+                Token::Pipe,
+                Token::Word("grep".into()),
+                Token::Word("foo".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn redirect_operators() {
+        let tokens = tokenize("echo > f && cat >> f");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::RedirOut,
+                Token::Word("f".into()),
+                Token::AndIf,
+                Token::Word("cat".into()),
+                Token::RedirAppend,
+                Token::Word("f".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_redirect() {
+        let tokens = tokenize("cat < input.txt");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("cat".into()),
+                Token::RedirIn,
+                Token::Word("input.txt".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn semicolons_and_background() {
+        let tokens = tokenize("a ; b & c");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("a".into()),
+                Token::Semicolon,
+                Token::Word("b".into()),
+                Token::Background,
+                Token::Word("c".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn or_if() {
+        let tokens = tokenize("false || echo fail");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("false".into()),
+                Token::OrIf,
+                Token::Word("echo".into()),
+                Token::Word("fail".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_ignored() {
+        let tokens = tokenize("echo hi # this is a comment");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("hi".into()),]
+        );
+    }
+
+    #[test]
+    fn empty_input() {
+        let tokens = tokenize("");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only() {
+        let tokens = tokenize("   \t  ");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn multiple_spaces() {
+        let tokens = tokenize("echo    a     b");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("a".into()),
+                Token::Word("b".into()),
+            ]
+        );
     }
 }

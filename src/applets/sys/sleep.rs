@@ -6,8 +6,12 @@ pub struct Sleep;
 pub static SLEEP: &Sleep = &Sleep;
 
 impl Applet for Sleep {
-    fn name(&self) -> &'static str { "sleep" }
-    fn help(&self) -> &'static str { "sleep N - pause for N seconds" }
+    fn name(&self) -> &'static str {
+        "sleep"
+    }
+    fn help(&self) -> &'static str {
+        "sleep N - pause for N seconds"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
         if args.is_empty() {
             eprintln!("sleep: missing operand");

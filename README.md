@@ -2,7 +2,7 @@
 
 一个用 Rust 编写的 BusyBox 风格多合一（multi-call）二进制，交叉编译为 ARM64 (aarch64)，
 运行在 QEMU 全系统模拟中。包含一个 systemd 风格的 init（PID 1，TOML 配置）、
-一个支持管道/重定向的极简 shell，以及 29 个常用命令。
+一个支持管道/重定向/历史/Tab 补全的交互式 shell，以及 29 个常用命令。
 
 ## 特性
 
@@ -12,7 +12,16 @@
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
 - **有序关机/重启**：ExecStop 逆序执行、进程组清理、孤儿进程收割、kmsg 日志
 - **系统初始化**：`/etc/fstab` 挂载、hostname、sysctl、PATH
-- **极简 shell**：管道、输入/输出重定向、双引号、转义
+- **交互式 shell**：
+  - 管道 `|`、重定向 `>` `>>` `<`、后台 `&`
+  - 控制操作符 `;` `&&` `||`
+  - 环境变量 `export VAR=val`、变量展开 `$VAR` `${VAR}` `$?` `$$`
+  - 命令历史（上下键浏览）、`!!` `!n` `!-n` 历史展开
+  - 行编辑：左右键移动光标、Ctrl-A/E/U/W/L、Home/End
+  - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
+  - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
+  - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
+- **工程化**：Clippy 零警告、126 个单元测试、46 个集成测试、rustfmt、GitHub Actions CI
 
 ## 快速开始
 
@@ -21,6 +30,7 @@ make all       # 交叉编译 + rootfs + initramfs
 make run       # QEMU 全系统模拟启动
 make test      # 集成测试（QEMU 自动化验证）
 make unittest  # 宿主机单元测试
+make verify    # check + clippy + unittest 一键验证
 ```
 
 依赖：Rust 工具链（`rustup target add aarch64-unknown-linux-gnu`）、
@@ -30,7 +40,7 @@ make unittest  # 宿主机单元测试
 
 ```
 src/applets/
-├── core/     # 系统核心：init（PID 1）及内部模块、shell、shutdown、reboot、status、rservice
+├── core/     # 系统核心：init（PID 1）及内部模块、shell/、shutdown、reboot、status、rservice
 ├── file/     # 文件操作：ls、cp、mv、rm、mkdir、touch、ln、cat
 ├── text/     # 文本处理：head、tail、wc、grep、printf、echo、basename、dirname
 └── sys/      # 系统工具：true、false、pwd、uname、date、sleep、env

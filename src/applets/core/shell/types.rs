@@ -1,7 +1,7 @@
 //! Shell 数据结构：Token、SimpleCmd、Pipeline、CommandList。
 
 /// 分词器产生的 Token。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     /// 普通参数（已去除引号/转义）。
     Word(String),
@@ -24,7 +24,7 @@ pub enum Token {
 }
 
 /// 一条简单命令（不含管道/重定向操作符，但持有重定向目标）。
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct SimpleCmd {
     pub argv: Vec<String>,
     pub stdin_file: Option<String>,
@@ -40,7 +40,7 @@ impl SimpleCmd {
 }
 
 /// 管道：一条或多条 SimpleCmd 串联。
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Pipeline {
     pub cmds: Vec<SimpleCmd>,
     pub background: bool,
@@ -60,14 +60,14 @@ pub enum Connector {
 }
 
 /// 一条逻辑段（一条 Pipeline + 连接符）。
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LogicalSegment {
     pub pipeline: Pipeline,
     pub connector: Connector,
 }
 
 /// 完整的命令列表（一行解析后的结果）。
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct CommandList {
     pub segments: Vec<LogicalSegment>,
 }

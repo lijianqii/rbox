@@ -52,3 +52,43 @@ pub(crate) fn each_input(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_n_default() {
+        let args: Vec<String> = vec![];
+        let (n, files) = parse_n_files(&args, "head");
+        assert_eq!(n, 10);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn parse_n_explicit() {
+        let args = vec!["-n".to_string(), "5".to_string()];
+        let (n, _) = parse_n_files(&args, "head");
+        assert_eq!(n, 5);
+    }
+
+    #[test]
+    fn parse_n_combined() {
+        let args = vec!["-n3".to_string()];
+        let (n, _) = parse_n_files(&args, "head");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn parse_files() {
+        let args = vec![
+            "-n".to_string(),
+            "2".to_string(),
+            "a.txt".to_string(),
+            "b.txt".to_string(),
+        ];
+        let (n, files) = parse_n_files(&args, "head");
+        assert_eq!(n, 2);
+        assert_eq!(files.len(), 2);
+    }
+}

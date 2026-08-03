@@ -568,10 +568,10 @@ rbox 二进制本身支持的元命令（非 applet）：
 | 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
 | rservice 管理 | stop、start、restart、list | 4 |
 | init 增强 | ExecReload、console reload、status 单查 console、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 8 |
-| Shell 增强 | export + 变量展开、命令分隔 ;、条件执行 &&、条件执行 \|\| | 4 |
-| Tab 补全 | 命令补全 ec->echo、文件补全 /etc/host->hostname | 2 |
+| Shell 增强 | export + 变量展开、命令分隔 ;、条件执行 &&、条件执行 \|\|、上下键历史、Ctrl-A/E/U/W/L | 6 |
+| Tab 补全 | 命令补全 ec->echo、文件补全 /etc/host->hostname、管道后命令补全 | 3 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **43** |
+| **合计** | | **46** |
 
 ### 运行测试
 
@@ -591,25 +591,37 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell.rs | tokenize（引号/转义/重定向/管道/控制操作符）、build_command_list（逻辑段/语法错误）、expand_vars（$VAR/${VAR}/$?/$$）、expand_glob（* ? []）、tab_complete（命令/文件补全）、execute_pipeline（管道/后台） | 25 |
-| init.rs | parse_cmdline（引号/空段）、compute_start_order（Requires/After/WantedBy/环检测）、parse_fstab（注释/短行）、parse_mount_flags（标志映射）、parse_environment（非法项）、format_status（列表/单查/未知）、parse_control_request（status/start/stop/restart/reload/错误）、resolve_unit_name/is_target_file、parse_sysctl_conf | 24 |
-| **合计** | | **35** |
+| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 13 |
+| shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 13 |
+| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n）、expand_tilde、expand_glob（* ? []） | 21 |
+| shell/completion | find_last_word_start、complete_command、complete_file、common_prefix | 16 |
+| init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 24 |
+| text/basename | basename（路径/后缀/根/尾随斜杠） | 7 |
+| text/dirname | dirname（路径/根/无目录/尾随斜杠） | 5 |
+| text/printf | printf_format（%s/%d/%x/%c/%%/转义序列） | 12 |
+| text/wc | WcCounts（行/字/字节计数） | 4 |
+| text/util | parse_n_files（默认值/显式/-nN/多文件） | 4 |
+| file/util | remove_recursive、is_dir、resolve_dest、copy_recursive | 7 |
+| **合计** | | **126** |
 
 测试结果示例：
 
 ```
 ========================================
-rbox 集成测试
-========================================
 
-[基本 applet]          4/4 PASS
+[基本 applet]          5/5 PASS
 [文件操作]             3/3 PASS
 [管道与重定向]          3/3 PASS
-[init 启动流程]        4/4 PASS
+[init 启动流程]        5/5 PASS
+[服务管理]             6/6 PASS
+[rservice 管理]        4/4 PASS
+[init 增强]            8/8 PASS
+[Shell 增强]           6/6 PASS
+[Tab 补全]             3/3 PASS
 [关机流程]             3/3 PASS
 
 ========================================
-结果: 17 通过, 0 失败
+结果: 46 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -757,14 +769,20 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 
 ### 第四优先级：工程化进阶
 
-| 功能 | 说明 |
-|------|------|
-| CI 流水线 | GitHub Actions 自动构建 + 测试 |
-| 单元测试 | Rust #[test] 模块（已完成，见测试章节） |
-| 静态链接 musl | 减小 rootfs 依赖（aarch64-unknown-linux-musl） |
-| 压缩二进制 | UPX 或 strip 减小体积 |
-| 持久化根文件系统 | ext4 磁盘镜像 + 真正的 init（非 initramfs） |
-| 网络支持 | 内核配置 virtio-net + busybox-style 网络工具 |
+| 功能 | 说明 | 状态 |
+|------|------|------|
+| CI 流水线 | GitHub Actions 自动构建 + 测试 | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（126 个） | ✅ 已实现 |
+| Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
+| rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
+| Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
+| Makefile APPLETS 自动同步 | 从 cargo run --list 提取 applet 列表 | ✅ 已实现 |
+| 共享工具提取 | file/util.rs（remove_recursive/is_dir/resolve_dest/copy_recursive） | ✅ 已实现 |
+| applet --help 支持 | `rbox <applet> --help` 打印帮助 | ✅ 已实现 |
+| 静态链接 musl | 减小 rootfs 依赖（aarch64-unknown-linux-musl） | TODO |
+| 压缩二进制 | UPX 或 strip 减小体积 | TODO |
+| 持久化根文件系统 | ext4 磁盘镜像 + 真正的 init（非 initramfs） | TODO |
+| 网络支持 | 内核配置 virtio-net + busybox-style 网络工具 | TODO |
 
 ---
 

@@ -6,8 +6,12 @@ pub struct Env;
 pub static ENV: &Env = &Env;
 
 impl Applet for Env {
-    fn name(&self) -> &'static str { "env" }
-    fn help(&self) -> &'static str { "env [VAR=val] [cmd] - show env or run cmd with modified env" }
+    fn name(&self) -> &'static str {
+        "env"
+    }
+    fn help(&self) -> &'static str {
+        "env [VAR=val] [cmd] - show env or run cmd with modified env"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
         let mut i = 0;
         // 解析 VAR=value 形式的参数
@@ -15,7 +19,9 @@ impl Applet for Env {
             let pair = args[i].splitn(2, '=').collect::<Vec<_>>();
             if pair.len() == 2 {
                 // SAFETY: single-threaded applet context
-                unsafe { std::env::set_var(pair[0], pair[1]); }
+                unsafe {
+                    std::env::set_var(pair[0], pair[1]);
+                }
             }
             i += 1;
         }
@@ -30,9 +36,7 @@ impl Applet for Env {
         let cmd = &args[i];
         let cmd_args = &args[i + 1..];
         match std::process::Command::new(cmd).args(cmd_args).status() {
-            Ok(status) => {
-                code_from_status(status)
-            }
+            Ok(status) => code_from_status(status),
             Err(e) => {
                 eprintln!("env: {}: {}", cmd, e);
                 ExitCode::from(127)
@@ -56,6 +60,8 @@ fn code_from_status(status: std::process::ExitStatus) -> ExitCode {
             }
         }
         #[cfg(not(unix))]
-        { ExitCode::from(1) }
+        {
+            ExitCode::from(1)
+        }
     }
 }

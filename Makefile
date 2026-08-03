@@ -23,11 +23,10 @@ QEMU_KCMD := console=ttyAMA0 rdinit=/init
 # gcc -print-file-name 能解析出实际的 libc 路径，比 -print-sysroot 更可靠
 GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc.so.6 2>/dev/null))
 
-# applet 列表（与 src/applet.rs APPLETS 一致）
-APPLETS := true false echo cat pwd uname init sh ls cp mv rm mkdir touch shutdown reboot \
-          head tail wc grep ln date sleep env printf basename dirname status rservice
+# applet 列表：从 rbox --list 自动提取，避免与 src/applet.rs 手动同步
+APPLETS := $(shell cargo run --target x86_64-unknown-linux-gnu --quiet -- --list 2>/dev/null)
 
-.PHONY: all build rootfs initramfs run test unittest kernel clean help
+.PHONY: all build rootfs initramfs run test unittest verify kernel clean help
 
 all: build rootfs initramfs
 
@@ -90,6 +89,15 @@ kernel:
 	cd $(KERNEL) && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
 	cd $(KERNEL) && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$$(nproc) Image
 
+# ─── 验证（CI 用）────────────────────────────────
+verify: check clippy unittest
+
+check:
+	cargo check --target x86_64-unknown-linux-gnu
+
+clippy:
+	cargo clippy --target x86_64-unknown-linux-gnu -- -D warnings
+
 # ─── 清理 ────────────────────────────────────────
 clean:
 	cargo clean
@@ -106,5 +114,6 @@ help:
 	@echo "  make run       - QEMU 启动"
 	@echo "  make test      - 集成测试"
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"
+	@echo "  make verify    - check + clippy + unittest（CI 用）"
 	@echo "  make kernel    - 编译 ARM64 内核"
 	@echo "  make clean     - 清理产物"

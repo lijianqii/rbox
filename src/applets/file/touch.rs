@@ -47,7 +47,12 @@ impl Applet for Touch {
 
 fn touch_one(path: &str) -> io::Result<()> {
     // 确保文件存在（目录跳过创建，仅更新时间戳）
-    match OpenOptions::new().create(true).write(true).open(path) {
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::IsADirectory => {}
         Err(e) => return Err(e),
@@ -85,6 +90,6 @@ fn set_file_times(path: &str, atime: SystemTime, mtime: SystemTime) -> io::Resul
 fn to_timespec(t: SystemTime) -> io::Result<(i64, i64)> {
     let dur = t
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "time before UNIX epoch"))?;
+        .map_err(|_| io::Error::other("time before UNIX epoch"))?;
     Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }

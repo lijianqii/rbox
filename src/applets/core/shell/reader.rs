@@ -1,6 +1,6 @@
 //! 终端 raw 模式管理 + 光标重绘。
 
-use libc::{tcgetattr, tcsetattr, termios, TCSANOW};
+use libc::{TCSANOW, tcgetattr, tcsetattr, termios};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 

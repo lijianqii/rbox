@@ -7,8 +7,12 @@ pub struct Grep;
 pub static GREP: &Grep = &Grep;
 
 impl Applet for Grep {
-    fn name(&self) -> &'static str { "grep" }
-    fn help(&self) -> &'static str { "grep [-i] [-n] [-v] PATTERN [file] - search text" }
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn help(&self) -> &'static str {
+        "grep [-i] [-n] [-v] PATTERN [file] - search text"
+    }
     fn run(&self, args: &[String]) -> ExitCode {
         let mut ignore_case = false;
         let mut show_line_num = false;
@@ -20,9 +24,18 @@ impl Applet for Grep {
                 "-i" => ignore_case = true,
                 "-n" => show_line_num = true,
                 "-v" => invert = true,
-                "-in" | "-ni" => { ignore_case = true; show_line_num = true; }
-                "-iv" | "-vi" => { ignore_case = true; invert = true; }
-                "-nv" | "-vn" => { show_line_num = true; invert = true; }
+                "-in" | "-ni" => {
+                    ignore_case = true;
+                    show_line_num = true;
+                }
+                "-iv" | "-vi" => {
+                    ignore_case = true;
+                    invert = true;
+                }
+                "-nv" | "-vn" => {
+                    show_line_num = true;
+                    invert = true;
+                }
                 "-" => {}
                 s if s.starts_with('-') && s.len() > 1 && s != "--" => {
                     eprintln!("grep: unknown option: {}", s);
@@ -42,9 +55,17 @@ impl Applet for Grep {
         let mut found = false;
 
         let mut search = |content: &str, fname: Option<&str>| {
-            let pat = if ignore_case { pattern.to_lowercase() } else { pattern.to_string() };
+            let pat = if ignore_case {
+                pattern.to_lowercase()
+            } else {
+                pattern.to_string()
+            };
             for (i, line) in content.lines().enumerate() {
-                let target = if ignore_case { line.to_lowercase() } else { line.to_string() };
+                let target = if ignore_case {
+                    line.to_lowercase()
+                } else {
+                    line.to_string()
+                };
                 let matches = target.contains(&pat);
                 if matches != invert {
                     let prefix = match (show_line_num, fname) {
@@ -68,7 +89,11 @@ impl Applet for Grep {
             for f in &files {
                 match std::fs::read_to_string(f) {
                     Ok(content) => {
-                        let fname = if files.len() > 1 { Some(f.as_str()) } else { None };
+                        let fname = if files.len() > 1 {
+                            Some(f.as_str())
+                        } else {
+                            None
+                        };
                         search(&content, fname);
                     }
                     Err(e) => eprintln!("grep: {}: {}", f, e),
@@ -76,6 +101,10 @@ impl Applet for Grep {
             }
         }
 
-        if found { ExitCode::SUCCESS } else { ExitCode::from(1) }
+        if found {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }
     }
 }

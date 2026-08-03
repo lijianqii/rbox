@@ -51,12 +51,30 @@ impl Applet for Uname {
             if a.starts_with('-') && a.len() > 1 {
                 for c in a[1..].chars() {
                     match c {
-                        'a' => { want_a = true; any = true; }
-                        's' => { want_s = true; any = true; }
-                        'n' => { want_n = true; any = true; }
-                        'r' => { want_r = true; any = true; }
-                        'v' => { want_v = true; any = true; }
-                        'm' => { want_m = true; any = true; }
+                        'a' => {
+                            want_a = true;
+                            any = true;
+                        }
+                        's' => {
+                            want_s = true;
+                            any = true;
+                        }
+                        'n' => {
+                            want_n = true;
+                            any = true;
+                        }
+                        'r' => {
+                            want_r = true;
+                            any = true;
+                        }
+                        'v' => {
+                            want_v = true;
+                            any = true;
+                        }
+                        'm' => {
+                            want_m = true;
+                            any = true;
+                        }
                         _ => {}
                     }
                 }

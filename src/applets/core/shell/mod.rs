@@ -43,7 +43,7 @@ impl Applet for Shell {
 
     fn run(&self, _args: &[String]) -> std::process::ExitCode {
         match Shell::run_shell() {
-            Ok(code) => std::process::ExitCode::from(code as u8),
+            Ok(code) => std::process::ExitCode::from(code),
             Err(_) => std::process::ExitCode::from(1),
         }
     }
@@ -105,17 +105,16 @@ impl Shell {
                     }
 
                     // 执行行（历史扩展在 execute_line 内部完成）
-                    last_rc = executor::execute_line(&full_line, &mut last_rc, &history, |rc: i32| {
-                        let _ = write!(io::stdout(), "rbox# ");
-                        let _ = io::stdout().flush();
-                        std::process::exit(rc);
-                    });
+                    last_rc =
+                        executor::execute_line(&full_line, &mut last_rc, &history, |rc: i32| {
+                            let _ = write!(io::stdout(), "rbox# ");
+                            let _ = io::stdout().flush();
+                            std::process::exit(rc);
+                        });
 
                     // 存入历史（非空且与最后一条不同）
-                    if !full_line.trim().is_empty() {
-                        if history.last().map_or(true, |last| last != &full_line) {
-                            history.push(full_line.clone());
-                        }
+                    if !full_line.trim().is_empty() && history.last() != Some(&full_line) {
+                        history.push(full_line.clone());
                     }
 
                     let _ = write!(io::stdout(), "rbox# ");
@@ -226,99 +225,100 @@ impl Shell {
                 0x1b => {
                     // ESC 序列：读取后续字节（方向键、Home/End 等）
                     let mut seq = [0u8; 2];
-                    if input.read(&mut seq[..1]).unwrap_or(0) == 1 && seq[0] == b'[' {
-                        if input.read(&mut seq[1..2]).unwrap_or(0) == 1 {
-                            match seq[1] {
-                                b'A' => {
-                                    // 上：上一条历史
-                                    if !history.is_empty() {
-                                        if hist_idx.is_none() {
-                                            saved_line = line.clone();
-                                            hist_idx = Some(history.len());
-                                        }
-                                        if let Some(idx) = hist_idx {
-                                            if idx > 0 {
-                                                hist_idx = Some(idx - 1);
-                                                line = history[idx - 1].clone();
-                                                cursor = line.len();
-                                                redraw(&pending_line, &line, cursor);
-                                            }
-                                        }
+                    if input.read(&mut seq[..1]).unwrap_or(0) == 1
+                        && seq[0] == b'['
+                        && input.read(&mut seq[1..2]).unwrap_or(0) == 1
+                    {
+                        match seq[1] {
+                            b'A' => {
+                                // 上：上一条历史
+                                if !history.is_empty() {
+                                    if hist_idx.is_none() {
+                                        saved_line = line.clone();
+                                        hist_idx = Some(history.len());
                                     }
-                                }
-                                b'B' => {
-                                    // 下：下一条历史
-                                    if let Some(idx) = hist_idx {
-                                        if idx + 1 < history.len() {
-                                            hist_idx = Some(idx + 1);
-                                            line = history[idx + 1].clone();
-                                        } else {
-                                            hist_idx = None;
-                                            line = saved_line.clone();
-                                        }
+                                    if let Some(idx) = hist_idx
+                                        && idx > 0
+                                    {
+                                        hist_idx = Some(idx - 1);
+                                        line = history[idx - 1].clone();
                                         cursor = line.len();
                                         redraw(&pending_line, &line, cursor);
                                     }
                                 }
-                                b'C' => {
-                                    // 右：光标右移（UTF-8 字符边界）
-                                    if cursor < line.len() {
-                                        let mut next = cursor + 1;
-                                        while next < line.len() && !line.is_char_boundary(next) {
-                                            next += 1;
-                                        }
-                                        cursor = next;
-                                        let _ = write!(io::stdout(), "\x1b[C");
-                                        let _ = io::stdout().flush();
-                                    }
-                                }
-                                b'D' => {
-                                    // 左：光标左移（UTF-8 字符边界）
-                                    if cursor > 0 {
-                                        let mut prev = cursor - 1;
-                                        while prev > 0 && !line.is_char_boundary(prev) {
-                                            prev -= 1;
-                                        }
-                                        cursor = prev;
-                                        let _ = write!(io::stdout(), "\x1b[D");
-                                        let _ = io::stdout().flush();
-                                    }
-                                }
-                                b'H' => {
-                                    cursor = 0;
-                                    redraw(&pending_line, &line, cursor);
-                                }
-                                b'F' => {
-                                    cursor = line.len();
-                                    redraw(&pending_line, &line, cursor);
-                                }
-                                b'1' | b'7' => {
-                                    let mut dummy = [0u8; 1];
-                                    let _ = input.read(&mut dummy);
-                                    cursor = 0;
-                                    redraw(&pending_line, &line, cursor);
-                                }
-                                b'4' | b'8' => {
-                                    let mut dummy = [0u8; 1];
-                                    let _ = input.read(&mut dummy);
-                                    cursor = line.len();
-                                    redraw(&pending_line, &line, cursor);
-                                }
-                                b'3' => {
-                                    // Delete 键
-                                    let mut dummy = [0u8; 1];
-                                    let _ = input.read(&mut dummy);
-                                    if cursor < line.len() {
-                                        let mut end = cursor + 1;
-                                        while end < line.len() && !line.is_char_boundary(end) {
-                                            end += 1;
-                                        }
-                                        line.replace_range(cursor..end, "");
-                                        redraw(&pending_line, &line, cursor);
-                                    }
-                                }
-                                _ => {}
                             }
+                            b'B' => {
+                                // 下：下一条历史
+                                if let Some(idx) = hist_idx {
+                                    if idx + 1 < history.len() {
+                                        hist_idx = Some(idx + 1);
+                                        line = history[idx + 1].clone();
+                                    } else {
+                                        hist_idx = None;
+                                        line = saved_line.clone();
+                                    }
+                                    cursor = line.len();
+                                    redraw(&pending_line, &line, cursor);
+                                }
+                            }
+                            b'C' => {
+                                // 右：光标右移（UTF-8 字符边界）
+                                if cursor < line.len() {
+                                    let mut next = cursor + 1;
+                                    while next < line.len() && !line.is_char_boundary(next) {
+                                        next += 1;
+                                    }
+                                    cursor = next;
+                                    let _ = write!(io::stdout(), "\x1b[C");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                            b'D' => {
+                                // 左：光标左移（UTF-8 字符边界）
+                                if cursor > 0 {
+                                    let mut prev = cursor - 1;
+                                    while prev > 0 && !line.is_char_boundary(prev) {
+                                        prev -= 1;
+                                    }
+                                    cursor = prev;
+                                    let _ = write!(io::stdout(), "\x1b[D");
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                            b'H' => {
+                                cursor = 0;
+                                redraw(&pending_line, &line, cursor);
+                            }
+                            b'F' => {
+                                cursor = line.len();
+                                redraw(&pending_line, &line, cursor);
+                            }
+                            b'1' | b'7' => {
+                                let mut dummy = [0u8; 1];
+                                let _ = input.read(&mut dummy);
+                                cursor = 0;
+                                redraw(&pending_line, &line, cursor);
+                            }
+                            b'4' | b'8' => {
+                                let mut dummy = [0u8; 1];
+                                let _ = input.read(&mut dummy);
+                                cursor = line.len();
+                                redraw(&pending_line, &line, cursor);
+                            }
+                            b'3' => {
+                                // Delete 键
+                                let mut dummy = [0u8; 1];
+                                let _ = input.read(&mut dummy);
+                                if cursor < line.len() {
+                                    let mut end = cursor + 1;
+                                    while end < line.len() && !line.is_char_boundary(end) {
+                                        end += 1;
+                                    }
+                                    line.replace_range(cursor..end, "");
+                                    redraw(&pending_line, &line, cursor);
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }

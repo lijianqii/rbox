@@ -81,7 +81,7 @@ fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
 
     if meta.is_dir() {
         if !recursive {
-            return Err(io::Error::new(io::ErrorKind::Other, "is a directory"));
+            return Err(io::Error::other("is a directory"));
         }
         remove_recursive(path)?;
     } else {
