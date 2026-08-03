@@ -24,7 +24,7 @@ QEMU_KCMD := console=ttyAMA0 rdinit=/init
 GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc.so.6 2>/dev/null))
 
 # applet 列表（与 src/applet.rs APPLETS 一致）
-APPLETS := true false echo cat pwd uname init shell ls cp mv rm mkdir touch shutdown reboot \
+APPLETS := true false echo cat pwd uname init sh ls cp mv rm mkdir touch shutdown reboot \
           head tail wc grep ln date sleep env printf basename dirname status rservice
 
 .PHONY: all build rootfs initramfs run test unittest kernel clean help

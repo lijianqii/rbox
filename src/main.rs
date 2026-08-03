@@ -62,10 +62,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// 按命令名查找 applet。`sh` 是 shell 的常见别名（rootfs/bin/sh -> rbox）。
+/// 按命令名查找 applet。
 fn applet_for(name: &str) -> Option<&'static dyn Applet> {
-    let lookup = if name == "sh" { "shell" } else { name };
-    applet::APPLETS.iter().find(|a| a.name() == lookup).copied()
+    applet::APPLETS.iter().find(|a| a.name() == name).copied()
 }
 
 /// 打印用法。`ok=true`（--help）返回成功，其余错误路径返回失败。

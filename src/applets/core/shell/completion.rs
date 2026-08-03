@@ -1,0 +1,243 @@
+//! Tab 补全：命令补全 + 文件补全。
+
+use crate::applet;
+use std::io::{self, Write};
+
+/// 补全结果：`(补全后的行, 是否打印了多匹配列表)`。
+pub fn tab_complete(line: &str) -> (String, bool) {
+    let word_start = find_last_word_start(line);
+    let prefix = &line[word_start..];
+    if prefix.is_empty() {
+        return (line.to_string(), false);
+    }
+
+    // 判断是命令补全还是文件补全：
+    // - 第一个词且不含 / -> 命令补全
+    // - 管道 | ; && || 后的新命令 -> 命令补全
+    // - 含 / 的第一个词（如 /bin/ls）-> 文件补全
+    // - 其他 -> 文件补全
+    let is_first_word = line[..word_start].trim().is_empty();
+    let is_path = prefix.contains('/');
+    let after_operator = {
+        let before = line[..word_start].trim_end();
+        before.ends_with('|')
+            || before.ends_with(';')
+            || before.ends_with("&&")
+            || before.ends_with("||")
+    };
+
+    let matches = if (is_first_word || after_operator) && !is_path {
+        complete_command(prefix)
+    } else {
+        complete_file(prefix)
+    };
+
+    if matches.is_empty() {
+        return (line.to_string(), false);
+    }
+
+    if matches.len() == 1 {
+        // 唯一匹配：补全整个词
+        let completion = &matches[0];
+        let mut new_line = line[..word_start].to_string();
+        new_line.push_str(completion);
+        // 目录补全后不加空格（用户可能要继续输入子路径）
+        if !completion.ends_with('/') {
+            new_line.push(' ');
+        }
+        (new_line, false)
+    } else {
+        // 多匹配：先补全到公共前缀
+        let common = common_prefix(&matches);
+        if common.len() > prefix.len() {
+            let mut new_line = line[..word_start].to_string();
+            new_line.push_str(&common);
+            (new_line, false)
+        } else {
+            // 无法继续补全，显示所有匹配（列格式排列）
+            let displays: Vec<String> = matches
+                .iter()
+                .map(|m| {
+                    let name = std::path::Path::new(m.trim_end_matches('/'))
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| m.clone());
+                    if m.ends_with('/') {
+                        format!("{}/", name)
+                    } else {
+                        name
+                    }
+                })
+                .collect();
+            print_completions(&displays);
+            (line.to_string(), true)
+        }
+    }
+}
+
+/// 命令补全：匹配内置 applet 名 + 内置命令 + PATH 下的可执行文件。
+fn complete_command(prefix: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+
+    // 内置 applet
+    for applet in applet::APPLETS {
+        let name = applet.name();
+        if name.starts_with(prefix) {
+            matches.push(name.to_string());
+        }
+    }
+
+    // 内置命令（shell builtin）
+    for builtin in &["cd", "exit", "export", "unset", "pwd", "history"] {
+        if builtin.starts_with(prefix) {
+            if !matches.iter().any(|m| m == *builtin) {
+                matches.push(builtin.to_string());
+            }
+        }
+    }
+
+    // PATH 下的可执行文件
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in paths.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with(prefix) {
+                        if !matches.iter().any(|m| m == &name) {
+                            matches.push(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    matches
+}
+
+/// 文件补全：匹配文件系统路径。
+fn complete_file(prefix: &str) -> Vec<String> {
+    let path = std::path::Path::new(prefix);
+
+    let (search_dir, prefix_name) = if prefix.ends_with('/') {
+        (path.to_path_buf(), String::new())
+    } else if let Some(parent) = path.parent() {
+        if parent.as_os_str().is_empty() {
+            (std::path::PathBuf::from("."), path.to_string_lossy().into_owned())
+        } else {
+            (parent.to_path_buf(), path.to_string_lossy().into_owned())
+        }
+    } else {
+        (std::path::PathBuf::from("."), prefix.to_string())
+    };
+
+    let entries = match std::fs::read_dir(&search_dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let base = if prefix.ends_with('/') {
+        prefix.to_string()
+    } else if let Some(parent) = path.parent() {
+        if parent.as_os_str().is_empty() {
+            String::new()
+        } else {
+            format!("{}/", parent.to_string_lossy())
+        }
+    } else {
+        String::new()
+    };
+
+    let mut matches: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix_name) {
+            let full = if base.is_empty() {
+                name.clone()
+            } else {
+                format!("{}{}", base, name)
+            };
+            // 目录加尾随 /
+            if entry
+                .file_type()
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
+                matches.push(format!("{}/", full));
+            } else {
+                matches.push(full);
+            }
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// 计算字符串列表的公共前缀。
+fn common_prefix(strs: &[String]) -> String {
+    if strs.is_empty() {
+        return String::new();
+    }
+    let first = &strs[0];
+    let mut len = first.len();
+    for s in &strs[1..] {
+        len = len.min(s.len());
+        let mut i = 0;
+        while i < len && first.as_bytes()[i] == s.as_bytes()[i] {
+            i += 1;
+        }
+        len = i;
+        if len == 0 {
+            break;
+        }
+    }
+    first[..len].to_string()
+}
+
+/// 以列格式打印补全选项（类似 bash compgen）。
+fn print_completions(items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    println!();
+
+    let max_len = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let col_width = max_len + 2;
+    let term_width = 80usize;
+    let cols = (term_width / col_width).max(1);
+
+    for (i, item) in items.iter().enumerate() {
+        let pad = col_width - item.chars().count();
+        print!("{}{}", item, " ".repeat(pad));
+        if (i + 1) % cols == 0 || i == items.len() - 1 {
+            println!();
+        }
+    }
+    let _ = io::stdout().flush();
+}
+
+/// 找到最后一个词的开始位置（用于 Tab 补全时提取当前正在输入的词）。
+fn find_last_word_start(line: &str) -> usize {
+    let bytes = line.as_bytes();
+    let mut i = bytes.len();
+    // 跳过尾部空白
+    while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+        i -= 1;
+    }
+    // 找到词的开始
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c == b' ' || c == b'\t' || c == b'|' || c == b';' || c == b'&'
+            || c == b'>' || c == b'<'
+        {
+            break;
+        }
+        i -= 1;
+    }
+    i
+}
