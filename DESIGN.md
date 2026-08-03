@@ -90,7 +90,7 @@ rbox/
 │       │   │   ├── mount.rs    # fstab 挂载、hostname、sysctl
 │       │   │   └── syscall.rs  # libc 系统调用封装
 │       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
-│       │   ├── shell.rs    # 命令解释器（管道 + 重定向 + 内置命令）
+│       │   ├── shell/       # 命令解释器（模块目录：mod/tokenizer/parser/expander/completion/builtin/executor/reader/types）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
 │       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
@@ -138,7 +138,7 @@ rbox/
 1. **subcommand 模式**：`rbox <applet> [args...]` - argv[1] 是 applet 名，argv[2..] 是参数
 2. **argv[0] 模式**：通过 symlink（如 `bin/echo -> rbox`），basename 即 applet 名，argv[1..] 是参数
 
-`sh` 是 shell 的常见别名（`bin/sh -> rbox`），分发时映射到 `shell` applet。
+`sh` 是 shell 的 applet 名（`bin/sh -> rbox`），通过 symlink 直接分发，无需额外映射。
 
 ### Applet Trait
 
@@ -181,7 +181,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 11 | mkdir | mkdir [-p] DIRS... | 创建目录，-p 递归创建 |
 | 12 | touch | touch FILES... | 创建空文件或更新时间戳 |
 | 13 | init | init | PID 1 系统初始化（见下文） |
-| 14 | shell | shell | 命令解释器（见下文） |
+| 14 | sh | sh | 命令解释器（见下文） | |
 | 15 | shutdown | shutdown | 向 PID 1 发 SIGTERM 触发有序关机 |
 | 16 | reboot | reboot | 向 PID 1 发 SIGINT 触发有序重启 |
 | 17 | head | head [-n N] [file] | 输出文件前 N 行（默认 10） |
@@ -199,7 +199,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
 ## Shell
 
-文件：src/applets/core/shell.rs（含单元测试）
+文件：src/applets/core/shell/（模块目录，含单元测试）
 
 一个命令解释器，REPL 循环逐字节读取输入并执行。提示符：`rbox# `（续行时 `> `）
 
@@ -316,6 +316,7 @@ enum Token {
 - 唯一匹配：补全 + 尾随空格（目录不加空格）
 - 多匹配：补全公共前缀；无公共前缀时列出所有选项
 - 路径形式（含 / 如 /bin/ls）：走文件补全而非命令补全
+- 根路径补全（`cd /pro` -> `/proc/`）：`complete_file` 从 `path.file_name()` 提取搜索前缀，从 `path.parent()` 提取搜索目录；根目录的 parent 用 `/` 而非 `//`
 
 **执行器**（execute_pipeline）：用 `Stdio::piped()` 串联子进程；后台运行（&）不等待子进程。
 
@@ -514,7 +515,7 @@ make test      # 集成测试
 |------|------|
 | make all | 编译 + 构建 rootfs + 打包 initramfs |
 | make build | 交叉编译 rbox（cargo build --target aarch64-unknown-linux-gnu --release） |
-| make rootfs | 拷贝 rbox 二进制 + 创建 27 个 applet 符号链接 + 拷贝 glibc 运行时 |
+| make rootfs | 拷贝 rbox 二进制 + 创建 29 个 applet 符号链接 + 拷贝 glibc 运行时 |
 | make initramfs | 将 rootfs/ 打包为 initramfs.cpio.gz（newc 格式 + gzip） |
 | make run | QEMU 全系统模拟启动 |
 | make test | 运行集成测试 |
@@ -594,7 +595,7 @@ make unittest
 | shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 13 |
 | shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 13 |
 | shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n）、expand_tilde、expand_glob（* ? []） | 21 |
-| shell/completion | find_last_word_start、complete_command、complete_file、common_prefix | 16 |
+| shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 20 |
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 24 |
 | text/basename | basename（路径/后缀/根/尾随斜杠） | 7 |
 | text/dirname | dirname（路径/根/无目录/尾随斜杠） | 5 |
@@ -602,7 +603,7 @@ make unittest
 | text/wc | WcCounts（行/字/字节计数） | 4 |
 | text/util | parse_n_files（默认值/显式/-nN/多文件） | 4 |
 | file/util | remove_recursive、is_dir、resolve_dest、copy_recursive | 7 |
-| **合计** | | **126** |
+| **合计** | | **130** |
 
 测试结果示例：
 
@@ -772,7 +773,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | ✅ 已实现 |
-| 单元测试 | Rust #[test] 模块（126 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（130 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |

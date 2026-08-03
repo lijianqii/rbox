@@ -21,7 +21,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、126 个单元测试、46 个集成测试、rustfmt、GitHub Actions CI
+- **工程化**：Clippy 零警告、130 个单元测试、76 个集成测试、rustfmt、GitHub Actions CI
 
 ## 快速开始
 
