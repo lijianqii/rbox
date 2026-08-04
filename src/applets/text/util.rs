@@ -29,16 +29,20 @@ pub(crate) fn parse_n_files<'a>(args: &'a [String], app: &str) -> (usize, Vec<&'
 }
 
 /// 遍历输入：无文件读 stdin，多文件打印 `==> name <==` 头，逐个调用 f。
+/// 返回 `false` 表示有 I/O 错误（用于退出码）。
 pub(crate) fn each_input(
     files: &[&String],
     app: &str,
     out: &mut std::io::StdoutLock,
     mut f: impl FnMut(&str, &mut std::io::StdoutLock),
-) {
+) -> bool {
+    let mut ok = true;
     if files.is_empty() {
         let mut buf = String::new();
         if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
             f(&buf, out);
+        } else {
+            ok = false;
         }
     } else {
         for file in files {
@@ -47,10 +51,14 @@ pub(crate) fn each_input(
             }
             match std::fs::read_to_string(file) {
                 Ok(content) => f(&content, out),
-                Err(e) => eprintln!("{}: {}: {}", app, file, e),
+                Err(e) => {
+                    eprintln!("{}: {}: {}", app, file, e);
+                    ok = false;
+                }
             }
         }
     }
+    ok
 }
 
 #[cfg(test)]

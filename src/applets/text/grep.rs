@@ -84,27 +84,26 @@ fn parse_grep_args<'a>(args: &'a [String]) -> GrepOpts<'a> {
     let mut show_line_num = false;
     let mut invert = false;
     let mut positional: Vec<&String> = Vec::new();
+    let mut end_of_opts = false;
 
     for a in args {
+        if end_of_opts {
+            positional.push(a);
+            continue;
+        }
         match a.as_str() {
-            "-i" => ignore_case = true,
-            "-n" => show_line_num = true,
-            "-v" => invert = true,
-            "-in" | "-ni" => {
-                ignore_case = true;
-                show_line_num = true;
-            }
-            "-iv" | "-vi" => {
-                ignore_case = true;
-                invert = true;
-            }
-            "-nv" | "-vn" => {
-                show_line_num = true;
-                invert = true;
-            }
-            "-" => {}
-            s if s.starts_with('-') && s.len() > 1 && s != "--" => {
-                return GrepOpts::Error("unknown option");
+            "--" => end_of_opts = true,
+            "-" => positional.push(a), // "-" 表示 stdin，作为位置参数处理
+            s if s.starts_with('-') && s.len() > 1 => {
+                // 逐字符解析组合标志（如 -inv）
+                for c in s[1..].chars() {
+                    match c {
+                        'i' => ignore_case = true,
+                        'n' => show_line_num = true,
+                        'v' => invert = true,
+                        _ => return GrepOpts::Error("unknown option"),
+                    }
+                }
             }
             _ => positional.push(a),
         }
@@ -244,5 +243,41 @@ mod tests {
             } => {}
             _ => panic!("expected Ok with flags"),
         }
+    }
+
+    #[test]
+    fn parse_triple_flags() {
+        let args = vec!["-inv".to_string(), "hello".to_string()];
+        let opts = parse_grep_args(&args);
+        match opts {
+            GrepOpts::Ok {
+                ignore_case: true,
+                show_line_num: true,
+                invert: true,
+                ..
+            } => {}
+            _ => panic!("expected Ok with all three flags"),
+        }
+    }
+
+    #[test]
+    fn parse_end_of_opts() {
+        // grep -- -pattern should treat -pattern as positional (pattern to search)
+        let args = vec!["--".to_string(), "-pattern".to_string()];
+        let opts = parse_grep_args(&args);
+        match opts {
+            GrepOpts::Ok { pattern, files, .. } => {
+                assert_eq!(pattern, "-pattern");
+                assert!(files.is_empty());
+            }
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn parse_unknown_option() {
+        let args = vec!["-x".to_string(), "hello".to_string()];
+        let opts = parse_grep_args(&args);
+        assert!(matches!(opts, GrepOpts::Error(_)));
     }
 }

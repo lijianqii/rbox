@@ -20,6 +20,8 @@ impl Applet for Printf {
         let format = &args[0];
         let format_args = &args[1..];
         print!("{}", printf_format(format, format_args));
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
         ExitCode::SUCCESS
     }
 }

@@ -17,12 +17,16 @@ impl Applet for Head {
     fn run(&self, args: &[String]) -> ExitCode {
         let (n, files) = parse_n_files(args, "head");
         let mut out = std::io::stdout().lock();
-        each_input(&files, "head", &mut out, |content, out| {
+        let ok = each_input(&files, "head", &mut out, |content, out| {
             for line in head_lines(content, n) {
                 let _ = writeln!(out, "{}", line);
             }
         });
-        ExitCode::SUCCESS
+        if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }
     }
 }
 

@@ -17,12 +17,16 @@ impl Applet for Tail {
     fn run(&self, args: &[String]) -> ExitCode {
         let (n, files) = parse_n_files(args, "tail");
         let mut out = std::io::stdout().lock();
-        each_input(&files, "tail", &mut out, |content, out| {
+        let ok = each_input(&files, "tail", &mut out, |content, out| {
             for line in tail_lines(content, n) {
                 let _ = writeln!(out, "{}", line);
             }
         });
-        ExitCode::SUCCESS
+        if ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        }
     }
 }
 

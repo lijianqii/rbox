@@ -25,6 +25,10 @@ impl Applet for Basename {
 
 /// 提取路径的 basename（文件名部分）。
 fn basename(path: &str, suffix: Option<&str>) -> String {
+    // 根路径特殊处理：basename("/") = "/"
+    if path == "/" {
+        return "/".to_string();
+    }
     let mut name = path.rsplit('/').next().unwrap_or(path).to_string();
     if name.is_empty() {
         let trimmed = path.trim_end_matches('/');
@@ -60,7 +64,7 @@ mod tests {
 
     #[test]
     fn root() {
-        assert_eq!(basename("/", None), "");
+        assert_eq!(basename("/", None), "/");
     }
 
     #[test]

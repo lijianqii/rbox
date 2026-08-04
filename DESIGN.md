@@ -14,7 +14,7 @@
 | 运行环境 | QEMU 全系统模拟（qemu-system-aarch64） |
 | 内核 | Linux 6.12.36 LTS，本机从源码交叉编译（defconfig，ARM64） |
 | 依赖 | serde + toml + libc（libc 用于 init/系统调用） |
-| 二进制大小 | ~1.3MB（release） |
+| 二进制大小 | ~965KB（release + strip） |
 | initramfs 大小 | ~1.4MB |
 
 **设计理念**：单一二进制 rbox 通过 argv[0] basename 分发或 rbox subcommand 子命令分发，模拟 BusyBox 的 multi-call binary 模式。一个二进制既是 init、又是 shell、又是所有用户命令。
@@ -518,7 +518,8 @@ make test      # 集成测试
 | make rootfs | 拷贝 rbox 二进制 + 创建 29 个 applet 符号链接 + 拷贝 glibc 运行时 |
 | make initramfs | 将 rootfs/ 打包为 initramfs.cpio.gz（newc 格式 + gzip） |
 | make run | QEMU 全系统模拟启动 |
-| make test | 运行集成测试 |
+| make strip | strip 符号表（1.4M -> 965K） |
+| make rootfs-test | 构建含测试单元的 initramfs（不污染生产 rootfs） |
 | make kernel | 编译 ARM64 内核（defconfig + Image） |
 | make clean | 清理产物 |
 | make help | 显示帮助 |
@@ -575,8 +576,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 | 文件 applets | ln -s 创建+读取、echo -n、ls -a、ls -1、rm -r、touch、mkdir -p | 7 |
 | tail | tail -n 1 末尾行 | 1 |
 | 行编辑快捷键 | Ctrl-E、Ctrl-U、Ctrl-K、Ctrl-W、Ctrl-C | 5 |
+| grep 增强 | grep -inv 组合标志、grep -- 结束选项 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **68** |
+| **合计** | | **70** |
 
 ### 运行测试
 
@@ -605,14 +607,14 @@ make unittest
 | text/dirname | dirname（路径/根/无目录/尾随斜杠） | 5 |
 | text/printf | printf_format（%s/%d/%x/%c/%%/转义序列） | 12 |
 | text/echo | echo_format（简单/-n/多参数/空参数/-n仅自身/第二个-n为文本） | 7 |
-| text/grep | grep_search（基本/忽略大小写/反向/行号/文件名前缀）、parse_grep_args（基本/缺模式/组合标志） | 11 |
+| text/grep | grep_search（基本/忽略大小写/反向/行号/文件名前缀）、parse_grep_args（基本/缺模式/组合标志/三标志/--结束选项/未知选项） | 14 |
 | text/head | head_lines（基本/超出范围/零行/空输入/无尾随换行/单行） | 6 |
 | text/tail | tail_lines（基本/超出范围/零行/空输入/单行/精确计数） | 6 |
 | text/wc | WcCounts（行/字/字节计数） | 4 |
 | text/util | parse_n_files（默认值/显式/-nN/多文件） | 4 |
 | file/util | remove_recursive、is_dir、resolve_dest、copy_recursive | 7 |
 | file/ls | mode_string_from_mode（普通/可执行/目录/符号链接/无权限）、filter_entries（隐藏/显示全部/空） | 8 |
-| **合计** | | **168** |
+| **合计** | | **173** |
 
 测试结果示例：
 
@@ -635,7 +637,7 @@ make unittest
 [关机流程]             3/3 PASS
 
 ========================================
-结果: 68 通过, 0 失败
+结果: 70 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -786,7 +788,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（168 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（173 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
@@ -794,7 +796,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 共享工具提取 | file/util.rs（remove_recursive/is_dir/resolve_dest/copy_recursive） | ✅ 已实现 |
 | applet --help 支持 | `rbox <applet> --help` 打印帮助 | ✅ 已实现 |
 | 静态链接 musl | 减小 rootfs 依赖（aarch64-unknown-linux-musl） | TODO |
-| 压缩二进制 | UPX 或 strip 减小体积 | TODO |
+| 压缩二进制 | make strip（strip 符号表，1.4M -> 965K） | ✅ 已实现 |
 | 持久化根文件系统 | ext4 磁盘镜像 + 真正的 init（非 initramfs） | TODO |
 | 网络支持 | 内核配置 virtio-net + busybox-style 网络工具 | TODO |
 

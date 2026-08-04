@@ -417,7 +417,7 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
 /// 拉起前台 console shell（getty 替代）。
 pub(crate) fn spawn_fresh_shell() -> Option<Child> {
     std::process::Command::new("/bin/rbox")
-        .arg("shell")
+        .arg("sh")
         .spawn()
         .or_else(|_| std::process::Command::new("/bin/sh").spawn())
         .ok()
