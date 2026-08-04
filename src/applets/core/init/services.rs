@@ -3,7 +3,7 @@
 use crate::applets::core::init::shutdown_requested;
 use crate::applets::core::init::syscall::{kill_process, kill_process_group};
 use crate::applets::core::init::units::{Unit, parse_cmdline};
-use crate::applets::core::log;
+use crate::applets::core::{LogLevel, log, log_at};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 
@@ -102,8 +102,9 @@ pub(crate) fn spawn_unit_command(
     command.args(args);
     command.envs(env.iter().cloned());
     command.process_group(0);
-    // 输出重定向到日志文件（追加），否则继承 console
+    // 输出重定向到日志文件（追加），超过阈值则轮转，否则继承 console
     if let Some(path) = cfg.logfile {
+        rotate_log_if_needed(path);
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -422,6 +423,40 @@ pub(crate) fn spawn_fresh_shell() -> Option<Child> {
         .ok()
 }
 
+/// 日志轮转阈值（256 KB）。超过此大小则截断为空，避免 LogFile 无限增长。
+const LOG_MAX_SIZE: u64 = 256 * 1024;
+
+/// 检查日志文件大小，超过阈值则截断（轮转）。
+/// 在每次服务 spawn 打开 LogFile 前调用。
+fn rotate_log_if_needed(path: &str) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return; // 文件不存在，正常（首次写入会创建）
+    };
+    if meta.len() <= LOG_MAX_SIZE {
+        return;
+    }
+    log_at(
+        LogLevel::Info,
+        &format!(
+            "rbox init: rotating log {} ({}KB > {}KB)",
+            path,
+            meta.len() / 1024,
+            LOG_MAX_SIZE / 1024
+        ),
+    );
+    // 截断为空文件（简单轮转，不保留旧文件）
+    if let Err(e) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        log_at(
+            LogLevel::Warn,
+            &format!("rbox init: failed to rotate {}: {}", path, e),
+        );
+    }
+}
+
 /// 构造一个测试用 ServiceInstance（control.rs 的 format_status 测试共用）。
 #[cfg(test)]
 pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance {
@@ -468,5 +503,33 @@ mod tests {
     fn parse_environment_skips_invalid() {
         let env = parse_environment(&["A=1".into(), "NOEQUALS".into(), "=v".into()]);
         assert_eq!(env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn rotate_truncates_large_file() {
+        let dir = format!("/tmp/rbox_rot_{}", std::process::id());
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{}/test.log", dir);
+        std::fs::write(&path, "x".repeat((LOG_MAX_SIZE + 100) as usize)).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > LOG_MAX_SIZE);
+        rotate_log_if_needed(&path);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_skips_small_file() {
+        let dir = format!("/tmp/rbox_rot2_{}", std::process::id());
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{}/test.log", dir);
+        std::fs::write(&path, "small").unwrap();
+        rotate_log_if_needed(&path);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotate_skips_nonexistent() {
+        rotate_log_if_needed("/tmp/rbox_nonexistent_log_file_xyz");
     }
 }

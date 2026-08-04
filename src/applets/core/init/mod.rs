@@ -29,7 +29,7 @@ use crate::applets::core::init::syscall::{kill_all, reboot_syscall, sync_fs};
 use crate::applets::core::init::units::{
     DEFAULT_TARGET, Unit, compute_start_order, load_all_units,
 };
-use crate::applets::core::log;
+use crate::applets::core::{LogLevel, log, log_at};
 use std::collections::HashMap;
 use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
@@ -89,7 +89,10 @@ impl Applet for Init {
                 u
             }
             Err(e) => {
-                log(&format!("rbox init: failed to load units: {}", e));
+                log_at(
+                    LogLevel::Error,
+                    &format!("rbox init: failed to load units: {}", e),
+                );
                 let empty: HashMap<String, Unit> = HashMap::new();
                 return reap_with_shutdown(
                     None,
@@ -105,11 +108,14 @@ impl Applet for Init {
         // 3. 计算从 default.target 出发的启动顺序（拓扑排序）
         let order = match compute_start_order(&units, DEFAULT_TARGET) {
             Ok(o) => {
-                log(&format!("rbox init: start order: {:?}", o));
+                log_at(LogLevel::Debug, &format!("rbox init: start order: {:?}", o));
                 o
             }
             Err(e) => {
-                log(&format!("rbox init: dependency error: {}", e));
+                log_at(
+                    LogLevel::Error,
+                    &format!("rbox init: dependency error: {}", e),
+                );
                 let empty: HashMap<String, Unit> = HashMap::new();
                 return reap_with_shutdown(
                     None,
@@ -138,16 +144,22 @@ impl Applet for Init {
                         && unit.service.typ != "simple"
                         && unit.service.typ != "forking"
                     {
-                        log(&format!(
-                            "rbox init: warning: {} Type={:?} unsupported, treating as simple",
-                            unit_name, unit.service.typ
-                        ));
+                        log_at(
+                            LogLevel::Warn,
+                            &format!(
+                                "rbox init: {} Type={:?} unsupported, treating as simple",
+                                unit_name, unit.service.typ
+                            ),
+                        );
                     }
                     if !unit.service.restart.is_empty() && unit.service.restart != "on-failure" {
-                        log(&format!(
-                            "rbox init: warning: {} Restart={:?} unsupported, treating as no",
-                            unit_name, unit.service.restart
-                        ));
+                        log_at(
+                            LogLevel::Warn,
+                            &format!(
+                                "rbox init: {} Restart={:?} unsupported, ignoring",
+                                unit_name, unit.service.restart
+                            ),
+                        );
                     }
                     if unit.unit.description.is_empty() {
                         log(&format!("rbox init: starting {}: {}", unit_name, cmd));
@@ -245,11 +257,14 @@ fn reap_with_shutdown(
             if let Some(child) = svc.child.as_mut() {
                 let (exited, failed) = match child.try_wait() {
                     Ok(Some(status)) => {
-                        log(&format!(
-                            "rbox init: service {} exited (code {:?})",
-                            svc.name,
-                            status.code()
-                        ));
+                        log_at(
+                            LogLevel::Warn,
+                            &format!(
+                                "rbox init: service {} exited (code {:?})",
+                                svc.name,
+                                status.code()
+                            ),
+                        );
                         (true, !status.success())
                     }
                     // 竞态：状态已被孤儿收割取走，视为退出但不触发重启
@@ -268,11 +283,14 @@ fn reap_with_shutdown(
                 && !svc.stopped
             {
                 svc.next_restart_at = None;
-                log(&format!(
-                    "rbox init: restarting {} (Restart=on-failure, attempt {})",
-                    svc.name,
-                    svc.fail_count + 1
-                ));
+                log_at(
+                    LogLevel::Info,
+                    &format!(
+                        "rbox init: restarting {} (attempt {})",
+                        svc.name,
+                        svc.fail_count + 1
+                    ),
+                );
                 respawn_service(svc);
             }
         }
@@ -329,7 +347,10 @@ fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::proc
         for svc in services.iter_mut() {
             // forking daemon 退出（被收养的 daemon 由这里匹配并触发重启调度）
             if svc.tracked_pid == Some(pid) {
-                log(&format!("rbox init: service {} (daemon) exited", svc.name));
+                log_at(
+                    LogLevel::Warn,
+                    &format!("rbox init: service {} (daemon) exited", svc.name),
+                );
                 svc.tracked_pid = None;
                 let failed = !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0;
                 schedule_restart(svc, failed);
@@ -368,7 +389,10 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
         libc::RB_POWER_OFF
     };
     if let Err(e) = reboot_syscall(action) {
-        log(&format!("rbox init: reboot syscall failed: {}", e));
+        log_at(
+            LogLevel::Error,
+            &format!("rbox init: reboot syscall failed: {}", e),
+        );
         // 重启失败时回退到关机；仍失败则挂起等待人工干预
         if is_reboot {
             let _ = reboot_syscall(libc::RB_POWER_OFF);

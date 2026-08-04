@@ -10,17 +10,72 @@ pub mod status;
 use std::fs;
 use std::io::Write;
 
-/// 输出日志：优先写入内核环形缓冲（/dev/kmsg，内核自动回显到 console，
-/// 带时间戳且不重复）；kmsg 不可用时（如 devtmpfs 挂载前）回退 console stderr。
-/// 注意：kmsg 每次 write 调用产生一条消息，必须整条一次性写入，
-/// 否则会被拆成多行（每行带时间戳前缀）。
-pub(crate) fn log(msg: &str) {
+/// 日志级别。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    fn tag(self) -> &'static str {
+        match self {
+            LogLevel::Error => "E",
+            LogLevel::Warn => "W",
+            LogLevel::Info => "I",
+            LogLevel::Debug => "D",
+        }
+    }
+}
+
+/// 当前日志级别（可通过 `RBOX_LOG` 环境变量调整，默认 Info）。
+fn current_log_level() -> LogLevel {
+    match std::env::var("RBOX_LOG").ok().as_deref() {
+        Some("debug") | Some("DEBUG") | Some("d") => LogLevel::Debug,
+        Some("warn") | Some("WARN") | Some("w") => LogLevel::Warn,
+        Some("error") | Some("ERROR") | Some("e") => LogLevel::Error,
+        _ => LogLevel::Info,
+    }
+}
+
+/// 输出带级别的日志：优先写入 /dev/kmsg，回退到 console stderr。
+pub fn log_at(level: LogLevel, msg: &str) {
+    if level > current_log_level() {
+        return;
+    }
+    let tagged = format!("rbox {}: {}", level.tag(), msg);
     if let Ok(mut kmsg) = fs::OpenOptions::new().write(true).open("/dev/kmsg") {
-        let line = format!("rbox: {}\n", msg);
-        let _ = kmsg.write_all(line.as_bytes());
+        let _ = kmsg.write_all(format!("{}\n", tagged).as_bytes());
         return;
     }
     let mut stderr = std::io::stderr();
-    let _ = writeln!(stderr, "{}", msg);
+    let _ = writeln!(stderr, "{}", tagged);
     let _ = stderr.flush();
+}
+
+/// Info 级别日志（最常用，等价于原来的 `log()`）。
+pub(crate) fn log(msg: &str) {
+    log_at(LogLevel::Info, msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_level_ordering() {
+        assert!(LogLevel::Error < LogLevel::Warn);
+        assert!(LogLevel::Warn < LogLevel::Info);
+        assert!(LogLevel::Info < LogLevel::Debug);
+    }
+
+    #[test]
+    fn log_level_tags() {
+        assert_eq!(LogLevel::Error.tag(), "E");
+        assert_eq!(LogLevel::Warn.tag(), "W");
+        assert_eq!(LogLevel::Info.tag(), "I");
+        assert_eq!(LogLevel::Debug.tag(), "D");
+    }
 }

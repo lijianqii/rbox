@@ -19,6 +19,9 @@ QEMU     := qemu-system-aarch64
 QEMU_OPTS := -M virt -cpu cortex-a72 -m 512M -nographic
 QEMU_KCMD := console=ttyAMA0 rdinit=/init
 
+TEST_INITRD := initramfs.test.cpio.gz
+TEST_UNITS := tests/units/*.toml
+
 # glibc 运行时（从交叉编译器的 multiarch 库目录拷贝）
 # gcc -print-file-name 能解析出实际的 libc 路径，比 -print-sysroot 更可靠
 GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc.so.6 2>/dev/null))
@@ -26,7 +29,7 @@ GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc
 # applet 列表：从 rbox --list 自动提取，避免与 src/applet.rs 手动同步
 APPLETS := $(shell cargo run --target x86_64-unknown-linux-gnu --quiet -- --list 2>/dev/null)
 
-.PHONY: all build rootfs initramfs run test unittest verify kernel clean help
+.PHONY: all build strip rootfs initramfs rootfs-test run test unittest verify kernel clean help
 
 all: build rootfs initramfs
 
@@ -34,8 +37,13 @@ all: build rootfs initramfs
 build:
 	cargo build --target $(TARGET) --$(PROFILE)
 
+# ─── strip 符号表（减小体积）─────────────────────
+strip: build
+	aarch64-linux-gnu-strip --strip-all target/$(TARGET)/$(PROFILE)/rbox
+	@echo "strip 完成: $$(du -h target/$(TARGET)/$(PROFILE)/rbox | cut -f1)"
+
 # ─── 构建 rootfs ─────────────────────────────────
-rootfs: build
+rootfs: strip
 	mkdir -p $(ROOTFS)/bin
 	# 拷贝 rbox 二进制
 	cp target/$(TARGET)/$(PROFILE)/rbox $(ROOTFS)/bin/rbox
@@ -75,6 +83,19 @@ run: initramfs
 		-append "$(QEMU_KCMD)"
 	@if [ -t 0 ]; then stty sane 2>/dev/null; fi
 
+# ─── 构建测试用 initramfs（含测试服务单元）─────────
+# 注入 tests/units/*.toml 到 rootfs，打包独立的测试 initramfs，
+# 然后清理注入的文件，生产 rootfs 保持干净。
+rootfs-test: rootfs
+	@echo "注入测试服务单元..."
+	cp $(TEST_UNITS) $(ROOTFS)/etc/rbox/system/
+	cd $(ROOTFS) && find . | cpio -o -H newc 2>/dev/null | gzip > ../$(TEST_INITRD)
+	@echo "清理注入的测试服务..."
+	@for f in $(notdir $(wildcard $(TEST_UNITS))); do \
+		rm -f $(ROOTFS)/etc/rbox/system/$$f; \
+	done
+	@echo "测试 initramfs 构建完成: $(TEST_INITRD) ($$(du -h $(TEST_INITRD) | cut -f1))"
+
 # ─── 单元测试（宿主机）──────────────────────────
 unittest:
 	cargo test --target x86_64-unknown-linux-gnu
@@ -109,8 +130,10 @@ help:
 	@echo "目标:"
 	@echo "  make all       - 编译 + rootfs + initramfs"
 	@echo "  make build     - 交叉编译 rbox"
+	@echo "  make strip     - strip 符号表减小体积"
 	@echo "  make rootfs    - 构建 rootfs（含符号链接 + glibc）"
 	@echo "  make initramfs - 打包 initramfs.cpio.gz"
+	@echo "  make rootfs-test - 构建含测试单元的 initramfs（不污染生产 rootfs）"
 	@echo "  make run       - QEMU 启动"
 	@echo "  make test      - 集成测试"
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"

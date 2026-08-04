@@ -2,32 +2,25 @@
 # rbox 集成测试脚本
 # 在 QEMU 全系统模拟中运行预设命令并验证输出
 #
-# 测试专用服务（tests/units/*.toml）在运行时注入 rootfs 并打包独立的
-# 测试 initramfs，测试结束后自动清理，生产 rootfs 保持干净。
+# 测试专用服务（tests/units/*.toml）通过 `make rootfs-test` 注入并打包为
+# 独立的测试 initramfs，生产 rootfs 保持干净。
 set -e
 
 cd "$(dirname "$0")/.."
 
 KERNEL=kernel/arch/arm64/boot/Image
-INITRD=initramfs.cpio.gz
 TEST_INITRD=initramfs.test.cpio.gz
-UNITS_DIR=rootfs/etc/rbox/system
 QEMU="qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic"
 APPEND="console=ttyAMA0 rdinit=/init"
 
 PASS=0
 FAIL=0
 
-# ─── 注入测试服务 + 打包测试 initramfs ───────────────
-cp tests/units/*.toml "$UNITS_DIR"/
-(cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip > ../$TEST_INITRD)
+# ─── 通过 Makefile 构建测试用 initramfs（注入+打包+清理）─────────
+make rootfs-test >/dev/null 2>&1
 
 cleanup() {
     rm -f "$TEST_INITRD"
-    # 仅删除注入的测试服务（不触碰生产配置）
-    rm -f "$UNITS_DIR/hello.service.toml" "$UNITS_DIR/restart-test.service.toml" \
-        "$UNITS_DIR/longrun.service.toml" "$UNITS_DIR/forktest.service.toml" \
-        "$UNITS_DIR/forktimeout.service.toml" "$UNITS_DIR/usertest.service.toml"
 }
 trap cleanup EXIT
 
@@ -238,7 +231,7 @@ assert_contains "sysctl kernel.panic" "^10$"
 assert_contains "User= 降权 nobody" "65534"
 assert_contains "Type=forking 等待父进程" "started forktest"
 assert_contains "Type=forking 超时终止" "did not daemonize within 2s"
-assert_contains "kmsg 日志写入" "\] rbox: rbox init: mounting devpts"
+assert_contains "kmsg 日志写入" "\] rbox I: rbox init: mounting devpts"
 
 
 echo ""

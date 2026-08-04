@@ -1,6 +1,6 @@
 //! Applet trait 与全局注册表。
 //!
-//! 每个 applet 实现 [`Applet`] trait 并提供静态实例，登记到 [`APPLETS`]。
+//! 每个 applet 实现 [`Applet`] trait 并提供静态实例，用 [`declare_applets!`] 宏登记到 [`APPLETS`]。
 //! 分发逻辑在 [`crate::main`] 中根据 argv[0] basename 或子命令查表。
 
 use std::process::ExitCode;
@@ -19,8 +19,19 @@ pub trait Applet: Sync {
     fn run(&self, args: &[String]) -> ExitCode;
 }
 
-/// 所有已注册的 applet。分发时线性查找。
-pub static APPLETS: &[&dyn Applet] = &[
+/// 声明所有 applet 注册表。
+///
+/// 用法：传入模块路径到静态实例的路径，宏展开为 `&[&dyn Applet]` 切片。
+/// 新增 applet 时只需在此处添加一行。
+macro_rules! declare_applets {
+    ($($path:path),* $(,)?) => {
+        pub static APPLETS: &[&dyn Applet] = &[
+            $($path),*
+        ];
+    };
+}
+
+declare_applets! {
     crate::applets::sys::true_::TRUE,
     crate::applets::sys::false_::FALSE,
     crate::applets::text::echo::ECHO,
@@ -50,4 +61,4 @@ pub static APPLETS: &[&dyn Applet] = &[
     crate::applets::text::dirname::DIRNAME,
     crate::applets::core::status::STATUS,
     crate::applets::core::rservice::RSERVICE,
-];
+}
