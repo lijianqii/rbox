@@ -540,7 +540,7 @@ make test      # 集成测试
 qemu-system-aarch64 \
     -M virt \
     -cpu cortex-a72 \
-    -m 512M \
+    -m 128M \
     -nographic \
     -kernel kernel/arch/arm64/boot/Image \
     -initrd initramfs.cpio.gz \

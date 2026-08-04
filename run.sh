@@ -31,7 +31,7 @@ fi
 qemu-system-aarch64 \
     -M virt \
     -cpu cortex-a72 \
-    -m 512M \
+    -m 128M \
     -nographic \
     -kernel "$KERNEL" \
     -initrd "$INITRD" \

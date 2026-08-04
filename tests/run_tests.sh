@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 KERNEL=kernel/arch/arm64/boot/Image
 TEST_INITRD=initramfs.test.cpio.gz
-QEMU="qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic"
+QEMU="qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic"
 APPEND="console=ttyAMA0 rdinit=/init"
 
 PASS=0
@@ -155,7 +155,7 @@ OUT=$(timeout 180 bash -c '
   printf "echo -e 'aaa\\nbbb\\nccc' | tail -n 1\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
-} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel '"$KERNEL"' -initrd '"$TEST_INITRD"' -append "'"$APPEND"'"
 ' 2>&1) || true
 

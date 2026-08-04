@@ -16,7 +16,7 @@ ROOTFS   := rootfs
 KERNEL   := kernel
 INITRD   := initramfs.cpio.gz
 QEMU     := qemu-system-aarch64
-QEMU_OPTS := -M virt -cpu cortex-a72 -m 512M -nographic
+QEMU_OPTS := -M virt -cpu cortex-a72 -m 128M -nographic
 QEMU_KCMD := console=ttyAMA0 rdinit=/init
 
 TEST_INITRD := initramfs.test.cpio.gz
