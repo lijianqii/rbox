@@ -1,4 +1,8 @@
 //! 执行器：执行命令列表、管道、重定向、外部命令查找。
+//!
+//! 前台进程 SIGINT 转发：shell 在等待前台子进程期间，如果收到 Ctrl-C
+//! （SIGINT），会将 SIGINT 转发给所有子进程的进程组，实现中断当前正在
+//! 运行的程序而不退出 shell。
 
 use super::builtin::{BuiltinResult, try_builtin};
 use super::expander::expand_history;
@@ -6,7 +10,30 @@ use super::expander::expand_pipeline;
 use super::parser::build_command_list;
 use super::tokenizer::tokenize;
 use super::types::*;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// 当前前台子进程组 ID（0 表示无前台进程在运行）。
+/// SIGINT 处理器读取此值以转发信号。
+static FOREGROUND_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// 注册 SIGINT 处理器：转发给前台进程组。
+/// 在 shell 启动时调用一次。
+pub fn install_sigint_handler() {
+    extern "C" fn handle_sigint(_sig: i32) {
+        let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
+        if pgid > 0 {
+            // 向前台进程组发送 SIGINT
+            unsafe {
+                libc::kill(-pgid, libc::SIGINT);
+            }
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as *const () as usize);
+    }
+}
 
 /// 执行一行命令。返回退出码。exit_fn 用于 `exit` 内置命令。
 pub fn execute_line<F>(line: &str, last_rc: &mut i32, history: &[String], exit_fn: F) -> i32
@@ -93,6 +120,17 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         command.args(&extra_args);
         command.args(&cmd.argv[1..]);
 
+        // 前台进程：创建独立进程组（setsid），便于 SIGINT 转发
+        if !pipeline.background {
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setpgid(0, 0);
+                    Ok(())
+                });
+            }
+        }
+
         // stdin
         if let Some(ref f) = cmd.stdin_file {
             match std::fs::File::open(f) {
@@ -152,6 +190,12 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         return 0;
     }
 
+    // 设置前台进程组：用第一个子进程的 pid 作为 pgid
+    if let Some(first) = children.first() {
+        let pgid = first.id() as i32;
+        FOREGROUND_PGID.store(pgid, Ordering::Relaxed);
+    }
+
     // 等待所有子进程，返回最后一个的退出码
     let mut last_code = 0;
     for child in &mut children {
@@ -160,6 +204,16 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             Err(_) => last_code = 1,
         }
     }
+
+    // 清除前台进程组标记
+    FOREGROUND_PGID.store(0, Ordering::Relaxed);
+
+    // 如果是被 SIGINT 中断的，打印换行使提示符对齐
+    if last_code == 130 {
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
     last_code
 }
 

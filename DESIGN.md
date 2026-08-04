@@ -355,7 +355,7 @@ enum Token {
 
 Tab 补全要求 shell 能逐字节读取按键，但默认终端处于 **canonical（行缓冲）模式**，按下 Tab 不会立即传递给进程。因此需要两层终端设置：
 
-1. **客户机侧（shell 启动时）**：`enable_raw_mode()` 通过 `libc::tcgetattr` 保存原始终端属性，`tcsetattr` 设置 cbreak 模式（关闭 `ICANON` + `ECHO`，`VMIN=1 VTIME=0`）。`RawGuard` 在 shell 退出时通过 `Drop` 自动恢复。管道输入时 `tcgetattr` 失败返回 `None`，不影响。
+1. **客户机侧（shell 启动时）**：`enable_raw_mode()` 通过 `libc::tcgetattr` 保存原始终端属性，`tcsetattr` 设置 cbreak 模式（关闭 `ICANON` + `ECHO`，**保留 `ISIG`** 使 Ctrl-C 产生 SIGINT 信号，`VMIN=1 VTIME=0`）。`RawGuard` 在 shell 退出时通过 `Drop` 自动恢复。管道输入时 `tcgetattr` 失败返回 `None`，不影响。
 2. **宿主机侧（make run / run.sh）**：`stty -echo -icanon min 1 time 0` 将宿主机终端设为 raw 模式，让按键立即传递给 QEMU。QEMU 退出后 `stty sane` 恢复。
 
 ```rust
@@ -367,7 +367,17 @@ impl Drop for RawGuard {
 }
 ```
 
-文件：src/applets/core/init.rs（含单元测试）
+### Ctrl-C 前台进程中断
+
+shell 注册 SIGINT handler，使用全局 `FOREGROUND_PGID: AtomicI32` 跟踪当前前台子进程组。当 shell 在 `wait()` 中阻塞等待子进程时，用户按下 Ctrl-C 产生 SIGINT 信号：
+
+1. handler 读取 `FOREGROUND_PGID`，如果非零则 `kill(-pgid, SIGINT)` 转发给子进程组
+2. 子进程收到 SIGINT 退出，`wait()` 返回退出码 130
+3. shell 清除 `FOREGROUND_PGID`，打印换行，显示新提示符
+
+如果 shell 在编辑行时收到 SIGINT（无前台子进程），`read()` 返回 `EINTR`，shell 打印 `^C` 并清除当前行。前台子进程通过 `pre_exec` 中的 `setpgid(0, 0)` 创建独立进程组。
+
+文件：src/applets/core/shell/executor.rs
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 

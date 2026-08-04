@@ -13,6 +13,7 @@
 //! - Tab 补全（命令 + 文件）。
 //! - 命令历史（上/下键）+ 历史扩展 `!!` `!n` `!$`。
 //! - 行编辑快捷键（Ctrl-A/E/U/K/W/C/L、Home/End/Delete）。
+//! - Ctrl-C SIGINT 转发：中断前台运行命令而不退出 shell。
 //! - `~` 展开。
 
 mod builtin;
@@ -51,6 +52,11 @@ impl Applet for Shell {
 
 impl Shell {
     fn run_shell() -> io::Result<u8> {
+        // 注册 SIGINT 处理器：前台有子进程时转发信号。
+        // tty 模式下 Ctrl-C 产生 SIGINT（ISIG 开启），由 handler 处理；
+        // 管道模式下 0x03 作为普通字节到达 REPL 的 0x03 分支。
+        executor::install_sigint_handler();
+
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut last_rc: i32 = 0;
@@ -72,7 +78,23 @@ impl Shell {
 
         loop {
             let mut byte = [0u8; 1];
-            if input.read(&mut byte)? == 0 {
+            let n = match input.read(&mut byte) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                    // SIGINT 打断了 read：如果有前台进程已被 handler 处理；
+                    // 如果是在编辑行时，清除当前行并新起一行
+                    let _ = writeln!(io::stdout(), "^C");
+                    line.clear();
+                    cursor = 0;
+                    pending_line.clear();
+                    hist_idx = None;
+                    let _ = write!(io::stdout(), "rbox# ");
+                    let _ = io::stdout().flush();
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if n == 0 {
                 break; // EOF
             }
             let b = byte[0];

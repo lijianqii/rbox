@@ -28,6 +28,7 @@ pub fn enable_raw_mode() -> Option<RawGuard> {
         return None;
     }
     let mut raw = original;
+    // 关闭 ICANON + ECHO，但保留 ISIG（让 Ctrl-C 产生 SIGINT 信号）
     raw.c_lflag &= !(libc::ICANON | libc::ECHO);
     raw.c_cc[libc::VMIN] = 1;
     raw.c_cc[libc::VTIME] = 0;
