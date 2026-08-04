@@ -120,12 +120,16 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         command.args(&extra_args);
         command.args(&cmd.argv[1..]);
 
-        // 前台进程：创建独立进程组（setsid），便于 SIGINT 转发
+        // 前台进程：创建独立进程组 + 恢复 SIGINT 默认处理
+        // （子进程继承了 shell 的 SIGINT handler，不恢复的话收到信号不会退出）
         if !pipeline.background {
             #[cfg(unix)]
             unsafe {
                 command.pre_exec(|| {
                     libc::setpgid(0, 0);
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+                    libc::signal(libc::SIGTSTP, libc::SIG_DFL);
                     Ok(())
                 });
             }

@@ -372,10 +372,10 @@ impl Drop for RawGuard {
 shell 注册 SIGINT handler，使用全局 `FOREGROUND_PGID: AtomicI32` 跟踪当前前台子进程组。当 shell 在 `wait()` 中阻塞等待子进程时，用户按下 Ctrl-C 产生 SIGINT 信号：
 
 1. handler 读取 `FOREGROUND_PGID`，如果非零则 `kill(-pgid, SIGINT)` 转发给子进程组
-2. 子进程收到 SIGINT 退出，`wait()` 返回退出码 130
+2. 子进程在 `pre_exec` 中已将 SIGINT/SIGQUIT/SIGTSTP 恢复为 `SIG_DFL`（不继承 shell handler），收到信号后直接退出
 3. shell 清除 `FOREGROUND_PGID`，打印换行，显示新提示符
 
-如果 shell 在编辑行时收到 SIGINT（无前台子进程），`read()` 返回 `EINTR`，shell 打印 `^C` 并清除当前行。前台子进程通过 `pre_exec` 中的 `setpgid(0, 0)` 创建独立进程组。
+如果 shell 在编辑行时收到 SIGINT（无前台子进程），`read()` 返回 `EINTR`，shell 打印 `^C` 并清除当前行。前台子进程通过 `pre_exec` 中的 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（否则子进程会继承 shell 的 handler，收到信号不会退出）。
 
 文件：src/applets/core/shell/executor.rs
 
