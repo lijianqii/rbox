@@ -78,12 +78,9 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !show_all && name.starts_with('.') {
-                continue;
-            }
             entries.push(name);
         }
-        entries.sort();
+        entries = filter_entries(entries, show_all);
 
         if long {
             for name in &entries {
@@ -131,30 +128,90 @@ fn print_long(name: &str, m: &fs::Metadata) {
     );
 }
 
-fn mode_string(m: &fs::Metadata) -> String {
-    let mode = m.mode();
-    let ft = m.file_type();
+/// 将文件 mode 转为 `drwxr-xr-x` 格式字符串。
+fn mode_string_from_mode(mode: u32, is_dir: bool, is_symlink: bool) -> String {
     let mut s = String::with_capacity(10);
-    s.push(if ft.is_dir() {
+    s.push(if is_dir {
         'd'
-    } else if ft.is_symlink() {
+    } else if is_symlink {
         'l'
     } else {
         '-'
     });
-    // owner
     s.push(if mode & 0o400 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o200 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o100 != 0 { 'x' } else { '-' });
-    // group
     s.push(if mode & 0o040 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o020 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o010 != 0 { 'x' } else { '-' });
-    // other
     s.push(if mode & 0o004 != 0 { 'r' } else { '-' });
     s.push(if mode & 0o002 != 0 { 'w' } else { '-' });
     s.push(if mode & 0o001 != 0 { 'x' } else { '-' });
     s
+}
+
+fn mode_string(m: &fs::Metadata) -> String {
+    mode_string_from_mode(m.mode(), m.file_type().is_dir(), m.file_type().is_symlink())
+}
+
+/// 过滤目录条目：去除隐藏文件（除非 show_all）。
+fn filter_entries(mut entries: Vec<String>, show_all: bool) -> Vec<String> {
+    if !show_all {
+        entries.retain(|n| !n.starts_with('.'));
+    }
+    entries.sort();
+    entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_regular_file() {
+        assert_eq!(mode_string_from_mode(0o644, false, false), "-rw-r--r--");
+    }
+
+    #[test]
+    fn mode_executable() {
+        assert_eq!(mode_string_from_mode(0o755, false, false), "-rwxr-xr-x");
+    }
+
+    #[test]
+    fn mode_directory() {
+        assert_eq!(mode_string_from_mode(0o755, true, false), "drwxr-xr-x");
+    }
+
+    #[test]
+    fn mode_symlink() {
+        assert_eq!(mode_string_from_mode(0o777, false, true), "lrwxrwxrwx");
+    }
+
+    #[test]
+    fn mode_no_permissions() {
+        assert_eq!(mode_string_from_mode(0o000, false, false), "----------");
+    }
+
+    #[test]
+    fn filter_hidden() {
+        let entries = vec![".hidden".into(), "visible".into(), ".secret".into()];
+        assert_eq!(filter_entries(entries, false), vec!["visible"]);
+    }
+
+    #[test]
+    fn filter_show_all() {
+        let entries = vec![".hidden".into(), "visible".into(), ".secret".into()];
+        assert_eq!(
+            filter_entries(entries, true),
+            vec![".hidden", ".secret", "visible"]
+        );
+    }
+
+    #[test]
+    fn filter_empty() {
+        let entries: Vec<String> = vec![];
+        assert_eq!(filter_entries(entries, false), Vec::<String>::new());
+    }
 }
 
 fn format_time(mtime: i64) -> String {

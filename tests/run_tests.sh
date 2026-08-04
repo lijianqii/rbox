@@ -35,7 +35,7 @@ trap cleanup EXIT
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
 # 注意：整个命令块在外层 bash -c '...' 单引号中，内部 printf 必须用双引号，
 #       $ 需转义为 \$，单引号用 \x27 代替，避免破坏外层引号。
-OUT=$(timeout 150 bash -c '
+OUT=$(timeout 180 bash -c '
 {
   sleep 12
   # 基本 applet
@@ -131,6 +131,35 @@ OUT=$(timeout 150 bash -c '
   printf "echo keep\x0b\n"; sleep 0.5
   printf "echo word1 word2\x17\n"; sleep 0.5
   printf "echo cancel\x03echo after_ctrl_c\n"; sleep 0.5
+  # 11. 文本处理 applets
+  printf "echo -e 'line1\\nline2\\nline3' | head -n 2\n"; sleep 0.5
+  printf "printf name=%%s-num=%%d rbox 42\n"; sleep 0.5
+  printf "echo hello | wc -c\n"; sleep 0.5
+  printf "echo hello | grep -o hel\n"; sleep 0.5
+  printf "basename /usr/bin/gcc\n"; sleep 0.5
+  printf "basename /tmp/test.txt .txt\n"; sleep 0.5
+  printf "dirname /usr/bin/gcc\n"; sleep 0.5
+  printf "date | head -c 3\n"; sleep 0.5
+  # 12. env / ln
+  printf "env | head -n 1\n"; sleep 0.5
+  printf "ln -s /etc/hostname /tmp/linktest\n"; sleep 0.5
+  printf "cat /tmp/linktest\n"; sleep 0.5
+  # 13. echo -n
+  printf "echo -n no_newline; echo after\n"; sleep 0.5
+  # 14. ls -a / ls -1
+  printf "ls -a / | head -n 3\n"; sleep 0.5
+  printf "ls -1 / | head -n 1\n"; sleep 0.5
+  # 15. rm -r
+  printf "rm -r /tmp/glob_test\n"; sleep 0.5
+  printf "ls /tmp/glob_test 2>&1\n"; sleep 0.5
+  # 16. touch 创建新文件
+  printf "touch /tmp/touched_new\n"; sleep 0.5
+  printf "ls /tmp/touched_new\n"; sleep 0.5
+  # 17. mkdir -p 嵌套
+  printf "mkdir -p /tmp/nested/deep/dir\n"; sleep 0.5
+  printf "ls /tmp/nested/deep/dir\n"; sleep 0.5
+  # 18. tail
+  printf "echo -e 'aaa\\nbbb\\nccc' | tail -n 1\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 512M -nographic \
@@ -280,6 +309,27 @@ assert_contains "Ctrl-U 删除行首" "world"
 assert_contains "Ctrl-K 行末不删除" "keep"
 assert_contains "Ctrl-W 删除单词" "echo word1"
 assert_contains "Ctrl-C 中断当前行" "after_ctrl_c"
+
+echo ""
+echo "[文本处理 applets]"
+assert_contains "head -n 2 截取两行" "line1"
+assert_contains "printf 格式化输出" "name=rbox-num=42"
+assert_contains "wc -c 字节计数" "6"
+assert_contains "grep 搜索匹配" "hel"
+assert_contains "basename 取文件名" "gcc"
+assert_contains "basename 去后缀" "test"
+assert_contains "dirname 取目录" "/usr/bin"
+assert_contains "date 日期输出" "20"
+assert_contains "env 环境变量" "PATH"
+assert_contains "ln -s 符号链接创建" "rbox"
+assert_contains "ln -s 符号链接读取" "rbox"
+assert_contains "echo -n 无换行" "no_newlineafter"
+assert_contains "ls -a 包含 ." "\."
+assert_contains "ls -1 单列输出" "bin"
+assert_contains "rm -r 递归删除" "No such file"
+assert_contains "touch 创建文件" "touched_new"
+assert_contains "mkdir -p 嵌套目录" "dir"
+assert_contains "tail -n 1 末尾行" "ccc"
 
 echo ""
 echo "[关机流程]"

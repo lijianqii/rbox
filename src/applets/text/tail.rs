@@ -18,12 +18,58 @@ impl Applet for Tail {
         let (n, files) = parse_n_files(args, "tail");
         let mut out = std::io::stdout().lock();
         each_input(&files, "tail", &mut out, |content, out| {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = if lines.len() > n { lines.len() - n } else { 0 };
-            for line in &lines[start..] {
+            for line in tail_lines(content, n) {
                 let _ = writeln!(out, "{}", line);
             }
         });
         ExitCode::SUCCESS
+    }
+}
+
+/// 取后 N 行。
+fn tail_lines(content: &str, n: usize) -> Vec<&str> {
+    let lines: Vec<&str> = content.lines().collect();
+    let start = if lines.len() > n { lines.len() - n } else { 0 };
+    lines[start..].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_basic() {
+        let lines = tail_lines("a\nb\nc\n", 2);
+        assert_eq!(lines, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn tail_more_than_available() {
+        let lines = tail_lines("a\nb\n", 10);
+        assert_eq!(lines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn tail_zero() {
+        let lines = tail_lines("a\nb\n", 0);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn tail_empty_input() {
+        let lines = tail_lines("", 5);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn tail_single_line() {
+        let lines = tail_lines("only line\n", 1);
+        assert_eq!(lines, vec!["only line"]);
+    }
+
+    #[test]
+    fn tail_exact_count() {
+        let lines = tail_lines("a\nb\nc\n", 3);
+        assert_eq!(lines, vec!["a", "b", "c"]);
     }
 }

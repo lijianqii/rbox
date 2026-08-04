@@ -571,8 +571,12 @@ rbox 二进制本身支持的元命令（非 applet）：
 | init 增强 | ExecReload、console reload、status 单查 console、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 8 |
 | Shell 增强 | export + 变量展开、命令分隔 ;、条件执行 &&、条件执行 \|\|、上下键历史、Ctrl-A/E/U/W/L | 6 |
 | Tab 补全 | 命令补全 ec->echo、文件补全 /etc/host->hostname、管道后命令补全 | 3 |
+| 文本处理 applets | head -n、printf %s/%d、wc -c、grep -o、basename、basename 去后缀、dirname、date、env | 9 |
+| 文件 applets | ln -s 创建+读取、echo -n、ls -a、ls -1、rm -r、touch、mkdir -p | 7 |
+| tail | tail -n 1 末尾行 | 1 |
+| 行编辑快捷键 | Ctrl-E、Ctrl-U、Ctrl-K、Ctrl-W、Ctrl-C | 5 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **46** |
+| **合计** | | **68** |
 
 ### 运行测试
 
@@ -600,10 +604,15 @@ make unittest
 | text/basename | basename（路径/后缀/根/尾随斜杠） | 7 |
 | text/dirname | dirname（路径/根/无目录/尾随斜杠） | 5 |
 | text/printf | printf_format（%s/%d/%x/%c/%%/转义序列） | 12 |
+| text/echo | echo_format（简单/-n/多参数/空参数/-n仅自身/第二个-n为文本） | 7 |
+| text/grep | grep_search（基本/忽略大小写/反向/行号/文件名前缀）、parse_grep_args（基本/缺模式/组合标志） | 11 |
+| text/head | head_lines（基本/超出范围/零行/空输入/无尾随换行/单行） | 6 |
+| text/tail | tail_lines（基本/超出范围/零行/空输入/单行/精确计数） | 6 |
 | text/wc | WcCounts（行/字/字节计数） | 4 |
 | text/util | parse_n_files（默认值/显式/-nN/多文件） | 4 |
 | file/util | remove_recursive、is_dir、resolve_dest、copy_recursive | 7 |
-| **合计** | | **130** |
+| file/ls | mode_string_from_mode（普通/可执行/目录/符号链接/无权限）、filter_entries（隐藏/显示全部/空） | 8 |
+| **合计** | | **168** |
 
 测试结果示例：
 
@@ -619,10 +628,14 @@ make unittest
 [init 增强]            8/8 PASS
 [Shell 增强]           6/6 PASS
 [Tab 补全]             3/3 PASS
+[文本处理 applets]     9/9 PASS
+[文件 applets]         7/7 PASS
+[tail]                 1/1 PASS
+[行编辑快捷键]          5/5 PASS
 [关机流程]             3/3 PASS
 
 ========================================
-结果: 46 通过, 0 失败
+结果: 68 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -773,7 +786,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（130 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（168 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
