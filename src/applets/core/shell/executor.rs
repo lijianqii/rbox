@@ -10,6 +10,7 @@ use super::expander::expand_pipeline;
 use super::parser::build_command_list;
 use super::tokenizer::tokenize;
 use super::types::*;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -20,11 +21,12 @@ static FOREGROUND_PGID: AtomicI32 = AtomicI32::new(0);
 
 /// 注册 SIGINT 处理器：转发给前台进程组。
 /// 在 shell 启动时调用一次。
+/// raw 模式下 ISIG 已关闭，Ctrl-C 不产生 SIGINT 信号；
+/// 此 handler 作为管道模式的后备（管道模式下 ISIG 仍然开启）。
 pub fn install_sigint_handler() {
     extern "C" fn handle_sigint(_sig: i32) {
         let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
         if pgid > 0 {
-            // 向前台进程组发送 SIGINT
             unsafe {
                 libc::kill(-pgid, libc::SIGINT);
             }
@@ -200,6 +202,49 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         FOREGROUND_PGID.store(pgid, Ordering::Relaxed);
     }
 
+    // 在等待子进程期间，启动一个线程监听 stdin 的 Ctrl-C（0x03 字节）。
+    // raw 模式下 ISIG 已关闭，Ctrl-C 不产生信号，而是作为 0x03 字节到达。
+    // shell 主线程在 wait() 中阻塞，无法读 stdin，所以需要单独线程。
+    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor_stop = stop_flag.clone();
+    let monitor = std::thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            if monitor_stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // 使用非阻塞 read，避免线程无法退出
+            let stdin_fd = std::io::stdin().as_raw_fd();
+            // 设置非阻塞
+            let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, 1) };
+            // 恢复阻塞
+            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags) };
+            if n == 1 && buf[0] == 0x03 {
+                // Ctrl-C：向子进程组发送 SIGINT
+                let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
+                if pgid > 0 {
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGINT);
+                    }
+                }
+                return;
+            }
+            if n <= 0 {
+                // 没有数据，短暂休眠后重试
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            // 如果读到其他字节，放回 stdin（通过回写）
+            if n == 1 && buf[0] != 0x03 {
+                // 把字节推回 stdin，用 ioctl TIOCSTI
+                unsafe {
+                    libc::ioctl(stdin_fd, libc::TIOCSTI, &buf[0] as *const u8 as *const _);
+                }
+            }
+        }
+    });
+
     // 等待所有子进程，返回最后一个的退出码
     let mut last_code = 0;
     for child in &mut children {
@@ -208,6 +253,10 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             Err(_) => last_code = 1,
         }
     }
+
+    // 停止 stdin 监控线程
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = monitor.join();
 
     // 清除前台进程组标记
     FOREGROUND_PGID.store(0, Ordering::Relaxed);

@@ -28,8 +28,10 @@ pub fn enable_raw_mode() -> Option<RawGuard> {
         return None;
     }
     let mut raw = original;
-    // 关闭 ICANON + ECHO，但保留 ISIG（让 Ctrl-C 产生 SIGINT 信号）
-    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    // 关闭 ICANON + ECHO + ISIG
+    // ISIG 关闭后 Ctrl-C 不再产生 SIGINT 信号，而是作为 0x03 字节传递给 shell
+    // shell 在 REPL 中检测 0x03 后手动向子进程组发送 SIGINT
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
     raw.c_cc[libc::VMIN] = 1;
     raw.c_cc[libc::VTIME] = 0;
     unsafe {

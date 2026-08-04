@@ -369,15 +369,23 @@ impl Drop for RawGuard {
 
 ### Ctrl-C 前台进程中断
 
-shell 注册 SIGINT handler，使用全局 `FOREGROUND_PGID: AtomicI32` 跟踪当前前台子进程组。当 shell 在 `wait()` 中阻塞等待子进程时，用户按下 Ctrl-C 产生 SIGINT 信号：
+raw 模式下 **ISIG 已关闭**，Ctrl-C 不产生 SIGINT 信号，而是作为 `0x03` 字节到达 stdin。shell 主线程在 `wait()` 中阻塞等待子进程，无法读 stdin，因此使用一个**后台监控线程**轮询 stdin 的 `0x03` 字节：
 
-1. handler 读取 `FOREGROUND_PGID`，如果非零则 `kill(-pgid, SIGINT)` 转发给子进程组
-2. 子进程在 `pre_exec` 中已将 SIGINT/SIGQUIT/SIGTSTP 恢复为 `SIG_DFL`（不继承 shell handler），收到信号后直接退出
-3. shell 清除 `FOREGROUND_PGID`，打印换行，显示新提示符
+1. `execute_pipeline()` 设置 `FOREGROUND_PGID`（第一个子进程的 pid）
+2. 启动 stdin 监控线程，非阻塞 read stdin：
+   - 收到 `0x03` -> `kill(-pgid, SIGINT)` 转发给子进程组，线程退出
+   - 收到其他字节 -> `ioctl(TIOCSTI)` 推回 stdin，供 shell 后续读取
+3. shell 主线程 `wait()` 子进程退出
+4. 设置 stop_flag 停止监控线程，`join()` 等待退出
+5. 清除 `FOREGROUND_PGID`，如果退出码为 130 则打印换行
 
-如果 shell 在编辑行时收到 SIGINT（无前台子进程），`read()` 返回 `EINTR`，shell 打印 `^C` 并清除当前行。前台子进程通过 `pre_exec` 中的 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（否则子进程会继承 shell 的 handler，收到信号不会退出）。
+子进程在 `pre_exec` 中通过 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（不继承 shell handler）。
 
-文件：src/applets/core/shell/executor.rs
+如果 shell 在编辑行时（无前台子进程），REPL 的 `0x03` 分支直接清除当前行并显示新提示符。
+
+SIGINT handler 仍注册为后备（管道模式下 ISIG 仍然开启时生效）。
+
+文件：src/applets/core/shell/executor.rs、src/applets/core/shell/reader.rs
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
