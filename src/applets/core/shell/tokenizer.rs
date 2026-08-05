@@ -73,6 +73,17 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 in_dquote = true;
                 in_token = true;
             }
+            '2' if chars.peek() == Some(&'>') => {
+                // stderr 重定向：2> 或 2>>
+                chars.next(); // consume '>'
+                flush_word(&mut tokens, &mut cur, &mut in_token);
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::RedirErrAppend);
+                } else {
+                    tokens.push(Token::RedirErr);
+                }
+            }
             '>' => {
                 flush_word(&mut tokens, &mut cur, &mut in_token);
                 if chars.peek() == Some(&'>') {
@@ -84,7 +95,12 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             }
             '<' => {
                 flush_word(&mut tokens, &mut cur, &mut in_token);
-                tokens.push(Token::RedirIn);
+                if chars.peek() == Some(&'<') {
+                    chars.next();
+                    tokens.push(Token::RedirHereDoc);
+                } else {
+                    tokens.push(Token::RedirIn);
+                }
             }
             '|' => {
                 flush_word(&mut tokens, &mut cur, &mut in_token);

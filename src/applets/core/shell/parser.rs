@@ -51,6 +51,20 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
                 let f = next_word(&mut iter, "<")?;
                 cur.stdin_file = Some(f);
             }
+            Token::RedirHereDoc => {
+                let delim = next_word(&mut iter, "<<")?;
+                cur.heredoc = Some(delim);
+            }
+            Token::RedirErr => {
+                let f = next_word(&mut iter, "2>")?;
+                cur.stderr_file = Some(f);
+                cur.append_err = false;
+            }
+            Token::RedirErrAppend => {
+                let f = next_word(&mut iter, "2>>")?;
+                cur.stderr_file = Some(f);
+                cur.append_err = true;
+            }
             Token::Pipe => {
                 if cur.is_empty() {
                     return Err("syntax error: empty command before |".to_string());

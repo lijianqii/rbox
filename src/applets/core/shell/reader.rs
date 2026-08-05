@@ -46,8 +46,15 @@ pub fn display_width(s: &str) -> usize {
 }
 
 /// 重绘当前行：`\r` + 清除行 + prompt + line + 光标定位。
+/// `pending` 非空表示续行模式，显示 `> ` 提示符；否则使用 `rbox# ` 或 $PS1。
 pub fn redraw(pending: &str, line: &str, cursor: usize) {
-    let prompt = if pending.is_empty() { "rbox# " } else { "> " };
+    let prompt = if !pending.is_empty() {
+        "> ".to_string()
+    } else if let Ok(ps1) = std::env::var("PS1") {
+        expand_ps1(&ps1)
+    } else {
+        "rbox# ".to_string()
+    };
     let _ = write!(io::stdout(), "\r\x1b[K{}{}", prompt, line);
     // 光标定位：从行末向左移动到 cursor 位置
     let display_pos = display_width(&line[..cursor]);
@@ -56,4 +63,77 @@ pub fn redraw(pending: &str, line: &str, cursor: usize) {
         let _ = write!(io::stdout(), "\x1b[{}D", back);
     }
     let _ = io::stdout().flush();
+}
+
+/// 生成提示符字符串。
+pub fn make_prompt(pending: &str) -> String {
+    if !pending.is_empty() {
+        return "> ".to_string();
+    }
+    if let Ok(ps1) = std::env::var("PS1") {
+        expand_ps1(&ps1)
+    } else {
+        "rbox# ".to_string()
+    }
+}
+
+/// 展开 PS1 转义序列。
+pub fn expand_ps1(ps1: &str) -> String {
+    let mut result = String::new();
+    let mut chars = ps1.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&next) = chars.peek() {
+                chars.next();
+                match next {
+                    'w' => {
+                        let cwd = std::env::current_dir()
+                            .map(|d| d.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let home = std::env::var("HOME").unwrap_or_default();
+                        if !home.is_empty() && cwd.starts_with(&home) {
+                            result.push('~');
+                            result.push_str(&cwd[home.len()..]);
+                        } else {
+                            result.push_str(&cwd);
+                        }
+                    }
+                    'u' => {
+                        result.push_str(
+                            &std::env::var("USER").unwrap_or_else(|_| "root".to_string()),
+                        );
+                    }
+                    'h' => {
+                        let host = std::fs::read_to_string("/etc/hostname")
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
+                        result.push_str(&host);
+                    }
+                    '$' => {
+                        result.push('$');
+                    }
+                    '#' => {
+                        result.push('#');
+                    }
+                    'n' => {
+                        result.push('\n');
+                    }
+                    'e' => {
+                        result.push('\u{1b}');
+                    }
+                    '\\' => {
+                        result.push('\\');
+                    }
+                    _ => {
+                        result.push('\\');
+                        result.push(next);
+                    }
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }

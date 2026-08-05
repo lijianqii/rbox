@@ -11,6 +11,12 @@ pub enum Token {
     RedirAppend,
     /// `<` 输入重定向。
     RedirIn,
+    /// `<<` here-doc。
+    RedirHereDoc,
+    /// `2>` stderr 重定向（覆盖）。
+    RedirErr,
+    /// `2>>` stderr 重定向（追加）。
+    RedirErrAppend,
     /// `|` 管道。
     Pipe,
     /// `;` 命令分隔。
@@ -28,8 +34,12 @@ pub enum Token {
 pub struct SimpleCmd {
     pub argv: Vec<String>,
     pub stdin_file: Option<String>,
+    /// here-doc 内容（临时文件路径）。
+    pub heredoc: Option<String>,
     pub stdout_file: Option<String>,
+    pub stderr_file: Option<String>,
     pub append: bool,
+    pub append_err: bool,
 }
 
 impl SimpleCmd {

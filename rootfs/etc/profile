@@ -1,0 +1,16 @@
+# /etc/profile - system-wide shell initialization
+# Sourced by rbox sh on startup (if run as login shell or via source)
+
+# Set PATH
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Set hostname
+export HOSTNAME=$(cat /etc/hostname 2>/dev/null || echo rbox)
+export USER=root
+export HOME=/
+
+# Set prompt: user@host:cwd#
+export PS1='\u@\h:\w# '
+
+# Set default editor
+export EDITOR=vi

@@ -328,20 +328,23 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。Shell 部分覆盖 10 个功能组、76 个断言：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。Shell 部分覆盖 13 个功能组、94 个断言：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
 | 引号与转义 | 双引号、单引号、反斜杠、续行、注释 | 5 |
 | 变量展开 | $VAR、${VAR}、$?、$$、unset | 5 |
 | 控制操作符 | ;、&&、||、链式、后台 & | 5 |
-| 重定向 | >、>>、< | 3 |
+| 重定向 | >、>>、<、2>、2>> | 5 |
 | 管道 | 3级管道、管道+重定向 | 3 |
 | 通配符 | *、?、[] | 4 |
 | 历史扩展 | !!、!n、!$、history | 4 |
 | ~ 展开 | echo ~、cd ~ + pwd | 2 |
 | Tab 补全 | 命令、文件、管道后 | 3 |
 | 行编辑快捷键 | Ctrl-E/U/K/W/C | 5 |
+| PS1 提示符 | \\u \\h \\w \\# | 3 |
+| source 命令 | source /etc/profile | 2 |
+| here-doc | <<EOF | 1 |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -350,12 +353,13 @@ enum Token {
 - Shell 不支持 `for`/`while`/`if` 等复合命令
 - 不支持命令别名 `alias`
 - 不支持子shell `()` 和命令替换 `$()`
+- here-doc 仅在交互式 tty 模式下可用（管道模式无法多行输入）
 
 ### 终端模式（Tab 补全的前提）
 
 Tab 补全要求 shell 能逐字节读取按键，但默认终端处于 **canonical（行缓冲）模式**，按下 Tab 不会立即传递给进程。因此需要两层终端设置：
 
-1. **客户机侧（shell 启动时）**：`enable_raw_mode()` 通过 `libc::tcgetattr` 保存原始终端属性，`tcsetattr` 设置 cbreak 模式（关闭 `ICANON` + `ECHO`，**保留 `ISIG`** 使 Ctrl-C 产生 SIGINT 信号，`VMIN=1 VTIME=0`）。`RawGuard` 在 shell 退出时通过 `Drop` 自动恢复。管道输入时 `tcgetattr` 失败返回 `None`，不影响。
+1. **客户机侧（shell 启动时）**：`enable_raw_mode()` 通过 `libc::tcgetattr` 保存原始终端属性，`tcsetattr` 设置 cbreak 模式（关闭 `ICANON` + `ECHO` + `ISIG`，使 Ctrl-C 作为 `0x03` 字节传递，`VMIN=1 VTIME=0`）。`RawGuard` 在 shell 退出时通过 `Drop` 自动恢复。管道输入时 `tcgetattr` 失败返回 `None`，不影响。
 2. **宿主机侧（make run / run.sh）**：`stty -echo -icanon min 1 time 0` 将宿主机终端设为 raw 模式，让按键立即传递给 QEMU。QEMU 退出后 `stty sane` 恢复。
 
 ```rust
@@ -385,7 +389,33 @@ raw 模式下 **ISIG 已关闭**，Ctrl-C 不产生 SIGINT 信号，而是作为
 
 SIGINT handler 仍注册为后备（管道模式下 ISIG 仍然开启时生效）。
 
-文件：src/applets/core/shell/executor.rs、src/applets/core/shell/reader.rs
+### SIGCHLD 后台进程回收
+
+shell 注册 `SIGCHLD` handler，自动回收后台子进程（`&` 启动的），避免僵尸进程。handler 内部循环 `waitpid(-1, WNOHANG)` 直到无子进程可回收。
+
+### 命令历史持久化
+
+shell 启动时从 `~/.rbox_history` 加载历史记录，每条命令执行后追加写入。历史文件路径优先使用 `$HOME/.rbox_history`，`$HOME` 未设置时使用 `/tmp/.rbox_history`。
+
+### PS1 提示符
+
+shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u`（用户名）、`\h`（主机名）、`\w`（当前路径，`$HOME` 替换为 `~`）、`\$`（`$`）、`\#`（`#`）、`\n`（换行）、`\e`（ESC）、`\\`（反斜杠）。`$PS1` 未设置时默认为 `rbox# `。
+
+`/etc/profile` 在 shell 启动时自动 source，设置默认 PATH、USER、HOSTNAME、PS1 等。
+
+### source 内置命令
+
+`source file` 或 `. file`：逐行读取文件并执行，跳过空行和 `#` 注释行。不支持 `exit`（source 中直接 return）。
+
+### stderr 重定向
+
+支持 `2>`（覆盖）和 `2>>`（追加）重定向 stderr。在 tokenizer 中通过前导 `2` 识别，parser 设置 `SimpleCmd.stderr_file`，executor 在 `command.stderr()` 中配置。
+
+### here-doc
+
+支持 `<<EOF` 语法。REPL 检测到 `<<` 后，提示 `> ` 逐行读取内容直到遇到 delimiter，写入临时文件 `/tmp/heredoc_<pid>`，然后替换为 `< /tmp/heredoc_<pid>` 执行。仅在交互式 tty 模式下可用。
+
+文件：src/applets/core/shell/executor.rs、src/applets/core/shell/reader.rs、src/applets/core/shell/mod.rs
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
@@ -806,7 +836,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（173 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（176 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |

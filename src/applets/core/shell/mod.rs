@@ -26,8 +26,118 @@ mod tokenizer;
 mod types;
 
 use crate::applet::Applet;
-use reader::{enable_raw_mode, redraw};
+use reader::{enable_raw_mode, make_prompt, redraw};
 use std::io::{self, Read, Write};
+
+/// 处理 here-doc：检测 `<<DELIM`，读取后续行直到 DELIM，写入临时文件。
+/// 返回替换后的命令行（`<<DELIM` -> `<tmpfile`）。
+fn process_heredoc<R: Read>(line: &str, input: &mut R, _pending: &str) -> String {
+    // 查找 << 在行中的位置
+    let idx = match line.find("<<") {
+        Some(i) => i,
+        None => return line.to_string(),
+    };
+
+    // 提取 delimiter（<< 后面的第一个词）
+    let after = &line[idx + 2..];
+    let delim = after.split_whitespace().next().unwrap_or("");
+    if delim.is_empty() {
+        return line.to_string();
+    }
+
+    // 读取 here-doc 内容
+    let mut content = String::new();
+    let mut buf = String::new();
+    loop {
+        let _ = write!(io::stdout(), "> ");
+        let _ = io::stdout().flush();
+        let mut byte = [0u8; 1];
+        loop {
+            match input.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if byte[0] == b'\n' || byte[0] == b'\r' {
+                        break;
+                    }
+                    buf.push(byte[0] as char);
+                }
+                Err(_) => break,
+            }
+        }
+        let line_content = buf.trim().to_string();
+        buf.clear();
+        if line_content == delim {
+            break;
+        }
+        content.push_str(&line_content);
+        content.push('\n');
+    }
+
+    // 写入临时文件
+    let tmpfile = format!("/tmp/heredoc_{}", std::process::id());
+    if std::fs::write(&tmpfile, &content).is_err() {
+        return line.to_string();
+    }
+
+    // 替换 <<DELIM 为 <tmpfile
+    let before = &line[..idx];
+    format!("{} < {}", before.trim_end(), tmpfile)
+}
+
+/// 历史文件路径。
+fn history_file() -> String {
+    std::env::var("HOME")
+        .map(|h| format!("{}/.rbox_history", h))
+        .unwrap_or_else(|_| "/tmp/.rbox_history".to_string())
+}
+
+/// 加载历史文件。
+fn load_history() -> Vec<String> {
+    let path = history_file();
+    match std::fs::read_to_string(&path) {
+        Ok(content) => content.lines().map(|l| l.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 追加一条历史到文件。
+fn append_history(line: &str) {
+    let path = history_file();
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// 执行 source 命令：逐行读取文件并执行。
+fn source_file(path: &str, last_rc: &mut i32, history: &mut Vec<String>) -> i32 {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("source: {}: {}", path, e);
+            return 1;
+        }
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        *last_rc = executor::execute_line(line, last_rc, history, |_rc: i32| {
+            // source 中不支持 exit
+        });
+        // 追加历史
+        if !line.is_empty() && history.last() != Some(&line.to_string()) {
+            history.push(line.to_string());
+            append_history(line);
+        }
+    }
+    *last_rc
+}
 
 pub struct Shell;
 
@@ -52,25 +162,33 @@ impl Applet for Shell {
 
 impl Shell {
     fn run_shell() -> io::Result<u8> {
-        // 注册 SIGINT 处理器：前台有子进程时转发信号。
-        // tty 模式下 Ctrl-C 产生 SIGINT（ISIG 开启），由 handler 处理；
-        // 管道模式下 0x03 作为普通字节到达 REPL 的 0x03 分支。
+        // 注册 SIGINT handler（管道模式后备）
         executor::install_sigint_handler();
+
+        // 注册 SIGCHLD handler：自动回收后台僵尸子进程
+        executor::install_sigchld_handler();
+
+        // 加载 /etc/profile（如果存在）
+        let mut boot_rc: i32 = 0;
+        let mut boot_history: Vec<String> = Vec::new();
+        if std::path::Path::new("/etc/profile").exists() {
+            source_file("/etc/profile", &mut boot_rc, &mut boot_history);
+        }
 
         let stdin = io::stdin();
         let mut input = stdin.lock();
         let mut last_rc: i32 = 0;
         let mut pending_line = String::new();
 
-        // 命令历史
-        let mut history: Vec<String> = Vec::new();
+        // 命令历史：从文件加载
+        let mut history: Vec<String> = load_history();
         let mut hist_idx: Option<usize> = None;
         let mut saved_line = String::new();
 
         // raw mode guard（终端时启用，管道时为 None）
         let _raw_guard = enable_raw_mode();
 
-        let _ = write!(io::stdout(), "rbox# ");
+        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
         let _ = io::stdout().flush();
 
         let mut line = String::new();
@@ -81,14 +199,12 @@ impl Shell {
             let n = match input.read(&mut byte) {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-                    // SIGINT 打断了 read：如果有前台进程已被 handler 处理；
-                    // 如果是在编辑行时，清除当前行并新起一行
                     let _ = writeln!(io::stdout(), "^C");
                     line.clear();
                     cursor = 0;
                     pending_line.clear();
                     hist_idx = None;
-                    let _ = write!(io::stdout(), "rbox# ");
+                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                     let _ = io::stdout().flush();
                     continue;
                 }
@@ -121,15 +237,30 @@ impl Shell {
 
                     // 空行直接跳过
                     if full_line.trim().is_empty() {
-                        let _ = write!(io::stdout(), "rbox# ");
+                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                         let _ = io::stdout().flush();
                         continue;
+                    }
+
+                    // source 命令特殊处理
+                    let trimmed = full_line.trim();
+                    if trimmed.starts_with("source ") || trimmed.starts_with(". ") {
+                        let file = trimmed.split_whitespace().nth(1).unwrap_or("");
+                        source_file(file, &mut last_rc, &mut history);
+                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+
+                    // here-doc 处理：检测 <<DELIM
+                    if full_line.contains("<<") {
+                        full_line = process_heredoc(&full_line, &mut input, &pending_line);
                     }
 
                     // 执行行（历史扩展在 execute_line 内部完成）
                     last_rc =
                         executor::execute_line(&full_line, &mut last_rc, &history, |rc: i32| {
-                            let _ = write!(io::stdout(), "rbox# ");
+                            let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                             let _ = io::stdout().flush();
                             std::process::exit(rc);
                         });
@@ -137,9 +268,10 @@ impl Shell {
                     // 存入历史（非空且与最后一条不同）
                     if !full_line.trim().is_empty() && history.last() != Some(&full_line) {
                         history.push(full_line.clone());
+                        append_history(&full_line);
                     }
 
-                    let _ = write!(io::stdout(), "rbox# ");
+                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                     let _ = io::stdout().flush();
                 }
 
@@ -147,8 +279,7 @@ impl Shell {
                     // Tab 补全
                     let (new_line, printed) = completion::tab_complete(&line);
                     if printed {
-                        // 多匹配列表已打印，重绘提示符 + 当前行
-                        let _ = write!(io::stdout(), "rbox# ");
+                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                         let _ = io::stdout().flush();
                     }
                     line = new_line;
@@ -185,7 +316,7 @@ impl Shell {
                     cursor = 0;
                     pending_line.clear();
                     hist_idx = None;
-                    let _ = write!(io::stdout(), "rbox# ");
+                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                     let _ = io::stdout().flush();
                 }
 

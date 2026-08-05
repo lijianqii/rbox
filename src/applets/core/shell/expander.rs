@@ -22,8 +22,11 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
         new_cmds.push(SimpleCmd {
             argv: new_argv,
             stdin_file: cmd.stdin_file.clone(),
+            heredoc: cmd.heredoc.clone(),
             stdout_file: cmd.stdout_file.clone(),
+            stderr_file: cmd.stderr_file.clone(),
             append: cmd.append,
+            append_err: cmd.append_err,
         });
     }
     Ok(Pipeline {

@@ -173,6 +173,25 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             command.stdout(Stdio::piped());
         }
 
+        // stderr
+        if let Some(ref f) = cmd.stderr_file {
+            let mut opts = std::fs::OpenOptions::new();
+            let opts = if cmd.append_err {
+                opts.create(true).append(true).open(f)
+            } else {
+                opts.create(true).write(true).truncate(true).open(f)
+            };
+            match opts {
+                Ok(file) => {
+                    command.stderr(Stdio::from(file));
+                }
+                Err(e) => {
+                    eprintln!("shell: {}: {}", f, e);
+                    return 1;
+                }
+            }
+        }
+
         // 管道中间命令的 stdin 来自前一个命令的 stdout
         if i > 0
             && cmd.stdin_file.is_none()
@@ -186,6 +205,10 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             Ok(child) => children.push(child),
             Err(e) => {
                 eprintln!("shell: {}: {}", cmd.argv[0], e);
+                // 关闭未消费的 pipe stdout，避免 fd 泄漏
+                for child in &mut children {
+                    child.stdout = None;
+                }
                 return 127;
             }
         }
@@ -268,6 +291,22 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
     }
 
     last_code
+}
+
+/// 注册 SIGCHLD 处理器：自动回收后台僵尸子进程。
+pub fn install_sigchld_handler() {
+    extern "C" fn handle_sigchld(_sig: i32) {
+        // 非阻塞 waitpid 回收所有已终止的子进程
+        loop {
+            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+            if pid <= 0 {
+                break;
+            }
+        }
+    }
+    unsafe {
+        libc::signal(libc::SIGCHLD, handle_sigchld as *const () as usize);
+    }
 }
 
 /// 命令查找：含 `/` 按字面路径，否则在 PATH 下查找。

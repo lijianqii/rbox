@@ -11,13 +11,26 @@ pub fn tab_complete(line: &str) -> (String, bool) {
         return (line.to_string(), false);
     }
 
+    // 如果 prefix 以引号开头，提取引号内的内容作为实际 prefix
+    let (quote_char, inner_prefix) = if let Some(s) = prefix.strip_prefix('"') {
+        ('"', s)
+    } else if let Some(s) = prefix.strip_prefix('\'') {
+        ('\'', s)
+    } else {
+        ('\0', prefix)
+    };
+
+    if inner_prefix.is_empty() {
+        return (line.to_string(), false);
+    }
+
     // 判断是命令补全还是文件补全：
     // - 第一个词且不含 / -> 命令补全
     // - 管道 | ; && || 后的新命令 -> 命令补全
     // - 含 / 的第一个词（如 /bin/ls）-> 文件补全
     // - 其他 -> 文件补全
     let is_first_word = line[..word_start].trim().is_empty();
-    let is_path = prefix.contains('/');
+    let is_path = inner_prefix.contains('/');
     let after_operator = {
         let before = line[..word_start].trim_end();
         before.ends_with('|')
@@ -40,17 +53,26 @@ pub fn tab_complete(line: &str) -> (String, bool) {
         // 唯一匹配：补全整个词
         let completion = &matches[0];
         let mut new_line = line[..word_start].to_string();
+        if quote_char != '\0' {
+            new_line.push(quote_char);
+        }
         new_line.push_str(completion);
         // 目录补全后不加空格（用户可能要继续输入子路径）
         if !completion.ends_with('/') {
             new_line.push(' ');
+            if quote_char != '\0' {
+                new_line.push(quote_char);
+            }
         }
         (new_line, false)
     } else {
         // 多匹配：先补全到公共前缀
         let common = common_prefix(&matches);
-        if common.len() > prefix.len() {
+        if common.len() > inner_prefix.len() {
             let mut new_line = line[..word_start].to_string();
+            if quote_char != '\0' {
+                new_line.push(quote_char);
+            }
             new_line.push_str(&common);
             (new_line, false)
         } else {
