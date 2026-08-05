@@ -147,7 +147,6 @@ impl Applet for Wc {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn count_basic() {

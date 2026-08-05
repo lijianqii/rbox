@@ -15,6 +15,23 @@ use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
+/// 以覆盖或追加方式打开文件用于重定向。
+fn open_redirect(path: &str, append: bool) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    let result = if append {
+        opts.create(true).append(true).open(path)
+    } else {
+        opts.create(true).write(true).truncate(true).open(path)
+    };
+    match result {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("shell: {}: {}", path, e);
+            None
+        }
+    }
+}
+
 /// 当前前台子进程组 ID（0 表示无前台进程在运行）。
 /// SIGINT 处理器读取此值以转发信号。
 static FOREGROUND_PGID: AtomicI32 = AtomicI32::new(0);
@@ -148,26 +165,15 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
                     return 1;
                 }
             }
-        } else if i > 0 {
-            // 管道中间命令：stdin 来自前一个命令的 pipe（在下面处理）
         }
 
         // stdout
         if let Some(ref f) = cmd.stdout_file {
-            let mut opts = std::fs::OpenOptions::new();
-            let opts = if cmd.append {
-                opts.create(true).append(true).open(f)
-            } else {
-                opts.create(true).write(true).truncate(true).open(f)
-            };
-            match opts {
-                Ok(file) => {
+            match open_redirect(f, cmd.append) {
+                Some(file) => {
                     command.stdout(Stdio::from(file));
                 }
-                Err(e) => {
-                    eprintln!("shell: {}: {}", f, e);
-                    return 1;
-                }
+                None => return 1,
             }
         } else if i < ncmds - 1 {
             command.stdout(Stdio::piped());
@@ -175,20 +181,11 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
 
         // stderr
         if let Some(ref f) = cmd.stderr_file {
-            let mut opts = std::fs::OpenOptions::new();
-            let opts = if cmd.append_err {
-                opts.create(true).append(true).open(f)
-            } else {
-                opts.create(true).write(true).truncate(true).open(f)
-            };
-            match opts {
-                Ok(file) => {
+            match open_redirect(f, cmd.append_err) {
+                Some(file) => {
                     command.stderr(Stdio::from(file));
                 }
-                Err(e) => {
-                    eprintln!("shell: {}: {}", f, e);
-                    return 1;
-                }
+                None => return 1,
             }
         }
 
@@ -244,26 +241,26 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, 1) };
             // 恢复阻塞
             unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags) };
-            if n == 1 && buf[0] == 0x03 {
-                // Ctrl-C：向子进程组发送 SIGINT
-                let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
-                if pgid > 0 {
+
+            if n == 1 {
+                if buf[0] == 0x03 {
+                    // Ctrl-C：向子进程组发送 SIGINT
+                    let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
+                    if pgid > 0 {
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGINT);
+                        }
+                    }
+                    return;
+                } else {
+                    // 其他字节推回 stdin
                     unsafe {
-                        libc::kill(-pgid, libc::SIGINT);
+                        libc::ioctl(stdin_fd, libc::TIOCSTI, &buf[0] as *const u8 as *const _);
                     }
                 }
-                return;
-            }
-            if n <= 0 {
+            } else {
                 // 没有数据，短暂休眠后重试
                 std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            // 如果读到其他字节，放回 stdin（通过回写）
-            if n == 1 && buf[0] != 0x03 {
-                // 把字节推回 stdin，用 ioctl TIOCSTI
-                unsafe {
-                    libc::ioctl(stdin_fd, libc::TIOCSTI, &buf[0] as *const u8 as *const _);
-                }
             }
         }
     });
@@ -334,4 +331,58 @@ fn resolve_command(cmd: &str) -> (String, Vec<String>) {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "/bin/rbox".to_string());
     (rbox_path, vec![cmd.to_string()])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_redirect_creates_new_file() {
+        let path = "/tmp/rbox_test_redirect_new";
+        let _ = std::fs::remove_file(path);
+        let f = open_redirect(path, false);
+        assert!(f.is_some());
+        assert!(std::path::Path::new(path).exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_redirect_append_mode() {
+        let path = "/tmp/rbox_test_redirect_append";
+        let _ = std::fs::remove_file(path);
+        // First write
+        let _ = open_redirect(path, false);
+        // Append should also work
+        let f = open_redirect(path, true);
+        assert!(f.is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_redirect_fails_for_invalid_path() {
+        // Directory as target -> error
+        let f = open_redirect("/tmp", false);
+        assert!(f.is_none());
+    }
+
+    #[test]
+    fn resolve_command_finds_builtin_echo() {
+        // echo should be found via PATH (coreutils on host or rbox fallback)
+        let (program, _args) = resolve_command("echo");
+        // Should resolve to some path containing "echo" or rbox
+        assert!(
+            program.contains("echo") || program.contains("rbox"),
+            "expected echo or rbox, got: {}",
+            program
+        );
+    }
+
+    #[test]
+    fn resolve_command_fallback_for_unknown() {
+        // Unknown command -> rbox fallback
+        let (program, args) = resolve_command("nonexistent_cmd_xyz");
+        assert!(program.contains("rbox") || program.contains("cargo"));
+        assert_eq!(args, vec!["nonexistent_cmd_xyz"]);
+    }
 }

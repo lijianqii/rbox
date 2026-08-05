@@ -374,4 +374,110 @@ mod tests {
             vec![Token::Word("echo".into()), Token::Word("2".into()),]
         );
     }
+
+    // ─── 引号嵌套 ──────────────────────────────
+
+    #[test]
+    fn double_quote_with_single_inside() {
+        let tokens = tokenize("echo \"it's\"");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("it's".into()),]
+        );
+    }
+
+    #[test]
+    fn single_quote_with_double_inside() {
+        let tokens = tokenize("echo 'say \"hi\"'");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("say \"hi\"".into()),]
+        );
+    }
+
+    #[test]
+    fn mixed_quotes_concatenation() {
+        // 'abc'"def" -> abcdef (no space between)
+        let tokens = tokenize("echo 'abc'\"def\"");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("abcdef".into()),]
+        );
+    }
+
+    // ─── 转义字符 ──────────────────────────────
+
+    #[test]
+    fn escaped_pipe_as_word() {
+        let tokens = tokenize(r"echo a\|b");
+        // \| inside word -> literal |
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("a|b".into()),]
+        );
+    }
+
+    #[test]
+    fn escaped_semicolon_as_word() {
+        let tokens = tokenize(r"echo a\;b");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("a;b".into()),]
+        );
+    }
+
+    // ─── 注释 ──────────────────────────────────
+
+    #[test]
+    fn comment_at_end() {
+        let tokens = tokenize("echo hi # this is a comment");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("hi".into()),]
+        );
+    }
+
+    #[test]
+    fn full_line_comment() {
+        let tokens = tokenize("# just a comment");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn comment_after_operator() {
+        let tokens = tokenize("echo a; # comment");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("a".into()),
+                Token::Semicolon,
+            ]
+        );
+    }
+
+    // ─── 续行 ──────────────────────────────────
+
+    #[test]
+    fn line_continuation() {
+        let tokens = tokenize("echo a\\\nb");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("ab".into()),]
+        );
+    }
+
+    // ─── 空输入 ────────────────────────────────
+
+    #[test]
+    fn only_whitespace() {
+        let tokens = tokenize("   \t  ");
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn only_comment() {
+        let tokens = tokenize("  # comment only  ");
+        assert!(tokens.is_empty());
+    }
 }

@@ -469,4 +469,198 @@ mod tests {
         assert!(glob_match("file[0-9]?", "file5a"));
         assert!(!glob_match("file[0-9]?", "fileab"));
     }
+
+    // ─── expand_pipeline ──────────────────────
+
+    #[test]
+    fn expand_pipeline_preserves_redirects() {
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec!["echo".into(), "$VAR".into()],
+                stdout_file: Some("/tmp/out".into()),
+                ..Default::default()
+            }],
+            background: false,
+        };
+        unsafe {
+            std::env::set_var("VAR", "hello");
+        }
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert_eq!(result.cmds[0].argv, vec!["echo", "hello"]);
+        assert_eq!(result.cmds[0].stdout_file.as_deref(), Some("/tmp/out"));
+        unsafe {
+            std::env::remove_var("VAR");
+        }
+    }
+
+    #[test]
+    fn expand_pipeline_preserves_background() {
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec!["sleep".into(), "10".into()],
+                ..Default::default()
+            }],
+            background: true,
+        };
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert!(result.background);
+    }
+
+    #[test]
+    fn expand_pipeline_preserves_stderr() {
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec!["echo".into(), "hi".into()],
+                stderr_file: Some("/tmp/err".into()),
+                append_err: true,
+                ..Default::default()
+            }],
+            background: false,
+        };
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert_eq!(result.cmds[0].stderr_file.as_deref(), Some("/tmp/err"));
+        assert!(result.cmds[0].append_err);
+    }
+
+    #[test]
+    fn expand_pipeline_preserves_heredoc() {
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec!["cat".into()],
+                heredoc: Some("EOF".into()),
+                ..Default::default()
+            }],
+            background: false,
+        };
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert_eq!(result.cmds[0].heredoc.as_deref(), Some("EOF"));
+    }
+
+    #[test]
+    fn expand_pipeline_multiple_cmds() {
+        let p = Pipeline {
+            cmds: vec![
+                SimpleCmd {
+                    argv: vec!["echo".into(), "$A".into()],
+                    ..Default::default()
+                },
+                SimpleCmd {
+                    argv: vec!["cat".into()],
+                    ..Default::default()
+                },
+            ],
+            background: false,
+        };
+        unsafe {
+            std::env::set_var("A", "x");
+        }
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert_eq!(result.cmds.len(), 2);
+        assert_eq!(result.cmds[0].argv, vec!["echo", "x"]);
+        assert_eq!(result.cmds[1].argv, vec!["cat"]);
+        unsafe {
+            std::env::remove_var("A");
+        }
+    }
+
+    // ─── expand_vars 边界 ──────────────────────
+
+    #[test]
+    fn expand_vars_dollar_at_end() {
+        // lone $ at end -> literal $
+        assert_eq!(expand_vars("echo $", 0), "echo $");
+    }
+
+    #[test]
+    fn expand_vars_unclosed_brace() {
+        // ${VAR without closing } -> takes rest of string
+        unsafe {
+            std::env::set_var("VAR", "val");
+        }
+        assert_eq!(expand_vars("${VAR", 0), "val");
+        unsafe {
+            std::env::remove_var("VAR");
+        }
+    }
+
+    #[test]
+    fn expand_vars_empty_brace() {
+        // ${} -> empty
+        assert_eq!(expand_vars("${}", 0), "");
+    }
+
+    #[test]
+    fn expand_vars_dollar_underscore() {
+        unsafe {
+            std::env::set_var("_", "underscore_val");
+        }
+        assert_eq!(expand_vars("$_", 0), "underscore_val");
+        unsafe {
+            std::env::remove_var("_");
+        }
+    }
+
+    #[test]
+    fn expand_vars_multiple() {
+        unsafe {
+            std::env::set_var("A", "1");
+            std::env::set_var("B", "2");
+        }
+        assert_eq!(expand_vars("$A-$B", 0), "1-2");
+        unsafe {
+            std::env::remove_var("A");
+            std::env::remove_var("B");
+        }
+    }
+
+    // ─── expand_history 边界 ──────────────────
+
+    #[test]
+    fn hist_bang_at_end_no_next() {
+        // ! at end with no next char -> literal !
+        let history = vec!["echo a".to_string()];
+        assert_eq!(expand_history("echo !", &history), "echo !");
+    }
+
+    #[test]
+    fn hist_bang_n_out_of_range() {
+        let history = vec!["echo a".to_string()];
+        // !99 -> out of range, literal !99
+        assert_eq!(expand_history("!99", &history), "!99");
+    }
+
+    #[test]
+    fn hist_bang_minus_n_out_of_range() {
+        let history = vec!["echo a".to_string()];
+        assert_eq!(expand_history("!-5", &history), "!-5");
+    }
+
+    #[test]
+    fn hist_bang_invalid_char() {
+        let history = vec!["echo a".to_string()];
+        // !x -> unknown, literal !
+        assert_eq!(expand_history("!x", &history), "!x");
+    }
+
+    // ─── expand_tilde 边界 ────────────────────
+
+    #[test]
+    fn tilde_no_home_var() {
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+        assert_eq!(expand_tilde("~"), "/");
+    }
+
+    #[test]
+    fn tilde_with_home_set() {
+        unsafe {
+            std::env::set_var("HOME", "/root");
+        }
+        assert_eq!(expand_tilde("~"), "/root");
+        assert_eq!(expand_tilde("~/foo"), "/root/foo");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
 }

@@ -31,7 +31,7 @@ use std::io::{self, Read, Write};
 
 /// 处理 here-doc：检测 `<<DELIM`，读取后续行直到 DELIM，写入临时文件。
 /// 返回替换后的命令行（`<<DELIM` -> `<tmpfile`）。
-fn process_heredoc<R: Read>(line: &str, input: &mut R, _pending: &str) -> String {
+fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
     // 查找 << 在行中的位置
     let idx = match line.find("<<") {
         Some(i) => i,
@@ -254,7 +254,7 @@ impl Shell {
 
                     // here-doc 处理：检测 <<DELIM
                     if full_line.contains("<<") {
-                        full_line = process_heredoc(&full_line, &mut input, &pending_line);
+                        full_line = process_heredoc(&full_line, &mut input);
                     }
 
                     // 执行行（历史扩展在 execute_line 内部完成）

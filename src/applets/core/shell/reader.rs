@@ -48,13 +48,7 @@ pub fn display_width(s: &str) -> usize {
 /// 重绘当前行：`\r` + 清除行 + prompt + line + 光标定位。
 /// `pending` 非空表示续行模式，显示 `> ` 提示符；否则使用 `rbox# ` 或 $PS1。
 pub fn redraw(pending: &str, line: &str, cursor: usize) {
-    let prompt = if !pending.is_empty() {
-        "> ".to_string()
-    } else if let Ok(ps1) = std::env::var("PS1") {
-        expand_ps1(&ps1)
-    } else {
-        "rbox# ".to_string()
-    };
+    let prompt = make_prompt(pending);
     let _ = write!(io::stdout(), "\r\x1b[K{}{}", prompt, line);
     // 光标定位：从行末向左移动到 cursor 位置
     let display_pos = display_width(&line[..cursor]);

@@ -296,4 +296,86 @@ mod tests {
         let tokens = vec![Token::Word("cat".into()), Token::RedirHereDoc];
         assert!(build_command_list(&tokens).is_err());
     }
+
+    // ─── 后台执行 ──────────────────────────────
+
+    #[test]
+    fn parse_background() {
+        let cl = parse("sleep 10 &");
+        assert_eq!(cl.segments.len(), 1);
+        assert!(cl.segments[0].pipeline.background);
+    }
+
+    #[test]
+    fn parse_background_with_pipe() {
+        let cl = parse("echo hi | cat &");
+        assert_eq!(cl.segments.len(), 1);
+        assert!(cl.segments[0].pipeline.background);
+        assert_eq!(cl.segments[0].pipeline.cmds.len(), 2);
+    }
+
+    // ─── 复杂命令行 ────────────────────────────
+
+    #[test]
+    fn parse_full_complex_line() {
+        let cl = parse("echo a > out.txt && cat out.txt | grep x");
+        assert_eq!(cl.segments.len(), 2);
+        assert_eq!(cl.segments[0].connector, Connector::Start);
+        assert_eq!(cl.segments[1].connector, Connector::AndIf);
+        assert_eq!(cl.segments[0].pipeline.cmds.len(), 1);
+        assert_eq!(cl.segments[1].pipeline.cmds.len(), 2);
+    }
+
+    // ─── 空管道命令 ────────────────────────────
+
+    #[test]
+    fn parse_empty() {
+        let cl = parse("");
+        assert!(cl.segments.is_empty());
+    }
+
+    #[test]
+    fn parse_only_semicolons() {
+        let cl = parse(";;;");
+        assert!(cl.segments.is_empty());
+    }
+
+    // ─── 多重定向同一命令 ──────────────────────
+
+    #[test]
+    fn parse_stdin_and_stdout_same_cmd() {
+        let cl = parse("cmd < in > out");
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stdin_file.as_deref(), Some("in"));
+        assert_eq!(cmd.stdout_file.as_deref(), Some("out"));
+    }
+
+    #[test]
+    fn parse_append_stdout() {
+        let cl = parse("cmd >> out");
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stdout_file.as_deref(), Some("out"));
+        assert!(cmd.append);
+    }
+
+    // ─── 连续操作符 ────────────────────────────
+
+    #[test]
+    fn parse_semicolon_chain() {
+        let cl = parse("a; b; c");
+        assert_eq!(cl.segments.len(), 3);
+        assert_eq!(cl.segments[0].connector, Connector::Start);
+        assert_eq!(cl.segments[1].connector, Connector::Sequential);
+        assert_eq!(cl.segments[2].connector, Connector::Sequential);
+    }
+
+    #[test]
+    fn parse_mixed_connectors() {
+        let cl = parse("a && b || c; d");
+        assert_eq!(cl.segments.len(), 4);
+        assert_eq!(cl.segments[0].connector, Connector::Start);
+        assert_eq!(cl.segments[1].connector, Connector::AndIf);
+        assert_eq!(cl.segments[2].connector, Connector::OrIf);
+        assert_eq!(cl.segments[3].connector, Connector::Sequential);
+    }
 }

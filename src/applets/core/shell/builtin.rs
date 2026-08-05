@@ -186,4 +186,67 @@ mod tests {
         let result = try_builtin(&SimpleCmd::default(), &mut rc, &[]);
         assert!(matches!(result, BuiltinResult::Done));
     }
+
+    // ─── cd 边界 ───────────────────────────────
+
+    #[test]
+    fn cd_to_root() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["cd", "/"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn cd_no_arg_goes_home() {
+        unsafe {
+            std::env::set_var("HOME", "/tmp");
+        }
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["cd"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
+        assert_eq!(std::env::current_dir().unwrap().to_string_lossy(), "/tmp");
+        unsafe {
+            std::env::remove_var("HOME");
+        }
+    }
+
+    // ─── export 边界 ───────────────────────────
+
+    #[test]
+    fn export_without_eq_sign() {
+        // export VAR (no =) -> does nothing, just marks as exported
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["export", "RBOX_EMPTY"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn export_no_arg() {
+        // export with no args -> Done (lists all vars, but we just check it doesn't fail)
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["export"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+    }
+
+    // ─── unset 边界 ────────────────────────────
+
+    #[test]
+    fn unset_nonexistent_var() {
+        // unset nonexistent -> no error
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["unset", "RBOX_NOEXIST"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+    }
+
+    // ─── exit with invalid code ────────────────
+
+    #[test]
+    fn exit_with_non_numeric_code() {
+        let mut rc = 5;
+        try_builtin(&make_cmd(&["exit", "abc"]), &mut rc, &[]);
+        // Non-numeric exit code -> keeps last rc
+        assert_eq!(rc, 5);
+    }
 }
