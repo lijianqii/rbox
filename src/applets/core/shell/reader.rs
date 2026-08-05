@@ -137,3 +137,100 @@ pub fn expand_ps1(ps1: &str) -> String {
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ps1_literal() {
+        assert_eq!(expand_ps1("hello"), "hello");
+    }
+
+    #[test]
+    fn ps1_user() {
+        unsafe {
+            std::env::set_var("USER", "testuser");
+        }
+        assert_eq!(expand_ps1(r"\u"), "testuser");
+        unsafe {
+            std::env::remove_var("USER");
+        }
+    }
+
+    #[test]
+    fn ps1_user_default_root() {
+        unsafe {
+            std::env::remove_var("USER");
+        }
+        assert_eq!(expand_ps1(r"\u"), "root");
+    }
+
+    #[test]
+    fn ps1_dollar() {
+        assert_eq!(expand_ps1(r"\$"), "$");
+    }
+
+    #[test]
+    fn ps1_hash() {
+        assert_eq!(expand_ps1(r"\#"), "#");
+    }
+
+    #[test]
+    fn ps1_newline() {
+        assert_eq!(expand_ps1(r"\n"), "\n");
+    }
+
+    #[test]
+    fn ps1_escape() {
+        assert_eq!(expand_ps1(r"\e"), "\u{1b}");
+    }
+
+    #[test]
+    fn ps1_backslash() {
+        assert_eq!(expand_ps1(r"\\"), "\\");
+    }
+
+    #[test]
+    fn ps1_unknown_escape_preserved() {
+        assert_eq!(expand_ps1(r"\x"), "\\x");
+    }
+
+    #[test]
+    fn ps1_trailing_backslash() {
+        // trailing \ with no following char is dropped (consumed by peek but no push)
+        assert_eq!(expand_ps1("abc\\"), "abc");
+    }
+
+    #[test]
+    fn make_prompt_continuation() {
+        assert_eq!(make_prompt("pending text"), "> ");
+    }
+
+    #[test]
+    fn make_prompt_default() {
+        unsafe {
+            std::env::remove_var("PS1");
+        }
+        assert_eq!(make_prompt(""), "rbox# ");
+    }
+
+    #[test]
+    fn make_prompt_ps1() {
+        unsafe {
+            std::env::set_var("PS1", r"\u@\h:\w$ ");
+        }
+        let prompt = make_prompt("");
+        assert!(prompt.contains("@"));
+        assert!(prompt.contains("$"));
+        unsafe {
+            std::env::remove_var("PS1");
+        }
+    }
+
+    #[test]
+    fn display_width_ascii() {
+        assert_eq!(display_width("hello"), 5);
+        assert_eq!(display_width(""), 0);
+    }
+}

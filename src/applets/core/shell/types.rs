@@ -50,7 +50,7 @@ impl SimpleCmd {
 }
 
 /// 管道：一条或多条 SimpleCmd 串联。
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Pipeline {
     pub cmds: Vec<SimpleCmd>,
     pub background: bool,
@@ -80,4 +80,69 @@ pub struct LogicalSegment {
 #[derive(Debug, PartialEq)]
 pub struct CommandList {
     pub segments: Vec<LogicalSegment>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simple_cmd_default() {
+        let cmd = SimpleCmd::default();
+        assert!(cmd.argv.is_empty());
+        assert!(cmd.stdin_file.is_none());
+        assert!(cmd.stdout_file.is_none());
+        assert!(cmd.stderr_file.is_none());
+        assert!(cmd.heredoc.is_none());
+        assert!(!cmd.append);
+        assert!(!cmd.append_err);
+    }
+
+    #[test]
+    fn simple_cmd_is_empty() {
+        let cmd = SimpleCmd::default();
+        assert!(cmd.is_empty());
+    }
+
+    #[test]
+    fn simple_cmd_not_empty_with_argv() {
+        let cmd = SimpleCmd {
+            argv: vec!["echo".into()],
+            ..Default::default()
+        };
+        assert!(!cmd.is_empty());
+    }
+
+    #[test]
+    fn simple_cmd_not_empty_with_redirect_only() {
+        let cmd = SimpleCmd {
+            stdout_file: Some("/tmp/out".into()),
+            ..Default::default()
+        };
+        // has redirect but no argv -> still "empty" (no command to run)
+        assert!(cmd.is_empty());
+    }
+
+    #[test]
+    fn pipeline_default() {
+        let p = Pipeline::default();
+        assert!(p.cmds.is_empty());
+        assert!(!p.background);
+    }
+
+    #[test]
+    fn command_list_default() {
+        let cl = CommandList {
+            segments: Vec::new(),
+        };
+        assert!(cl.segments.is_empty());
+    }
+
+    #[test]
+    fn token_equality() {
+        assert_eq!(Token::Pipe, Token::Pipe);
+        assert_ne!(Token::Pipe, Token::Semicolon);
+        assert_eq!(Token::Word("a".into()), Token::Word("a".into()));
+        assert_ne!(Token::Word("a".into()), Token::Word("b".into()));
+    }
 }

@@ -85,3 +85,105 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         _ => BuiltinResult::NotBuiltin,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cmd(args: &[&str]) -> SimpleCmd {
+        SimpleCmd {
+            argv: args.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exit_returns_exit() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["exit"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Exit));
+    }
+
+    #[test]
+    fn exit_with_code() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["exit", "42"]), &mut rc, &[]);
+        assert_eq!(rc, 42);
+    }
+
+    #[test]
+    fn exit_default_last_rc() {
+        let mut rc = 7;
+        try_builtin(&make_cmd(&["exit"]), &mut rc, &[]);
+        assert_eq!(rc, 7);
+    }
+
+    #[test]
+    fn cd_sets_cwd() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["cd", "/tmp"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+        assert_eq!(std::env::current_dir().unwrap().to_string_lossy(), "/tmp");
+    }
+
+    #[test]
+    fn cd_nonexistent_fails() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["cd", "/nonexistent_xyz"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 1);
+    }
+
+    #[test]
+    fn pwd_prints_cwd() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["pwd"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn export_sets_var() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["export", "RBOX_TEST=123"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(std::env::var("RBOX_TEST").unwrap(), "123");
+        unsafe {
+            std::env::remove_var("RBOX_TEST");
+        }
+    }
+
+    #[test]
+    fn unset_removes_var() {
+        unsafe {
+            std::env::set_var("RBOX_TEST_UNSET", "val");
+        }
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["unset", "RBOX_TEST_UNSET"]), &mut rc, &[]);
+        assert!(std::env::var("RBOX_TEST_UNSET").is_err());
+    }
+
+    #[test]
+    fn history_lists_entries() {
+        let mut rc = 0;
+        let history = vec!["echo a".to_string(), "echo b".to_string()];
+        let result = try_builtin(&make_cmd(&["history"]), &mut rc, &history);
+        assert!(matches!(result, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn unknown_returns_not_builtin() {
+        let mut rc = 0;
+        let result = try_builtin(&make_cmd(&["nonexistent_cmd"]), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::NotBuiltin));
+    }
+
+    #[test]
+    fn empty_argv_returns_done() {
+        let mut rc = 0;
+        let result = try_builtin(&SimpleCmd::default(), &mut rc, &[]);
+        assert!(matches!(result, BuiltinResult::Done));
+    }
+}

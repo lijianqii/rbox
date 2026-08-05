@@ -300,4 +300,78 @@ mod tests {
             ]
         );
     }
+
+    // ─── stderr 重定向 ─────────────────────────
+
+    #[test]
+    fn stderr_redirect() {
+        let tokens = tokenize("echo hi 2> /tmp/err");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hi".into()),
+                Token::RedirErr,
+                Token::Word("/tmp/err".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn stderr_redirect_append() {
+        let tokens = tokenize("echo hi 2>> /tmp/err");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hi".into()),
+                Token::RedirErrAppend,
+                Token::Word("/tmp/err".into()),
+            ]
+        );
+    }
+
+    // ─── here-doc ──────────────────────────────
+
+    #[test]
+    fn heredoc_token() {
+        let tokens = tokenize("cat <<EOF");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("cat".into()),
+                Token::RedirHereDoc,
+                Token::Word("EOF".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn combined_redirects() {
+        let tokens = tokenize("cmd < in > out 2> err");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("cmd".into()),
+                Token::RedirIn,
+                Token::Word("in".into()),
+                Token::RedirOut,
+                Token::Word("out".into()),
+                Token::RedirErr,
+                Token::Word("err".into()),
+            ]
+        );
+    }
+
+    // ─── 数字 2 作为普通参数 ───────────────────
+
+    #[test]
+    fn digit_two_as_word() {
+        // "2" not followed by ">" should be a word
+        let tokens = tokenize("echo 2");
+        assert_eq!(
+            tokens,
+            vec![Token::Word("echo".into()), Token::Word("2".into()),]
+        );
+    }
 }

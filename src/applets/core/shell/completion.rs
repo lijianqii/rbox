@@ -40,9 +40,9 @@ pub fn tab_complete(line: &str) -> (String, bool) {
     };
 
     let matches = if (is_first_word || after_operator) && !is_path {
-        complete_command(prefix)
+        complete_command(inner_prefix)
     } else {
-        complete_file(prefix)
+        complete_file(inner_prefix)
     };
 
     if matches.is_empty() {
@@ -389,5 +389,65 @@ mod tests {
     fn file_complete_no_match() {
         let matches = complete_file("/zzzznonexistent");
         assert!(matches.is_empty());
+    }
+
+    // ─── 引号内补全 ─────────────────────────────
+
+    #[test]
+    fn complete_in_double_quotes() {
+        let _ = std::fs::write("/tmp/rbox_test_unique", "x");
+        let (line, printed) = tab_complete("cat \"/tmp/rbox_test_uniq");
+        assert!(!printed);
+        assert!(line.contains("rbox_test_unique"));
+        let _ = std::fs::remove_file("/tmp/rbox_test_unique");
+    }
+
+    #[test]
+    fn complete_in_single_quotes() {
+        let _ = std::fs::write("/tmp/rbox_test_unique2", "x");
+        let (line, printed) = tab_complete("cat '/tmp/rbox_test_uniq");
+        assert!(!printed);
+        assert!(line.contains("rbox_test_unique2"));
+        let _ = std::fs::remove_file("/tmp/rbox_test_unique2");
+    }
+
+    // ─── find_last_word_start 额外边界 ──────────
+
+    #[test]
+    fn word_start_empty_line() {
+        assert_eq!(find_last_word_start(""), 0);
+    }
+
+    #[test]
+    fn word_start_only_spaces() {
+        assert_eq!(find_last_word_start("   "), 0);
+    }
+
+    #[test]
+    fn word_start_after_background() {
+        assert_eq!(find_last_word_start("sleep 10 & ec"), 11);
+    }
+
+    #[test]
+    fn word_start_multiple_pipes() {
+        assert_eq!(find_last_word_start("a | b | c"), 8);
+    }
+
+    #[test]
+    fn word_start_after_andif() {
+        assert_eq!(find_last_word_start("true && ec"), 8);
+    }
+
+    #[test]
+    fn word_start_after_orif() {
+        // "false || ec" -> bytes: f a l s e ' ' | | ' ' e c
+        //                        0 1 2 3 4  5 6 7  8 9 10
+        // word_start should be 9 (after "|| ")
+        assert_eq!(find_last_word_start("false || ec"), 9);
+    }
+
+    #[test]
+    fn word_start_after_stderr_redirect() {
+        assert_eq!(find_last_word_start("echo 2> f"), 8);
     }
 }

@@ -151,8 +151,7 @@ mod tests {
 
     #[test]
     fn count_basic() {
-        let counts = WcCounts::new(true, true, true);
-        // 2 lines, 4 words, 16 bytes
+        // 2 lines, 4 words, 20 bytes
         let content = "hello world\nfoo bar\n";
         let lines = content.lines().count();
         let words = content.split_whitespace().count();

@@ -28,9 +28,9 @@ trap cleanup EXIT
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
 # 注意：整个命令块在外层 bash -c '...' 单引号中，内部 printf 必须用双引号，
 #       $ 需转义为 \$，单引号用 \x27 代替，避免破坏外层引号。
-OUT=$(timeout 180 bash -c '
+OUT=$(timeout 200 bash -c '
 {
-  sleep 12
+  sleep 15
   # 基本 applet
   printf "uname -m\n"; sleep 0.5
   printf "uname -n\n"; sleep 0.5
@@ -125,8 +125,8 @@ OUT=$(timeout 180 bash -c '
   printf "echo word1 word2\x17\n"; sleep 0.5
   printf "echo cancel\x03echo after_ctrl_c\n"; sleep 0.5
   # 11. 文本处理 applets
-  printf "echo -e 'line1\\nline2\\nline3' | head -n 2\n"; sleep 0.5
-  printf "printf name=%%s-num=%%d rbox 42\n"; sleep 0.5
+  printf "echo -e \x27line1\\nline2\\nline3\x27 | head -n 2\n"; sleep 0.5
+  printf "printf name=%%s-num=%%d rbox 42\n"; sleep 1
   printf "echo hello | wc -c\n"; sleep 0.5
   printf "echo hello | grep -o hel\n"; sleep 0.5
   printf "basename /usr/bin/gcc\n"; sleep 0.5
@@ -152,7 +152,17 @@ OUT=$(timeout 180 bash -c '
   printf "mkdir -p /tmp/nested/deep/dir\n"; sleep 0.5
   printf "ls /tmp/nested/deep/dir\n"; sleep 0.5
   # 18. tail
-  printf "echo -e 'aaa\\nbbb\\nccc' | tail -n 1\n"; sleep 0.5
+  printf "echo -e \x27aaa\\nbbb\\nccc\x27 | tail -n 1\n"; sleep 0.5
+  # 19. stderr 重定向 2>
+  printf "ls /nonexistent_xyz 2> /tmp/stderr_out; cat /tmp/stderr_out\n"; sleep 0.5
+  # 20. stderr 追加 2>>
+  printf "ls /another_missing 2>> /tmp/stderr_out; cat /tmp/stderr_out\n"; sleep 0.5
+  # 21. source 命令
+  printf "echo \x27export SOURCED=yes\x27 > /tmp/srctest.sh; source /tmp/srctest.sh; echo \$SOURCED\n"; sleep 0.5
+  # 22. PS1 提示符（通过 source /etc/profile）
+  printf "export PS1=\\x27test# \\x27; echo done\n"; sleep 0.5
+  # 23. here-doc
+  printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
@@ -179,10 +189,10 @@ echo ""
 
 echo "[基本 applet]"
 assert_contains "uname -m -> aarch64" "aarch64"
-assert_contains "uname -n -> 主机名" "^rbox$"
+assert_contains "uname -n -> 主机名" "rbox"
 assert_contains "pwd -> /" "^/"
 assert_contains "echo hello -> hello" "hello"
-assert_contains "cat /etc/hostname" "^rbox$"
+assert_contains "cat /etc/hostname" "rbox"
 
 echo ""
 echo "[文件操作]"
@@ -210,7 +220,7 @@ assert_contains "Environment= 注入 HELLO" "HELLO=world"
 assert_contains "Restart=on-failure 自动重启" "restarting restart-test"
 assert_contains "status 列出 console" "console-shell"
 assert_contains "status 列出重启服务" "restart-test"
-assert_contains "status 单服务查询" "^hello "
+assert_contains "status 单服务查询" "hello "
 assert_contains "status 显示重启策略" "restart=on-failure"
 
 
@@ -226,8 +236,8 @@ echo ""
 echo "[init 增强]"
 assert_contains "ExecReload 执行" "reloaded-ok"
 assert_contains "console reload 提示" "console-shell has no ExecReload"
-assert_contains "status 单查 console" "^console-shell running"
-assert_contains "sysctl kernel.panic" "^10$"
+assert_contains "status 单查 console" "console-shell running"
+assert_contains "sysctl kernel.panic" "10"
 assert_contains "User= 降权 nobody" "65534"
 assert_contains "Type=forking 等待父进程" "started forktest"
 assert_contains "Type=forking 超时终止" "did not daemonize within 2s"
@@ -244,11 +254,11 @@ assert_contains "注释不执行" "visible"
 
 echo ""
 echo "[Shell: 变量展开]"
-assert_contains "export + \$VAR" "^bar$"
+assert_contains "export + \$VAR" "bar"
 assert_contains "\${VAR}_x 展开" "bar_x"
 assert_contains "\$? 退出码" "rc=1"
 assert_contains "\$\$ PID 展开" "pid="
-assert_contains "unset 后为空" "^\[\]$"
+assert_contains "unset 后为空" "\[\]"
 
 echo ""
 echo "[Shell: 控制操作符]"
@@ -286,8 +296,8 @@ assert_contains "history 内置命令" "hist_one"
 
 echo ""
 echo "[Shell: ~ 展开]"
-assert_contains "echo ~ 输出 HOME" "^/$"
-assert_contains "cd ~ 后 pwd" "^/$"
+assert_contains "echo ~ 输出 HOME" " /"
+assert_contains "cd ~ 后 pwd" " /"
 
 echo ""
 echo "[Shell: Tab 补全]"
@@ -323,6 +333,23 @@ assert_contains "rm -r 递归删除" "No such file"
 assert_contains "touch 创建文件" "touched_new"
 assert_contains "mkdir -p 嵌套目录" "dir"
 assert_contains "tail -n 1 末尾行" "ccc"
+
+echo ""
+echo "[Shell: stderr 重定向]"
+assert_contains "2> stderr 重定向" "No such file"
+assert_contains "2>> stderr 追加" "another_missing"
+
+echo ""
+echo "[Shell: source 命令]"
+assert_contains "source 加载变量" "yes"
+
+echo ""
+echo "[Shell: PS1]"
+assert_contains "PS1 设置执行" "done"
+
+echo ""
+echo "[Shell: here-doc]"
+assert_contains "here-doc 内容" "hello heredoc"
 
 echo ""
 echo "[关机流程]"

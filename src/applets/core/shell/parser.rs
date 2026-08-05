@@ -221,4 +221,79 @@ mod tests {
         assert_eq!(cl.segments[1].connector, Connector::OrIf);
         assert_eq!(cl.segments[2].connector, Connector::AndIf);
     }
+
+    // ─── stderr 重定向解析 ─────────────────────
+
+    #[test]
+    fn parse_stderr_redirect() {
+        let cl = parse("echo hi 2> /tmp/err");
+        assert_eq!(cl.segments.len(), 1);
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stderr_file.as_deref(), Some("/tmp/err"));
+        assert!(!cmd.append_err);
+    }
+
+    #[test]
+    fn parse_stderr_redirect_append() {
+        let cl = parse("echo hi 2>> /tmp/err");
+        assert_eq!(cl.segments.len(), 1);
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stderr_file.as_deref(), Some("/tmp/err"));
+        assert!(cmd.append_err);
+    }
+
+    // ─── here-doc 解析 ────────────────────────
+
+    #[test]
+    fn parse_heredoc() {
+        let cl = parse("cat <<EOF");
+        assert_eq!(cl.segments.len(), 1);
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.heredoc.as_deref(), Some("EOF"));
+    }
+
+    // ─── 混合重定向 ────────────────────────────
+
+    #[test]
+    fn parse_combined_redirects() {
+        let cl = parse("cmd < in > out 2> err");
+        assert_eq!(cl.segments.len(), 1);
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stdin_file.as_deref(), Some("in"));
+        assert_eq!(cmd.stdout_file.as_deref(), Some("out"));
+        assert_eq!(cmd.stderr_file.as_deref(), Some("err"));
+    }
+
+    // ─── 管道中带重定向 ────────────────────────
+
+    #[test]
+    fn parse_pipe_with_redirect() {
+        let cl = parse("echo hi > out | cat");
+        assert_eq!(cl.segments.len(), 1);
+        assert_eq!(cl.segments[0].pipeline.cmds.len(), 2);
+        assert_eq!(
+            cl.segments[0].pipeline.cmds[0].stdout_file,
+            Some("out".into())
+        );
+    }
+
+    // ─── 错误语法 ──────────────────────────────
+
+    #[test]
+    fn syntax_error_double_pipe() {
+        let tokens = vec![Token::Pipe, Token::Word("cat".into())];
+        assert!(build_command_list(&tokens).is_err());
+    }
+
+    #[test]
+    fn syntax_error_missing_stderr_target() {
+        let tokens = vec![Token::Word("echo".into()), Token::RedirErr];
+        assert!(build_command_list(&tokens).is_err());
+    }
+
+    #[test]
+    fn syntax_error_missing_heredoc_delim() {
+        let tokens = vec![Token::Word("cat".into()), Token::RedirHereDoc];
+        assert!(build_command_list(&tokens).is_err());
+    }
 }
