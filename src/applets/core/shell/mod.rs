@@ -27,11 +27,11 @@ mod types;
 
 use crate::applet::Applet;
 use reader::{enable_raw_mode, make_prompt, redraw};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// 处理 here-doc：检测 `<<DELIM`，读取后续行直到 DELIM，写入临时文件。
 /// 返回替换后的命令行（`<<DELIM` -> `<tmpfile`）。
-fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
+fn process_heredoc<R: BufRead>(line: &str, input: &mut R) -> String {
     // 查找 << 在行中的位置
     let idx = match line.find("<<") {
         Some(i) => i,
@@ -45,27 +45,23 @@ fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
         return line.to_string();
     }
 
-    // 读取 here-doc 内容
+    // 读取 here-doc 内容（按行读取，保留 UTF-8）
     let mut content = String::new();
-    let mut buf = String::new();
     loop {
         let _ = write!(io::stdout(), "> ");
         let _ = io::stdout().flush();
-        let mut byte = [0u8; 1];
-        loop {
-            match input.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte[0] == b'\n' || byte[0] == b'\r' {
-                        break;
-                    }
-                    buf.push(byte[0] as char);
-                }
-                Err(_) => break,
+        let mut line_buf = Vec::new();
+        if input.read_until(b'\n', &mut line_buf).unwrap_or(0) == 0 {
+            break; // EOF
+        }
+        // 去掉行尾换行符（\n 或 \r\n）
+        if line_buf.last() == Some(&b'\n') {
+            line_buf.pop();
+            if line_buf.last() == Some(&b'\r') {
+                line_buf.pop();
             }
         }
-        let line_content = buf.trim().to_string();
-        buf.clear();
+        let line_content = String::from_utf8_lossy(&line_buf).trim().to_string();
         if line_content == delim {
             break;
         }
@@ -82,6 +78,22 @@ fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
     // 替换 <<DELIM 为 <tmpfile
     let before = &line[..idx];
     format!("{} < {}", before.trim_end(), tmpfile)
+}
+
+/// 中断当前行输入（Ctrl-C / EINTR）：清空行与续行缓冲，打印 ^C 并重绘提示符。
+fn abort_line(
+    line: &mut String,
+    cursor: &mut usize,
+    pending_line: &mut String,
+    hist_idx: &mut Option<usize>,
+) {
+    let _ = writeln!(io::stdout(), "^C");
+    line.clear();
+    *cursor = 0;
+    pending_line.clear();
+    *hist_idx = None;
+    let _ = write!(io::stdout(), "{}", make_prompt(pending_line));
+    let _ = io::stdout().flush();
 }
 
 /// 历史文件路径。
@@ -199,13 +211,7 @@ impl Shell {
             let n = match input.read(&mut byte) {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
-                    let _ = writeln!(io::stdout(), "^C");
-                    line.clear();
-                    cursor = 0;
-                    pending_line.clear();
-                    hist_idx = None;
-                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
-                    let _ = io::stdout().flush();
+                    abort_line(&mut line, &mut cursor, &mut pending_line, &mut hist_idx);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -311,13 +317,7 @@ impl Shell {
 
                 0x03 => {
                     // Ctrl-C：中断当前行，新起一行
-                    let _ = writeln!(io::stdout(), "^C");
-                    line.clear();
-                    cursor = 0;
-                    pending_line.clear();
-                    hist_idx = None;
-                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
-                    let _ = io::stdout().flush();
+                    abort_line(&mut line, &mut cursor, &mut pending_line, &mut hist_idx);
                 }
 
                 0x0c => {

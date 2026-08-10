@@ -93,15 +93,7 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: failed to load units: {}", e),
                 );
-                let empty: HashMap<String, Unit> = HashMap::new();
-                return reap_with_shutdown(
-                    None,
-                    "console-shell.service",
-                    &None,
-                    &mut Vec::new(),
-                    &empty,
-                    None,
-                );
+                return run_without_units();
             }
         };
 
@@ -116,15 +108,7 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: dependency error: {}", e),
                 );
-                let empty: HashMap<String, Unit> = HashMap::new();
-                return reap_with_shutdown(
-                    None,
-                    "console-shell.service",
-                    &None,
-                    &mut Vec::new(),
-                    &empty,
-                    None,
-                );
+                return run_without_units();
             }
         };
 
@@ -199,6 +183,19 @@ impl Applet for Init {
             status_listener,
         )
     }
+}
+
+/// 单元加载/依赖解析失败时的降级路径：无服务，仅拉起 console shell 并进入主循环。
+fn run_without_units() -> ExitCode {
+    let empty: HashMap<String, Unit> = HashMap::new();
+    reap_with_shutdown(
+        None,
+        "console-shell.service",
+        &None,
+        &mut Vec::new(),
+        &empty,
+        None,
+    )
 }
 
 /// 安装 SIGTERM/SIGINT 信号处理器（sigaction + SA_RESTART）。

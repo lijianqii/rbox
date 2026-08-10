@@ -163,6 +163,22 @@ fn filter_entries(mut entries: Vec<String>, show_all: bool) -> Vec<String> {
     entries
 }
 
+/// 将 mtime 格式化为 `Mon DD HH:MM`（ctime 风格）。
+fn format_time(mtime: i64) -> String {
+    // 简单格式化：使用 ctime 风格的简短形式 "Mon DD HH:MM"
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t = mtime;
+    unsafe { libc::localtime_r(&t as *const i64, &mut tm) };
+    let months = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mon = months.get(tm.tm_mon as usize).copied().unwrap_or("???");
+    format!(
+        "{} {:>2} {:02}:{:02}",
+        mon, tm.tm_mday, tm.tm_hour, tm.tm_min
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,19 +228,4 @@ mod tests {
         let entries: Vec<String> = vec![];
         assert_eq!(filter_entries(entries, false), Vec::<String>::new());
     }
-}
-
-fn format_time(mtime: i64) -> String {
-    // 简单格式化：使用 ctime 风格的简短形式 "Mon DD HH:MM"
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let t = mtime;
-    unsafe { libc::localtime_r(&t as *const i64, &mut tm) };
-    let months = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let mon = months.get(tm.tm_mon as usize).copied().unwrap_or("???");
-    format!(
-        "{} {:>2} {:02}:{:02}",
-        mon, tm.tm_mday, tm.tm_hour, tm.tm_min
-    )
 }
