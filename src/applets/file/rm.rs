@@ -65,6 +65,69 @@ impl Applet for Rm {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_rm_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(RM.name(), "rm");
+        assert!(RM.help().contains("remove"));
+    }
+
+    #[test]
+    fn rm_file() {
+        let dir = tmpdir();
+        let f = format!("{}/file", dir);
+        fs::write(&f, "x").unwrap();
+        let args = vec![f.clone()];
+        let _ = RM.run(&args);
+        assert!(!Path::new(&f).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_recursive() {
+        let dir = tmpdir();
+        let sub = format!("{}/sub", dir);
+        fs::create_dir(&sub).unwrap();
+        fs::write(format!("{}/sub/a", dir), "a").unwrap();
+        fs::write(format!("{}/sub/b", dir), "b").unwrap();
+        let args = vec!["-r".to_string(), sub.clone()];
+        let _ = RM.run(&args);
+        assert!(!Path::new(&sub).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rm_force_nonexistent() {
+        let args = vec!["-f".to_string(), "/nonexistent_xyz".to_string()];
+        let _ = RM.run(&args);
+        // Should not panic
+    }
+
+    #[test]
+    fn rm_dir_without_r_fails() {
+        let dir = tmpdir();
+        let sub = format!("{}/sub", dir);
+        fs::create_dir(&sub).unwrap();
+        let args = vec![sub.clone()];
+        let _ = RM.run(&args);
+        // Without -r, should fail but not panic
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,

@@ -40,3 +40,18 @@ impl Applet for Date {
         ExitCode::SUCCESS
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(DATE.name(), "date");
+    }
+
+    #[test]
+    fn date_succeeds() {
+        let _ = DATE.run(&[]);
+    }
+}

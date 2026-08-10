@@ -25,3 +25,14 @@ impl Applet for Shutdown {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(SHUTDOWN.name(), "shutdown");
+        assert!(SHUTDOWN.help().contains("SIGTERM"));
+    }
+}

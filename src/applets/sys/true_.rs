@@ -16,3 +16,14 @@ impl Applet for True {
         ExitCode::SUCCESS
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(TRUE.name(), "true");
+        assert!(TRUE.help().contains("success"));
+    }
+}

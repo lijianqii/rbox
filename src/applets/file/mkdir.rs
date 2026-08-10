@@ -58,3 +58,67 @@ impl Applet for Mkdir {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_mkdir_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(MKDIR.name(), "mkdir");
+        assert!(MKDIR.help().contains("directories"));
+    }
+
+    #[test]
+    fn mkdir_simple() {
+        let dir = tmpdir();
+        let target = format!("{}/newdir", dir);
+        let args = vec![target.clone()];
+        let _ = MKDIR.run(&args);
+        assert!(Path::new(&target).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mkdir_p_recursive() {
+        let dir = tmpdir();
+        let target = format!("{}/a/b/c", dir);
+        let args = vec!["-p".to_string(), target.clone()];
+        let _ = MKDIR.run(&args);
+        assert!(Path::new(&target).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mkdir_existing_with_p() {
+        let dir = tmpdir();
+        let target = format!("{}/exists", dir);
+        fs::create_dir(&target).unwrap();
+        let args = vec!["-p".to_string(), target.clone()];
+        let _ = MKDIR.run(&args);
+        // Should succeed (not error) with -p
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mkdir_multiple_dirs() {
+        let dir = tmpdir();
+        let t1 = format!("{}/d1", dir);
+        let t2 = format!("{}/d2", dir);
+        let args = vec![t1.clone(), t2.clone()];
+        let _ = MKDIR.run(&args);
+        assert!(Path::new(&t1).exists());
+        assert!(Path::new(&t2).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

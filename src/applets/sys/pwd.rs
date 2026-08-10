@@ -25,3 +25,14 @@ impl Applet for Pwd {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(PWD.name(), "pwd");
+        assert!(PWD.help().contains("working directory"));
+    }
+}

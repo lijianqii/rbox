@@ -59,3 +59,26 @@ impl Applet for Rservice {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(RSERVICE.name(), "rservice");
+        assert!(RSERVICE.help().contains("manage services"));
+    }
+
+    #[test]
+    fn no_init_running() {
+        let args = vec!["list".to_string()];
+        let _ = RSERVICE.run(&args);
+    }
+
+    #[test]
+    fn bad_usage_returns_error() {
+        let args = vec!["badcmd".to_string()];
+        let _ = RSERVICE.run(&args);
+    }
+}

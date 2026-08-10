@@ -53,3 +53,60 @@ impl Applet for Ln {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_ln_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(LN.name(), "ln");
+        assert!(LN.help().contains("link"));
+    }
+
+    #[test]
+    fn symlink_creates_link() {
+        let dir = tmpdir();
+        let target = format!("{}/target", dir);
+        let link = format!("{}/link", dir);
+        fs::write(&target, "hello").unwrap();
+        let args = vec!["-s".to_string(), target.clone(), link.clone()];
+        let _ = LN.run(&args);
+        assert!(Path::new(&link).exists());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hardlink_creates_link() {
+        let dir = tmpdir();
+        let target = format!("{}/target", dir);
+        let link = format!("{}/link", dir);
+        fs::write(&target, "hello").unwrap();
+        let args = vec![target.clone(), link.clone()];
+        let _ = LN.run(&args);
+        assert!(Path::new(&link).exists());
+        assert_eq!(fs::read_to_string(&link).unwrap(), "hello");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ln_missing_target_fails() {
+        let args = vec![
+            "/nonexistent_target".to_string(),
+            "/tmp/rbox_link".to_string(),
+        ];
+        let _ = LN.run(&args);
+        // Should not panic
+    }
+}

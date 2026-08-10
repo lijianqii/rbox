@@ -58,45 +58,32 @@ impl Applet for Wc {
         let mut files: Vec<&String> = Vec::new();
 
         for a in args {
-            match a.as_str() {
-                "-l" => {
-                    count_lines = true;
-                    any_specified = true;
+            if a == "-" {
+                continue;
+            }
+            if a.starts_with('-') && a.len() > 1 {
+                // 逐字符解析选项
+                for c in a[1..].chars() {
+                    match c {
+                        'l' => {
+                            count_lines = true;
+                            any_specified = true;
+                        }
+                        'w' => {
+                            count_words = true;
+                            any_specified = true;
+                        }
+                        'c' => {
+                            count_bytes = true;
+                            any_specified = true;
+                        }
+                        _ => {
+                            eprintln!("wc: unknown option: -{}", c);
+                        }
+                    }
                 }
-                "-w" => {
-                    count_words = true;
-                    any_specified = true;
-                }
-                "-c" => {
-                    count_bytes = true;
-                    any_specified = true;
-                }
-                "-lw" | "-wl" => {
-                    count_lines = true;
-                    count_words = true;
-                    any_specified = true;
-                }
-                "-lc" | "-cl" => {
-                    count_lines = true;
-                    count_bytes = true;
-                    any_specified = true;
-                }
-                "-wc" | "-cw" => {
-                    count_words = true;
-                    count_bytes = true;
-                    any_specified = true;
-                }
-                "-lwc" | "-lcw" | "-wlc" | "-wcl" | "-clw" | "-cwl" => {
-                    count_lines = true;
-                    count_words = true;
-                    count_bytes = true;
-                    any_specified = true;
-                }
-                "-" => {}
-                s if s.starts_with('-') && s.len() > 1 => {
-                    eprintln!("wc: unknown option: {}", s);
-                }
-                _ => files.push(a),
+            } else {
+                files.push(a);
             }
         }
         if !any_specified {

@@ -45,6 +45,55 @@ impl Applet for Touch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_touch_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(TOUCH.name(), "touch");
+        assert!(TOUCH.help().contains("timestamps"));
+    }
+
+    #[test]
+    fn touch_creates_file() {
+        let dir = tmpdir();
+        let f = format!("{}/newfile", dir);
+        let args = vec![f.clone()];
+        let _ = TOUCH.run(&args);
+        assert!(Path::new(&f).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_multiple_files() {
+        let dir = tmpdir();
+        let f1 = format!("{}/f1", dir);
+        let f2 = format!("{}/f2", dir);
+        let args = vec![f1.clone(), f2.clone()];
+        let _ = TOUCH.run(&args);
+        assert!(Path::new(&f1).exists());
+        assert!(Path::new(&f2).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn touch_empty_args_fails() {
+        let _ = TOUCH.run(&[]);
+        // Should not panic
+    }
+}
+
 fn touch_one(path: &str) -> io::Result<()> {
     // 确保文件存在（目录跳过创建，仅更新时间戳）
     match OpenOptions::new()

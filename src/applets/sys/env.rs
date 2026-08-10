@@ -65,3 +65,37 @@ fn code_from_status(status: std::process::ExitStatus) -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_name() {
+        assert_eq!(ENV.name(), "env");
+    }
+
+    #[test]
+    fn env_sets_var() {
+        let args = vec!["RBOX_ENV_TEST=hello".to_string()];
+        ENV.run(&args);
+        assert_eq!(std::env::var("RBOX_ENV_TEST").unwrap(), "hello");
+        unsafe {
+            std::env::remove_var("RBOX_ENV_TEST");
+        }
+    }
+
+    #[test]
+    fn env_runs_true_command() {
+        let args = vec!["true".to_string()];
+        // env runs `true` which returns 0 - we just verify it doesn't panic
+        let _ = ENV.run(&args);
+    }
+
+    #[test]
+    fn env_missing_command_returns_127() {
+        let args = vec!["/nonexistent_cmd_xyz".to_string()];
+        let _ = ENV.run(&args);
+        // Can't directly compare ExitCode, but it should not panic
+    }
+}

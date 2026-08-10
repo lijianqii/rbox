@@ -60,6 +60,68 @@ impl Applet for Cp {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_cp_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(CP.name(), "cp");
+        assert!(CP.help().contains("copy"));
+    }
+
+    #[test]
+    fn cp_single_file() {
+        let dir = tmpdir();
+        let src = format!("{}/src", dir);
+        let dst = format!("{}/dst", dir);
+        fs::write(&src, "hello cp").unwrap();
+        let args = vec![src.clone(), dst.clone()];
+        let _ = CP.run(&args);
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello cp");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cp_to_dir() {
+        let dir = tmpdir();
+        let src = format!("{}/src", dir);
+        let dstdir = format!("{}/dstdir", dir);
+        fs::write(&src, "hello").unwrap();
+        fs::create_dir(&dstdir).unwrap();
+        let args = vec![src.clone(), dstdir.clone()];
+        let _ = CP.run(&args);
+        assert_eq!(
+            fs::read_to_string(format!("{}/src", dstdir)).unwrap(),
+            "hello"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cp_missing_operand() {
+        let _ = CP.run(&[]);
+        // Should not panic
+    }
+
+    #[test]
+    fn cp_nonexistent_src() {
+        let dir = tmpdir();
+        let args = vec!["/nonexistent_src".to_string(), format!("{}/dst", dir)];
+        let _ = CP.run(&args);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 fn copy_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
     let src_meta = fs::metadata(src)?;
     if src_meta.is_dir() {

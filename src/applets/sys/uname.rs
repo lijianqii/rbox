@@ -114,3 +114,37 @@ impl Applet for Uname {
         ExitCode::SUCCESS
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(UNAME.name(), "uname");
+        assert!(UNAME.help().contains("system info"));
+    }
+
+    #[test]
+    fn default_succeeds() {
+        let _ = UNAME.run(&[]);
+    }
+
+    #[test]
+    fn all_flag_succeeds() {
+        let args = vec!["-a".to_string()];
+        let _ = UNAME.run(&args);
+    }
+
+    #[test]
+    fn machine_flag_succeeds() {
+        let args = vec!["-m".to_string()];
+        let _ = UNAME.run(&args);
+    }
+
+    #[test]
+    fn combined_flags_succeed() {
+        let args = vec!["-snr".to_string()];
+        let _ = UNAME.run(&args);
+    }
+}

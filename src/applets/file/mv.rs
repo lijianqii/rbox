@@ -57,6 +57,70 @@ impl Applet for Mv {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn tmpdir() -> String {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = format!("/tmp/rbox_mv_test_{}_{}", std::process::id(), n);
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(MV.name(), "mv");
+        assert!(MV.help().contains("move"));
+    }
+
+    #[test]
+    fn mv_rename_file() {
+        let dir = tmpdir();
+        let src = format!("{}/src", dir);
+        let dst = format!("{}/dst", dir);
+        fs::write(&src, "hello mv").unwrap();
+        let args = vec![src.clone(), dst.clone()];
+        let _ = MV.run(&args);
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello mv");
+        assert!(!Path::new(&src).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mv_to_dir() {
+        let dir = tmpdir();
+        let src = format!("{}/src", dir);
+        let dstdir = format!("{}/dstdir", dir);
+        fs::write(&src, "hello").unwrap();
+        fs::create_dir(&dstdir).unwrap();
+        let args = vec![src.clone(), dstdir.clone()];
+        let _ = MV.run(&args);
+        assert_eq!(
+            fs::read_to_string(format!("{}/src", dstdir)).unwrap(),
+            "hello"
+        );
+        assert!(!Path::new(&src).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mv_missing_operand() {
+        let _ = MV.run(&[]);
+    }
+
+    #[test]
+    fn mv_nonexistent_src() {
+        let dir = tmpdir();
+        let args = vec!["/nonexistent_src".to_string(), format!("{}/dst", dir)];
+        let _ = MV.run(&args);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
 fn move_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
     let dest_path = if dest_is_dir {
         resolve_dest(src, dest)?

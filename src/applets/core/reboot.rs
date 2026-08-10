@@ -26,3 +26,14 @@ impl Applet for Reboot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(REBOOT.name(), "reboot");
+        assert!(REBOOT.help().contains("Reboot"));
+    }
+}

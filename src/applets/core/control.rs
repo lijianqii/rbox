@@ -21,3 +21,16 @@ pub fn send_request(req: &str) -> Result<String, String> {
         .map_err(|e| format!("read error: {}", e))?;
     Ok(resp)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_request_no_socket() {
+        // No init running -> connection should fail
+        let result = send_request("status");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot connect"));
+    }
+}

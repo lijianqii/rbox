@@ -16,3 +16,14 @@ impl Applet for False {
         ExitCode::FAILURE
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(FALSE.name(), "false");
+        assert!(FALSE.help().contains("failure"));
+    }
+}

@@ -38,3 +38,21 @@ impl Applet for Status {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_and_help() {
+        assert_eq!(STATUS.name(), "status");
+        assert!(STATUS.help().contains("service status"));
+    }
+
+    #[test]
+    fn no_init_running() {
+        // No init running -> should fail gracefully
+        let args = vec![];
+        let _ = STATUS.run(&args);
+    }
+}
