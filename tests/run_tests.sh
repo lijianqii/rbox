@@ -163,6 +163,10 @@ OUT=$(timeout 200 bash -c '
   printf "export PS1=\\x27test# \\x27; echo done\n"; sleep 0.5
   # 23. here-doc
   printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\n"; sleep 0.5
+  # 24. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
+  printf "echo before_reboot\n"; sleep 0.5
+  printf "reboot\n"; sleep 30
+  printf "echo after_reboot\n"; sleep 0.5
   # 关机
   printf "shutdown\n"; sleep 10
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
@@ -350,6 +354,11 @@ assert_contains "PS1 设置执行" "done"
 echo ""
 echo "[Shell: here-doc]"
 assert_contains "here-doc 内容" "hello heredoc"
+
+echo ""
+echo "[重启流程]"
+assert_contains "reboot 触发有序关机" "rbox init: rebooting"
+assert_contains "重启后系统恢复" "after_reboot"
 
 echo ""
 echo "[关机流程]"

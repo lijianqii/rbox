@@ -328,23 +328,35 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。Shell 部分覆盖 15 个功能组、99 个断言：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 24 个测试组、101 个断言（涵盖 29 个 applet、Shell 全功能、init 服务管理、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
+| 基本 applet | uname -m、uname -n、pwd、echo、cat | 5 |
+| 文件操作 | 重定向写入、cp、ls | 3 |
+| 管道与重定向 | cat\|cat、追加写入 | 3 |
+| init 启动流程 | PID 1、fstab、挂载、加载单元、reached target | 5 |
+| 服务管理 | Environment、Restart=on-failure、status 查询 | 6 |
+| rservice 管理 | stop、start、restart、list | 4 |
+| init 增强 | ExecReload、sysctl、User= 降权、forking、kmsg | 8 |
 | 引号与转义 | 双引号、单引号、反斜杠、续行、注释 | 5 |
 | 变量展开 | $VAR、${VAR}、$?、$$、unset | 5 |
-| 控制操作符 | ;、&&、||、链式、后台 & | 5 |
-| 重定向 | >、>>、<、2>、2>> | 5 |
-| 管道 | 3级管道、管道+重定向 | 3 |
+| 控制操作符 | ;、&&、\|\|、链式、后台 & | 5 |
+| 重定向 | >、>>、< | 3 |
+| 管道 | 3 级管道、管道+重定向 | 3 |
 | 通配符 | *、?、[] | 4 |
 | 历史扩展 | !!、!n、!$、history | 4 |
 | ~ 展开 | echo ~、cd ~ + pwd | 2 |
 | Tab 补全 | 命令、文件、管道后 | 3 |
 | 行编辑快捷键 | Ctrl-E/U/K/W/C | 5 |
-| PS1 提示符 | \\u \\h \\w \\# | 3 |
-| source 命令 | source /etc/profile | 2 |
+| 文本处理 applets | head、printf、wc、grep、basename、dirname、date、env、ln、echo -n、ls -a/-1、rm -r、touch、mkdir -p、tail | 18 |
+| stderr 重定向 | 2>、2>> | 2 |
+| source 命令 | source 加载变量 | 1 |
+| PS1 提示符 | PS1 设置执行 | 1 |
 | here-doc | <<EOF | 1 |
+| 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
+| 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
+| **合计** | | **101** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -609,24 +621,9 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-| 类别 | 测试项 | 数量 |
-|------|--------|------|
-| 基本 applet | uname -m、uname -n（主机名）、pwd、echo、cat | 5 |
-| 文件操作 | 重定向写入、cp、ls | 3 |
-| 管道与重定向 | 管道 cat\|cat、追加写入 | 3 |
-| init 启动流程 | PID 1 启动、fstab 挂载、加载单元、reached target | 5 |
-| 服务管理 | Environment 注入、Restart 自动重启、status 查询×4 | 6 |
-| rservice 管理 | stop、start、restart、list | 4 |
-| init 增强 | ExecReload、console reload、status 单查 console、sysctl、User= 降权、forking 等待、forking 超时、kmsg 日志 | 8 |
-| Shell 增强 | export + 变量展开、命令分隔 ;、条件执行 &&、条件执行 \|\|、上下键历史、Ctrl-A/E/U/W/L | 6 |
-| Tab 补全 | 命令补全 ec->echo、文件补全 /etc/host->hostname、管道后命令补全 | 3 |
-| 文本处理 applets | head -n、printf %s/%d、wc -c、grep -o、basename、basename 去后缀、dirname、date、env | 9 |
-| 文件 applets | ln -s 创建+读取、echo -n、ls -a、ls -1、rm -r、touch、mkdir -p | 7 |
-| tail | tail -n 1 末尾行 | 1 |
-| 行编辑快捷键 | Ctrl-E、Ctrl-U、Ctrl-K、Ctrl-W、Ctrl-C | 5 |
-| grep 增强 | grep -inv 组合标志、grep -- 结束选项 | 2 |
-| 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **70** |
+集成测试共 24 个测试组、101 个断言，覆盖全部 29 个 applet 及 Shell/init/重启/关机流程，
+完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
+末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
 ### 运行测试
 
@@ -646,46 +643,45 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 13 |
-| shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 13 |
-| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n）、expand_tilde、expand_glob（* ? []） | 21 |
-| shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 20 |
-| init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 24 |
-| text/basename | basename（路径/后缀/根/尾随斜杠） | 7 |
-| text/dirname | dirname（路径/根/无目录/尾随斜杠） | 5 |
-| text/printf | printf_format（%s/%d/%x/%c/%%/转义序列） | 12 |
-| text/echo | echo_format（简单/-n/多参数/空参数/-n仅自身/第二个-n为文本） | 7 |
-| text/grep | grep_search（基本/忽略大小写/反向/行号/文件名前缀）、parse_grep_args（基本/缺模式/组合标志/三标志/--结束选项/未知选项） | 14 |
-| text/head | head_lines（基本/超出范围/零行/空输入/无尾随换行/单行） | 6 |
-| text/tail | tail_lines（基本/超出范围/零行/空输入/单行/精确计数） | 6 |
-| text/wc | WcCounts（行/字/字节计数） | 4 |
-| text/util | parse_n_files（默认值/显式/-nN/多文件） | 4 |
-| file/util | remove_recursive、is_dir、resolve_dest、copy_recursive | 7 |
-| file/ls | mode_string_from_mode（普通/可执行/目录/符号链接/无权限）、filter_entries（隐藏/显示全部/空） | 8 |
-| **合计** | | **173** |
+| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 29 |
+| shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 30 |
+| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n）、expand_tilde、expand_glob（* ? []） | 37 |
+| shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 29 |
+| shell/builtin | cd、exit、export、unset、pwd、history 内置命令 | 17 |
+| shell/reader | make_prompt（PS1 展开）、display_width | 14 |
+| shell/executor | 重定向打开、命令解析回退 | 5 |
+| shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 7 |
+| init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 10 |
+| init/server | 控制协议处理 | 8 |
+| init/services | 服务生命周期 | 5 |
+| init/mount | fstab 挂载 | 5 |
+| text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 3、util 4 | 64 |
+| file/* | ls 8、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 47 |
+| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1 | 10 |
+| **合计** | | **337** |
 
 测试结果示例：
 
 ```
 ========================================
+rbox 集成测试
+========================================
 
-[基本 applet]          5/5 PASS
-[文件操作]             3/3 PASS
-[管道与重定向]          3/3 PASS
-[init 启动流程]        5/5 PASS
-[服务管理]             6/6 PASS
-[rservice 管理]        4/4 PASS
-[init 增强]            8/8 PASS
-[Shell 增强]           6/6 PASS
-[Tab 补全]             3/3 PASS
-[文本处理 applets]     9/9 PASS
-[文件 applets]         7/7 PASS
-[tail]                 1/1 PASS
-[行编辑快捷键]          5/5 PASS
-[关机流程]             3/3 PASS
+[基本 applet]
+  PASS  uname -m -> aarch64
+  PASS  uname -n -> 主机名
+  ...
+[重启流程]
+  PASS  reboot 触发有序关机
+  PASS  重启后系统恢复
+[关机流程]
+  PASS  shutdown 触发关机
+  PASS  ExecStop 逆序执行
+  PASS  power off
 
 ========================================
-结果: 70 通过, 0 失败
+结果: 101 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
