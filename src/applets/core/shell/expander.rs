@@ -422,27 +422,23 @@ mod tests {
         );
     }
 
-    // ─── Tilde 展开 ─────────────────────────────
+    // ─── Tilde 展开（合并为单测试：多个测试并行 set/remove 共享的 HOME 会互相干扰）───
 
     #[test]
-    fn tilde_only() {
-        unsafe {
-            std::env::set_var("HOME", "/root");
-        }
+    fn tilde_expansion() {
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/root") };
         assert_eq!(expand_tilde("~"), "/root");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-    }
-
-    #[test]
-    fn tilde_with_path() {
-        unsafe {
-            std::env::set_var("HOME", "/root");
-        }
         assert_eq!(expand_tilde("~/dir/file"), "/root/dir/file");
-        unsafe {
-            std::env::remove_var("HOME");
+        assert_eq!(expand_tilde("~/foo"), "/root/foo");
+
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(expand_tilde("~"), "/");
+
+        // 恢复 HOME，避免影响同进程其他测试
+        match orig {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
         }
     }
 
@@ -667,24 +663,5 @@ mod tests {
     }
 
     // ─── expand_tilde 边界 ────────────────────
-
-    #[test]
-    fn tilde_no_home_var() {
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-        assert_eq!(expand_tilde("~"), "/");
-    }
-
-    #[test]
-    fn tilde_with_home_set() {
-        unsafe {
-            std::env::set_var("HOME", "/root");
-        }
-        assert_eq!(expand_tilde("~"), "/root");
-        assert_eq!(expand_tilde("~/foo"), "/root/foo");
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-    }
+    //（tilde_no_home_var / tilde_with_home_set 已并入 tilde_expansion，避免共享 HOME 竞争）
 }

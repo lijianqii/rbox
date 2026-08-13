@@ -40,25 +40,6 @@ pub fn enable_raw_mode() -> Option<RawGuard> {
     Some(RawGuard { fd, original })
 }
 
-/// 临时开启/关闭 ISIG（前台命令运行期间开启，使 Ctrl-C 产生 SIGINT 信号，
-/// 由 SIGINT 处理器转发给前台进程组；结束后关闭恢复 raw 模式）。
-/// 非 tty（管道模式）时 tcgetattr 失败，静默跳过。
-pub fn set_isig(enabled: bool) {
-    let fd = io::stdin().as_raw_fd();
-    let mut t: termios = unsafe { std::mem::zeroed() };
-    if unsafe { tcgetattr(fd, &mut t) } != 0 {
-        return;
-    }
-    if enabled {
-        t.c_lflag |= libc::ISIG;
-    } else {
-        t.c_lflag &= !libc::ISIG;
-    }
-    unsafe {
-        tcsetattr(fd, TCSANOW, &t);
-    }
-}
-
 /// 计算字符串在终端中的显示宽度（控制字符 0，CJK/全角 2，其余 1）。
 pub fn display_width(s: &str) -> usize {
     s.chars().map(char_display_width).sum()

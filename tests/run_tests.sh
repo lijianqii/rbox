@@ -124,6 +124,12 @@ OUT=$(timeout 200 bash -c '
   printf "echo keep\x0b\n"; sleep 0.5
   printf "echo word1 word2\x17\n"; sleep 0.5
   printf "echo cancel\x03echo after_ctrl_c\n"; sleep 0.5
+  # 10.5 UTF-8 中文输入（多字节字符端到端）
+  printf "echo 你好世界\n"; sleep 0.5
+  # 10.6 后台命令与前台命令并发时的退出码（SIGCHLD 屏蔽验证）
+  printf "sleep 3 &\n"; sleep 0.5
+  printf "true\n"; sleep 0.5
+  printf "echo bg_true_rc=\$?\n"; sleep 0.5
   # 11. 文本处理 applets
   printf "echo -e \x27line1\\nline2\\nline3\x27 | head -n 2\n"; sleep 0.5
   printf "printf name=%%s-num=%%d rbox 42\n"; sleep 1
@@ -167,6 +173,10 @@ OUT=$(timeout 200 bash -c '
   printf "echo console_init=\$RBOX_CONSOLE\n"; sleep 0.5
   printf "exit\n"; sleep 3
   printf "echo console_respawn=\$RBOX_CONSOLE\n"; sleep 0.5
+  # 24.5 前台命令 Ctrl-C 中断（临时 ISIG + SIGINT 转发到前台进程组）
+  printf "sleep 60\n"; sleep 1
+  printf "\x03"; sleep 2
+  printf "echo intr_rc=\$?\n"; sleep 0.5
   # 25. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
   printf "echo before_reboot\n"; sleep 0.5
   printf "reboot\n"; sleep 30
@@ -322,6 +332,14 @@ assert_contains "Ctrl-W 删除单词" "echo word1"
 assert_contains "Ctrl-C 中断当前行" "after_ctrl_c"
 
 echo ""
+echo "[Shell: UTF-8 输入]"
+assert_contains "UTF-8 中文输入" "你好世界"
+
+echo ""
+echo "[Shell: 后台/前台退出码]"
+assert_contains "后台+前台并发退出码" "bg_true_rc=0"
+
+echo ""
 echo "[文本处理 applets]"
 assert_contains "head -n 2 截取两行" "line1"
 assert_contains "printf 格式化输出" "name=rbox-num=42"
@@ -363,6 +381,10 @@ echo ""
 echo "[console respawn]"
 assert_contains "console 初始环境变量" "console_init=1"
 assert_contains "respawn 后环境变量保留" "console_respawn=1"
+
+echo ""
+echo "[前台 Ctrl-C 中断]"
+assert_contains "前台命令 Ctrl-C 中断" "intr_rc=130"
 
 echo ""
 echo "[重启流程]"

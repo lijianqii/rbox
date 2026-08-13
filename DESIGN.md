@@ -328,7 +328,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 25 个测试组、103 个断言（涵盖 29 个 applet、Shell 全功能、init 服务管理、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 28 个测试组、106 个断言（涵盖 29 个 applet、Shell 全功能、init 服务管理、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -349,15 +349,18 @@ enum Token {
 | ~ 展开 | echo ~、cd ~ + pwd | 2 |
 | Tab 补全 | 命令、文件、管道后 | 3 |
 | 行编辑快捷键 | Ctrl-E/U/K/W/C | 5 |
+| UTF-8 输入 | 中文等多字节字符端到端 | 1 |
+| 后台/前台退出码 | 后台命令与前台命令并发时退出码正确 | 1 |
 | 文本处理 applets | head、printf、wc、grep、basename、dirname、date、env、ln、echo -n、ls -a/-1、rm -r、touch、mkdir -p、tail | 18 |
 | stderr 重定向 | 2>、2>> | 2 |
 | source 命令 | source 加载变量 | 1 |
 | PS1 提示符 | PS1 设置执行 | 1 |
 | here-doc | <<EOF | 1 |
 | console respawn | 初始环境变量、exit 后 respawn 保留配置 | 2 |
+| 前台 Ctrl-C 中断 | sleep 被 SIGINT 中断，$?=130 | 1 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **103** |
+| **合计** | | **106** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -386,19 +389,21 @@ impl Drop for RawGuard {
 
 ### Ctrl-C 前台进程中断
 
-shell 在 `execute_pipeline()` 中设置 `FOREGROUND_PGID`（第一个子进程的 pid）后，前台等待期间**临时开启 ISIG**（`set_isig(true)`），使 Ctrl-C 产生 SIGINT 信号；SIGINT 处理器读取 `FOREGROUND_PGID` 并 `kill(-pgid, SIGINT)` 转发给子进程组，等待结束后关闭 ISIG 恢复 raw 模式：
+raw 模式下 **ISIG 已关闭**，Ctrl-C 不产生 SIGINT 信号，而是作为 `0x03` 字节到达 stdin。shell 主线程在 `wait()` 中阻塞等待子进程，无法读 stdin，因此使用一个**后台监控线程**轮询 stdin 的 `0x03` 字节：
 
 1. `execute_pipeline()` 设置 `FOREGROUND_PGID`（第一个子进程的 pid）
-2. 屏蔽 SIGCHLD（见下文）+ `set_isig(true)` 开启 ISIG
-3. shell 主线程 `wait()` 子进程退出；期间 Ctrl-C -> SIGINT -> 处理器转发给前台进程组
-4. `set_isig(false)` 关闭 ISIG，收割后台僵尸，解除 SIGCHLD 屏蔽
+2. 启动 stdin 监控线程，非阻塞 read stdin：
+   - 收到 `0x03` -> `kill(-pgid, SIGINT)` 转发给子进程组，线程退出
+   - 收到其他字节 -> `ioctl(TIOCSTI)` 推回 stdin（root 下可用），供 shell 后续读取
+3. shell 主线程 `wait()` 子进程退出（信号终止的退出码取 `128 + signal`，如 SIGINT -> 130）
+4. 设置 stop_flag 停止监控线程，`join()` 等待退出
 5. 清除 `FOREGROUND_PGID`，如果退出码为 130 则打印换行
 
 子进程在 `pre_exec` 中通过 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（不继承 shell handler）。
 
 如果 shell 在编辑行时（无前台子进程），REPL 的 `0x03` 分支直接清除当前行并显示新提示符。
 
-SIGINT handler 同时作为管道模式后备（管道模式下 ISIG 本来就开启）。
+SIGINT handler 仍注册为后备（管道模式下 ISIG 仍然开启时生效）。
 
 ### SIGCHLD 后台进程回收
 
@@ -620,7 +625,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 25 个测试组、103 个断言，覆盖全部 29 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 28 个测试组、106 个断言，覆盖全部 29 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -644,7 +649,7 @@ make unittest
 |------|------|------|
 | shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 29 |
 | shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 30 |
-| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知）、expand_tilde、expand_glob（* ? []） | 39 |
+| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知）、expand_tilde、expand_glob（* ? []） | 36 |
 | shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 29 |
 | shell/builtin | cd、exit（8 位截断）、export、unset、pwd、history 内置命令 | 18 |
 | shell/reader | make_prompt（PS1 展开）、display_width（CJK/全角宽度）、set_isig | 16 |
@@ -660,7 +665,7 @@ make unittest
 | file/* | ls 12、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 51 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1 | 10 |
-| **合计** | | **373** |
+| **合计** | | **370** |
 
 测试结果示例：
 
@@ -682,7 +687,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 103 通过, 0 失败
+结果: 106 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -833,7 +838,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（373 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（370 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
