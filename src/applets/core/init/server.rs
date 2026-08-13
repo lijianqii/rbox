@@ -2,8 +2,8 @@
 
 use crate::applets::core::control::STATUS_SOCKET;
 use crate::applets::core::init::services::{
-    ServiceInstance, parse_environment, respawn_service, start_forking_service, start_service,
-    stop_service_instance,
+    ServiceInstance, EXEC_COMMAND_TIMEOUT, parse_environment, respawn_service, run_command_with_timeout,
+    start_forking_service, start_service, stop_service_instance,
 };
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;
@@ -38,6 +38,8 @@ pub(crate) fn handle_control_connection(
 ) {
     let mut req = String::new();
     if let Ok(peer) = stream.try_clone() {
+        // 读请求带 100ms 超时，避免异常客户端（连接后不发数据）挂住主循环
+        let _ = peer.set_read_timeout(Some(std::time::Duration::from_millis(100)));
         let mut reader = std::io::BufReader::new(peer);
         let _ = reader.read_line(&mut req);
     }
@@ -139,9 +141,9 @@ fn run_reload_cmd(name: &str, cmd: &str) -> String {
     if argv.is_empty() {
         return format!("{} has empty ExecReload\n", name);
     }
-    let _ = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status();
+    if !run_command_with_timeout(&argv, EXEC_COMMAND_TIMEOUT) {
+        return format!("{} reload command timed out\n", name);
+    }
     format!("{} reloaded\n", name)
 }
 
@@ -157,6 +159,7 @@ fn do_start(
         }
         svc.stopped = false;
         svc.fail_count = 0;
+        svc.first_failure_at = None;
         svc.next_restart_at = None;
         respawn_service(svc);
         return if svc.child.is_some() || svc.tracked_pid.is_some() {

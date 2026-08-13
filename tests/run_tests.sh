@@ -163,7 +163,11 @@ OUT=$(timeout 200 bash -c '
   printf "export PS1=\\x27test# \\x27; echo done\n"; sleep 0.5
   # 23. here-doc
   printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\n"; sleep 0.5
-  # 24. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
+  # 24. console shell respawn 保留配置（Environment 注入后 shell 退出重启仍保留）
+  printf "echo console_init=\$RBOX_CONSOLE\n"; sleep 0.5
+  printf "exit\n"; sleep 3
+  printf "echo console_respawn=\$RBOX_CONSOLE\n"; sleep 0.5
+  # 25. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
   printf "echo before_reboot\n"; sleep 0.5
   printf "reboot\n"; sleep 30
   printf "echo after_reboot\n"; sleep 0.5
@@ -354,6 +358,11 @@ assert_contains "PS1 设置执行" "done"
 echo ""
 echo "[Shell: here-doc]"
 assert_contains "here-doc 内容" "hello heredoc"
+
+echo ""
+echo "[console respawn]"
+assert_contains "console 初始环境变量" "console_init=1"
+assert_contains "respawn 后环境变量保留" "console_respawn=1"
 
 echo ""
 echo "[重启流程]"

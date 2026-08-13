@@ -1,5 +1,6 @@
 //! 单元配置：TOML 解析、单元名解析、依赖拓扑排序。
 
+use crate::applets::core::{LogLevel, log_at};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -65,10 +66,15 @@ pub(crate) struct ServiceSection {
     #[serde(default = "default_restart_sec")]
     #[serde(rename = "RestartSec")]
     pub(crate) restart_sec: u64,
-    /// 连续失败重启上限（默认 5，达到后停止重启）
+    /// 连续失败重启上限（默认 5，窗口内达到后停止重启）
     #[serde(default = "default_start_limit_burst")]
     #[serde(rename = "StartLimitBurst")]
     pub(crate) start_limit_burst: u32,
+    /// 失败计数时间窗（秒，默认 10）：窗口内连续失败达 StartLimitBurst 后放弃，
+    /// 距首次失败超过该时长则计数重置
+    #[serde(default = "default_start_limit_interval")]
+    #[serde(rename = "StartLimitIntervalSec")]
+    pub(crate) start_limit_interval_sec: u64,
     /// Type=forking 时等待父进程退出的超时（秒，默认 10）
     #[serde(default = "default_timeout_start")]
     #[serde(rename = "TimeoutStartSec")]
@@ -103,6 +109,9 @@ fn default_restart_sec() -> u64 {
 }
 fn default_start_limit_burst() -> u32 {
     5
+}
+fn default_start_limit_interval() -> u64 {
+    10
 }
 fn default_timeout_start() -> u64 {
     10
@@ -139,9 +148,17 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml")
-            && let Ok(content) = fs::read_to_string(&path)
-        {
+        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    log_at(
+                        LogLevel::Warn,
+                        &format!("rbox init: cannot read {}: {}", path.display(), e),
+                    );
+                    continue;
+                }
+            };
             match toml::from_str::<Unit>(&content) {
                 Ok(mut unit) => {
                     // 文件名去掉 .toml；单元名优先用 [Unit] Name，缺省回退文件名
@@ -151,14 +168,23 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
                         .unwrap_or_default();
                     unit.is_target = is_target_file(&file_stem);
                     unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
+                    if units.contains_key(&unit.name) {
+                        log_at(
+                            LogLevel::Warn,
+                            &format!(
+                                "rbox init: duplicate unit name '{}' in {}, overriding earlier",
+                                unit.name,
+                                path.display()
+                            ),
+                        );
+                    }
                     units.insert(unit.name.clone(), unit);
                 }
                 Err(e) => {
-                    crate::applets::core::log(&format!(
-                        "rbox init: parse error in {}: {}",
-                        path.display(),
-                        e
-                    ));
+                    log_at(
+                        LogLevel::Warn,
+                        &format!("rbox init: parse error in {}: {}", path.display(), e),
+                    );
                 }
             }
         }
@@ -192,6 +218,11 @@ pub(crate) fn compute_start_order(
         let unit = match units.get(name) {
             Some(u) => u,
             None => {
+                // 缺失依赖：告警但不中断（与 systemd 的宽松行为一致）
+                log_at(
+                    LogLevel::Warn,
+                    &format!("rbox init: dependency '{}' not found", name),
+                );
                 visited.insert(name.to_string(), 2);
                 return Ok(());
             }
@@ -220,15 +251,34 @@ pub(crate) fn compute_start_order(
     Ok(order)
 }
 
-/// 将命令字符串切分为 argv（简单空格切分，支持双引号）。
+/// 将命令字符串切分为 argv。
+/// 支持双引号、单引号、反斜杠转义；空格/制表符分隔（引号内保留）。
+/// 单引号内所有字符字面（反斜杠不转义）；双引号内与引号外反斜杠转义下一字符。
 pub(crate) fn parse_cmdline(s: &str) -> Vec<String> {
     let mut argv = Vec::new();
     let mut cur = String::new();
-    let mut in_quote = false;
+    let mut quote: Option<char> = None; // 当前引号：'"' 或 '\''
+    let mut escaped = false;
     for c in s.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
         match c {
-            '"' => in_quote = !in_quote,
-            ' ' if !in_quote => {
+            // 反斜杠转义下一字符（单引号内除外，遵循 shell 语义）
+            '\\' if quote != Some('\'') => escaped = true,
+            '\'' => match quote {
+                Some('\'') => quote = None,
+                None => quote = Some('\''),
+                Some(_) => cur.push(c),
+            },
+            '"' => match quote {
+                Some('"') => quote = None,
+                None => quote = Some('"'),
+                Some(_) => cur.push(c),
+            },
+            ' ' | '\t' if quote.is_none() => {
                 if !cur.is_empty() {
                     argv.push(std::mem::take(&mut cur));
                 }
@@ -271,6 +321,7 @@ mod tests {
                 restart: String::new(),
                 restart_sec: 1,
                 start_limit_burst: 5,
+                start_limit_interval_sec: 10,
                 timeout_start_sec: 10,
                 pidfile: None,
                 environment: Vec::new(),
@@ -304,6 +355,44 @@ mod tests {
     #[test]
     fn parse_cmdline_ignores_extra_spaces() {
         assert_eq!(parse_cmdline("  a   b  "), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_cmdline_single_quotes() {
+        assert_eq!(
+            parse_cmdline("/bin/rbox echo 'hello world'"),
+            vec!["/bin/rbox", "echo", "hello world"]
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_backslash_escape() {
+        assert_eq!(
+            parse_cmdline("/bin/rbox echo hello\\ world"),
+            vec!["/bin/rbox", "echo", "hello world"]
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_backslash_in_single_quotes_is_literal() {
+        // 单引号内反斜杠不转义，按 shell 语义原样保留
+        assert_eq!(
+            parse_cmdline("/bin/rbox echo 'a\\b'"),
+            vec!["/bin/rbox", "echo", "a\\b"]
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_mixed_quotes() {
+        assert_eq!(
+            parse_cmdline("/bin/rbox echo \"a'b\" 'c\"d'"),
+            vec!["/bin/rbox", "echo", "a'b", "c\"d"]
+        );
+    }
+
+    #[test]
+    fn parse_cmdline_tab_separator() {
+        assert_eq!(parse_cmdline("a\tb"), vec!["a", "b"]);
     }
 
     #[test]

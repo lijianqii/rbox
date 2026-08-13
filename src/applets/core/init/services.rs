@@ -28,10 +28,20 @@ pub(crate) struct ServiceInstance {
     pub(crate) is_forking: bool,
     pub(crate) pidfile: Option<String>,
     pub(crate) timeout_start_sec: u64,
+    /// 进程组 id（spawn 父进程时的 pid）；forking 服务用于进程组清理
+    pub(crate) pgid: Option<u32>,
+    /// forking 服务：已 spawn 父进程、等待其 daemon 化（异步状态机）
+    pub(crate) waiting_daemonize: bool,
+    /// forking 服务 daemon 化超时时间点
+    pub(crate) daemonize_deadline: Option<std::time::Instant>,
     pub(crate) restart_on_failure: bool,
     /// 自动重启间隔与连续失败上限
     pub(crate) restart_sec: u64,
     pub(crate) start_limit_burst: u32,
+    /// 失败计数时间窗（秒）：距首次失败超过该时长则计数重置
+    pub(crate) start_limit_interval_sec: u64,
+    /// 窗口内首次失败时间点（用于时间窗重置）
+    pub(crate) first_failure_at: Option<std::time::Instant>,
     /// 连续失败次数（成功退出或手动 start 时清零）
     pub(crate) fail_count: u32,
     /// 待重启时间点（RestartSec 退避调度）
@@ -220,50 +230,50 @@ pub(crate) fn start_service(
     Some(new_service_instance(unit, cmd, env, Some(child), None))
 }
 
-/// 启动一个 forking 类型服务：等父进程退出完成 daemon 化，
-/// 有 PIDFile 时跟踪 daemon pid（被 init 收养，退出由孤儿收割匹配）。
+/// 启动一个 forking 类型服务：spawn 父进程后立即返回（异步 daemon 化）。
+/// 父进程退出（daemon 化完成）由主循环检测，届时读 PIDFile 跟踪 daemon pid
+/// （被 init 收养，退出由孤儿收割匹配）。超时由主循环按 TimeoutStartSec 处理。
 pub(crate) fn start_forking_service(
     unit: &Unit,
     cmd: &str,
     env: &[(String, String)],
 ) -> Option<ServiceInstance> {
     let cfg = SpawnConfig::from_unit(unit);
-    let mut child = spawn_unit_command(&unit.name, cmd, env, &cfg)?;
-    // 等待父进程退出（daemon 化完成），超时 TimeoutStartSec
-    let timeout = unit.service.timeout_start_sec;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
-    loop {
-        if shutdown_requested() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    log(&format!(
-                        "rbox init: {} did not daemonize within {}s, killing",
-                        unit.name, timeout
-                    ));
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(_) => break,
-        }
+    let child = spawn_unit_command(&unit.name, cmd, env, &cfg)?;
+    let mut inst = new_service_instance(unit, cmd, env, Some(child), None);
+    inst.pgid = inst.child.as_ref().map(|c| c.id());
+    inst.waiting_daemonize = true;
+    inst.daemonize_deadline = Some(
+        std::time::Instant::now() + std::time::Duration::from_secs(unit.service.timeout_start_sec),
+    );
+    Some(inst)
+}
+
+/// forking 服务父进程退出：完成 daemon 化，读 PIDFile 设置 tracked_pid。
+/// 无 PIDFile 时无法跟踪 daemon，告警说明 Restart=on-failure 在 daemon
+/// 崩溃时不会触发（需要 cgroup 才能可靠跟踪，当前未实现）。
+pub(crate) fn finish_daemonize(svc: &mut ServiceInstance) {
+    svc.child = None;
+    svc.waiting_daemonize = false;
+    svc.daemonize_deadline = None;
+    svc.tracked_pid = svc.pidfile.as_deref().and_then(read_pid_file);
+    if svc.pidfile.is_some() && svc.tracked_pid.is_none() {
+        log_at(
+            LogLevel::Warn,
+            &format!(
+                "rbox init: {} daemonized but PIDFile unreadable, not tracking",
+                svc.name
+            ),
+        );
+    } else if svc.pidfile.is_none() {
+        log_at(
+            LogLevel::Warn,
+            &format!(
+                "rbox init: {} daemonized without PIDFile; daemon crash will not trigger Restart=on-failure",
+                svc.name
+            ),
+        );
     }
-    // 读 PID 文件获取 daemon pid（可选）
-    let tracked_pid = unit.service.pidfile.as_deref().and_then(read_pid_file);
-    if unit.service.pidfile.is_some() && tracked_pid.is_none() {
-        log(&format!(
-            "rbox init: {} daemonized but PIDFile unreadable, not tracking",
-            unit.name
-        ));
-    }
-    Some(new_service_instance(unit, cmd, env, None, tracked_pid))
 }
 
 /// 读取 PID 文件并解析 pid。
@@ -294,6 +304,8 @@ fn new_service_instance(
         restart_on_failure: unit.service.restart == "on-failure",
         restart_sec: unit.service.restart_sec,
         start_limit_burst: unit.service.start_limit_burst,
+        start_limit_interval_sec: unit.service.start_limit_interval_sec,
+        first_failure_at: None,
         fail_count: 0,
         next_restart_at: None,
         logfile: unit.service.logfile.clone(),
@@ -302,22 +314,38 @@ fn new_service_instance(
         is_forking: unit.service.typ == "forking",
         pidfile: unit.service.pidfile.clone(),
         timeout_start_sec: unit.service.timeout_start_sec,
+        pgid: None,
+        waiting_daemonize: false,
+        daemonize_deadline: None,
         stopped: false,
     }
 }
 
 /// 服务退出后调度重启：失败计数 +1（成功退出清零），
-/// 达到 StartLimitBurst 上限后放弃；否则按 RestartSec 退避。
+/// 窗口内失败次数超过 StartLimitBurst 后放弃；距首次失败超过
+/// StartLimitIntervalSec 则计数重置（时间窗）。失败时按 RestartSec 退避。
 pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
+    let now = std::time::Instant::now();
+    // 时间窗重置：距首次失败超过 interval 则清零计数
+    if let Some(first) = svc.first_failure_at
+        && now.duration_since(first) > std::time::Duration::from_secs(svc.start_limit_interval_sec)
+    {
+        svc.fail_count = 0;
+        svc.first_failure_at = None;
+    }
     if failed {
+        if svc.fail_count == 0 {
+            svc.first_failure_at = Some(now);
+        }
         svc.fail_count += 1;
     } else {
         svc.fail_count = 0;
+        svc.first_failure_at = None;
     }
     if !svc.restart_on_failure || !failed || svc.stopped || shutdown_requested() {
         return;
     }
-    if svc.fail_count >= svc.start_limit_burst {
+    if svc.fail_count > svc.start_limit_burst {
         log(&format!(
             "rbox init: {} failed {} times, giving up (StartLimitBurst={})",
             svc.name, svc.fail_count, svc.start_limit_burst
@@ -325,43 +353,67 @@ pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
         return;
     }
     svc.next_restart_at =
-        Some(std::time::Instant::now() + std::time::Duration::from_secs(svc.restart_sec));
+        Some(now + std::time::Duration::from_secs(svc.restart_sec));
 }
 
 /// 重新拉起服务（自动重启与手动 start 共用）。
-/// simple：直接 spawn；forking：重新走 daemon 化流程并重读 PIDFile。
+/// simple：直接 spawn；forking：spawn 父进程后异步等待 daemon 化（主循环处理）。
 pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
     let cfg = SpawnConfig {
         logfile: svc.logfile.as_deref(),
         user: svc.user.as_deref(),
         group: svc.group.as_deref(),
     };
+    svc.tracked_pid = None;
+    svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg);
     if !svc.is_forking {
-        svc.tracked_pid = None;
-        svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg);
         return;
     }
-    let mut child = match spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg) {
-        Some(c) => c,
-        None => return,
+    // forking：spawn 父进程后异步等待 daemon 化（主循环按 TimeoutStartSec 处理超时）
+    svc.pgid = svc.child.as_ref().map(|c| c.id());
+    svc.waiting_daemonize = svc.child.is_some();
+    svc.daemonize_deadline = if svc.waiting_daemonize {
+        Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(svc.timeout_start_sec),
+        )
+    } else {
+        None
+    };
+}
+
+/// ExecStop/ExecReload 命令超时（秒）。超时后 SIGKILL 该命令。
+pub(crate) const EXEC_COMMAND_TIMEOUT: u64 = 5;
+
+/// 运行一个命令并等待其退出，带超时（默认超时后 SIGKILL）。
+/// 返回是否在超时内正常退出；argv 为空或 spawn 失败返回 false。
+pub(crate) fn run_command_with_timeout(argv: &[String], timeout_secs: u64) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    let mut child = match std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
     };
     let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_start_sec);
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(_)) => return true,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
-                    return;
+                    let _ = child.wait();
+                    return false;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
-    svc.child = None;
-    svc.tracked_pid = svc.pidfile.as_deref().and_then(read_pid_file);
 }
 
 /// 执行 ExecStop 并终止服务进程组：SIGTERM 等 1 秒，超时 SIGKILL。
@@ -370,10 +422,11 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
     if let Some(stop_cmd) = &svc.exec_stop {
         log(&format!("rbox init: stopping {}: {}", svc.name, stop_cmd));
         let argv = parse_cmdline(stop_cmd);
-        if !argv.is_empty() {
-            let _ = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .status();
+        if !argv.is_empty() && !run_command_with_timeout(&argv, EXEC_COMMAND_TIMEOUT) {
+            log_at(
+                LogLevel::Warn,
+                &format!("rbox init: ExecStop for {} timed out", svc.name),
+            );
         }
     }
     if let Some(mut child) = svc.child.take() {
@@ -474,9 +527,14 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         is_forking: false,
         pidfile: None,
         timeout_start_sec: 10,
+        pgid: None,
+        waiting_daemonize: false,
+        daemonize_deadline: None,
         restart_on_failure,
         restart_sec: 1,
         start_limit_burst: 5,
+        start_limit_interval_sec: 10,
+        first_failure_at: None,
         fail_count: 0,
         next_restart_at: None,
         stopped: false,
@@ -531,5 +589,74 @@ mod tests {
     #[test]
     fn rotate_skips_nonexistent() {
         rotate_log_if_needed("/tmp/rbox_nonexistent_log_file_xyz");
+    }
+
+    #[test]
+    fn restart_burst_allows_exact_burst_then_gives_up() {
+        let mut svc = test_svc("t.service", true);
+        for attempt in 1..=6 {
+            svc.next_restart_at = None;
+            schedule_restart(&mut svc, true);
+            if attempt <= 5 {
+                assert!(svc.next_restart_at.is_some(), "attempt {attempt} should restart");
+            } else {
+                assert!(svc.next_restart_at.is_none(), "attempt {attempt} should give up");
+            }
+        }
+        assert_eq!(svc.fail_count, 6);
+    }
+
+    #[test]
+    fn restart_window_resets_after_interval() {
+        let mut svc = test_svc("t.service", true);
+        svc.fail_count = 5;
+        svc.first_failure_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+        svc.next_restart_at = None;
+        schedule_restart(&mut svc, true);
+        // 时间窗过期 → 计数重置 → 本次失败计数为 1（允许重启）
+        assert_eq!(svc.fail_count, 1);
+        assert!(svc.next_restart_at.is_some());
+    }
+
+    #[test]
+    fn restart_success_clears_count() {
+        let mut svc = test_svc("t.service", true);
+        svc.fail_count = 3;
+        svc.first_failure_at = Some(std::time::Instant::now());
+        schedule_restart(&mut svc, false);
+        assert_eq!(svc.fail_count, 0);
+        assert!(svc.first_failure_at.is_none());
+    }
+
+    #[test]
+    fn finish_daemonize_reads_pidfile() {
+        let dir = format!("/tmp/rbox_pid_{}", std::process::id());
+        let _ = std::fs::create_dir_all(&dir);
+        let pidfile = format!("{}/svc.pid", dir);
+        std::fs::write(&pidfile, "4242\n").unwrap();
+        let mut svc = test_svc("fork.service", true);
+        svc.is_forking = true;
+        svc.pidfile = Some(pidfile.clone());
+        svc.waiting_daemonize = true;
+        svc.daemonize_deadline = Some(std::time::Instant::now());
+        finish_daemonize(&mut svc);
+        assert_eq!(svc.tracked_pid, Some(4242));
+        assert!(!svc.waiting_daemonize);
+        assert!(svc.daemonize_deadline.is_none());
+        assert!(svc.child.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finish_daemonize_without_pidfile_does_not_track() {
+        let mut svc = test_svc("fork.service", true);
+        svc.is_forking = true;
+        svc.pidfile = None;
+        svc.waiting_daemonize = true;
+        svc.daemonize_deadline = Some(std::time::Instant::now());
+        finish_daemonize(&mut svc);
+        assert_eq!(svc.tracked_pid, None);
+        assert!(!svc.waiting_daemonize);
     }
 }

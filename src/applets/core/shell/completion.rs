@@ -395,20 +395,20 @@ mod tests {
 
     #[test]
     fn complete_in_double_quotes() {
-        let _ = std::fs::write("/tmp/rbox_test_unique", "x");
-        let (line, printed) = tab_complete("cat \"/tmp/rbox_test_uniq");
+        let _ = std::fs::write("/tmp/rbox_dq_unique", "x");
+        let (line, printed) = tab_complete("cat \"/tmp/rbox_dq_uniq");
         assert!(!printed);
-        assert!(line.contains("rbox_test_unique"));
-        let _ = std::fs::remove_file("/tmp/rbox_test_unique");
+        assert!(line.contains("rbox_dq_unique"));
+        let _ = std::fs::remove_file("/tmp/rbox_dq_unique");
     }
 
     #[test]
     fn complete_in_single_quotes() {
-        let _ = std::fs::write("/tmp/rbox_test_unique2", "x");
-        let (line, printed) = tab_complete("cat '/tmp/rbox_test_uniq");
+        let _ = std::fs::write("/tmp/rbox_sq_unique2", "x");
+        let (line, printed) = tab_complete("cat '/tmp/rbox_sq_uniq");
         assert!(!printed);
-        assert!(line.contains("rbox_test_unique2"));
-        let _ = std::fs::remove_file("/tmp/rbox_test_unique2");
+        assert!(line.contains("rbox_sq_unique2"));
+        let _ = std::fs::remove_file("/tmp/rbox_sq_unique2");
     }
 
     // ─── find_last_word_start 额外边界 ──────────
