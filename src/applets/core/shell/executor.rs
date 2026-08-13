@@ -8,9 +8,9 @@ use super::builtin::{BuiltinResult, try_builtin};
 use super::expander::expand_history;
 use super::expander::expand_pipeline;
 use super::parser::build_command_list;
+use super::reader::set_isig;
 use super::tokenizer::tokenize;
 use super::types::*;
-use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -222,48 +222,18 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         FOREGROUND_PGID.store(pgid, Ordering::Relaxed);
     }
 
-    // 在等待子进程期间，启动一个线程监听 stdin 的 Ctrl-C（0x03 字节）。
-    // raw 模式下 ISIG 已关闭，Ctrl-C 不产生信号，而是作为 0x03 字节到达。
-    // shell 主线程在 wait() 中阻塞，无法读 stdin，所以需要单独线程。
-    let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let monitor_stop = stop_flag.clone();
-    let monitor = std::thread::spawn(move || {
-        let mut buf = [0u8; 1];
-        loop {
-            if monitor_stop.load(Ordering::Relaxed) {
-                return;
-            }
-            // 使用非阻塞 read，避免线程无法退出
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            // 设置非阻塞
-            let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, 1) };
-            // 恢复阻塞
-            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags) };
-
-            if n == 1 {
-                if buf[0] == 0x03 {
-                    // Ctrl-C：向子进程组发送 SIGINT
-                    let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
-                    if pgid > 0 {
-                        unsafe {
-                            libc::kill(-pgid, libc::SIGINT);
-                        }
-                    }
-                    return;
-                } else {
-                    // 其他字节推回 stdin
-                    unsafe {
-                        libc::ioctl(stdin_fd, libc::TIOCSTI, &buf[0] as *const u8 as *const _);
-                    }
-                }
-            } else {
-                // 没有数据，短暂休眠后重试
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        }
-    });
+    // 前台等待期间：
+    // 1. 屏蔽 SIGCHLD —— 避免 SIGCHLD 处理器用 waitpid(-1) 抢收前台子进程，
+    //    导致 child.wait() 返回 ECHILD、退出码被误判为 1。
+    // 2. 开启 ISIG —— 让 Ctrl-C 产生 SIGINT 信号，由 SIGINT 处理器转发给
+    //    前台进程组（替代原 stdin 监控线程 + TIOCSTI 推回方案，消除丢字符）。
+    let mut sigset: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut sigset);
+        libc::sigaddset(&mut sigset, libc::SIGCHLD);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &sigset, std::ptr::null_mut());
+    }
+    set_isig(true);
 
     // 等待所有子进程，返回最后一个的退出码
     let mut last_code = 0;
@@ -274,9 +244,22 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
         }
     }
 
-    // 停止 stdin 监控线程
-    stop_flag.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
+    set_isig(false);
+
+    // 收割等待期间累积的后台僵尸（SIGCHLD 被屏蔽，处理器未执行）
+    unsafe {
+        loop {
+            let pid = libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG);
+            if pid <= 0 {
+                break;
+            }
+        }
+    }
+
+    // 解除 SIGCHLD 屏蔽
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &sigset, std::ptr::null_mut());
+    }
 
     // 清除前台进程组标记
     FOREGROUND_PGID.store(0, Ordering::Relaxed);
@@ -291,6 +274,8 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
 }
 
 /// 注册 SIGCHLD 处理器：自动回收后台僵尸子进程。
+/// 前台命令等待期间主线程用 pthread_sigmask 屏蔽 SIGCHLD，此时处理器不执行，
+/// 前台子进程由 child.wait() 收割，后台僵尸在等待结束后统一回收。
 pub fn install_sigchld_handler() {
     extern "C" fn handle_sigchld(_sig: i32) {
         // 非阻塞 waitpid 回收所有已终止的子进程

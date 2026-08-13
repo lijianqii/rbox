@@ -32,8 +32,8 @@ use std::io::{self, BufRead, Read, Write};
 /// 处理 here-doc：检测 `<<DELIM`，读取后续行直到 DELIM，写入临时文件。
 /// 返回替换后的命令行（`<<DELIM` -> `<tmpfile`）。
 fn process_heredoc<R: BufRead>(line: &str, input: &mut R) -> String {
-    // 查找 << 在行中的位置
-    let idx = match line.find("<<") {
+    // 查找真正的 <<（跳过引号内与反斜杠转义）
+    let idx = match find_heredoc_operator(line) {
         Some(i) => i,
         None => return line.to_string(),
     };
@@ -78,6 +78,108 @@ fn process_heredoc<R: BufRead>(line: &str, input: &mut R) -> String {
     // 替换 <<DELIM 为 <tmpfile
     let before = &line[..idx];
     format!("{} < {}", before.trim_end(), tmpfile)
+}
+
+/// 读取一个完整 UTF-8 字符（首字节已读入为 `first`），返回该字符的字符串形式。
+/// 多字节序列按首字节判断长度；无效/不完整序列按已读字节用 U+FFFD 替换。
+fn read_utf8_char<R: Read>(first: u8, input: &mut R) -> String {
+    let extra = match first {
+        0xc0..=0xdf => 1,
+        0xe0..=0xef => 2,
+        0xf0..=0xf7 => 3,
+        _ => 0,
+    };
+    let mut buf = vec![first];
+    for _ in 0..extra {
+        let mut b = [0u8; 1];
+        if input.read(&mut b).unwrap_or(0) != 1 {
+            break;
+        }
+        buf.push(b[0]);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 查找行中真正的 `<<` 操作符位置（跳过单/双引号内与反斜杠转义）。
+fn find_heredoc_operator(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_squote {
+            if b == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            match b {
+                b'"' => in_dquote = false,
+                b'\\' => i += 1, // 跳过转义字符
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'\\' => i += 1, // 跳过转义字符
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 判断行是否以"续行反斜杠"结尾（单引号内反斜杠不续行；双引号/引号外的
+/// 行尾反斜杠续行，被转义的反斜杠不续行）。
+fn needs_continuation(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_squote {
+            if b == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            match b {
+                b'"' => in_dquote = false,
+                b'\\' => {
+                    if i + 1 >= bytes.len() {
+                        return true; // 双引号内行尾反斜杠 = 续行
+                    }
+                    i += 1; // 跳过转义字符
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return true; // 行尾反斜杠 = 续行
+                }
+                i += 1; // 跳过转义字符
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// 中断当前行输入（Ctrl-C / EINTR）：清空行与续行缓冲，打印 ^C 并重绘提示符。
@@ -228,8 +330,8 @@ impl Shell {
                     line.clear();
                     cursor = 0;
 
-                    // 续行检查
-                    if full_line.ends_with('\\') && !full_line.ends_with("\\\\") {
+                    // 续行检查（感知引号：单引号内反斜杠不续行）
+                    if needs_continuation(&full_line) {
                         pending_line = full_line.trim_end_matches('\\').to_string();
                         let _ = write!(io::stdout(), "> ");
                         let _ = io::stdout().flush();
@@ -477,11 +579,12 @@ impl Shell {
                 }
 
                 _ => {
-                    // 普通可打印字符：插入到光标处
-                    line.insert(cursor, b as char);
-                    cursor += 1;
+                    // 普通可打印字符：聚合 UTF-8 多字节序列后插入到光标处
+                    let ch = read_utf8_char(b, &mut input);
+                    line.insert_str(cursor, &ch);
+                    cursor += ch.len();
                     if cursor == line.len() {
-                        let _ = write!(io::stdout(), "{}", b as char);
+                        let _ = write!(io::stdout(), "{}", ch);
                         let _ = io::stdout().flush();
                     } else {
                         redraw(&pending_line, &line, cursor);
@@ -491,5 +594,78 @@ impl Shell {
         }
 
         Ok(last_rc as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_ascii_single_byte() {
+        let mut input = &b"abc"[..];
+        assert_eq!(read_utf8_char(b'a', &mut input), "a");
+    }
+
+    #[test]
+    fn utf8_multibyte_char() {
+        // '你' = E4 BD A0（三字节）
+        let mut input = &b"\xbd\xa0"[..];
+        assert_eq!(read_utf8_char(0xe4, &mut input), "你");
+    }
+
+    #[test]
+    fn utf8_incomplete_sequence_uses_replacement() {
+        // 首字节声明 3 字节但无后续 → U+FFFD
+        let mut input = &b""[..];
+        assert_eq!(read_utf8_char(0xe4, &mut input), "\u{fffd}");
+    }
+
+    #[test]
+    fn utf8_two_byte_char() {
+        // 'é' = C3 A9（两字节）
+        let mut input = &b"\xa9"[..];
+        assert_eq!(read_utf8_char(0xc3, &mut input), "é");
+    }
+
+    // ─── here-doc 操作符检测（引号感知）─────────
+
+    #[test]
+    fn heredoc_operator_plain() {
+        assert_eq!(find_heredoc_operator("cat <<EOF"), Some(4));
+    }
+
+    #[test]
+    fn heredoc_operator_inside_quotes_ignored() {
+        // 引号内的 << 不是 here-doc
+        assert_eq!(find_heredoc_operator("echo \"a << b\""), None);
+        assert_eq!(find_heredoc_operator("echo 'a << b'"), None);
+    }
+
+    #[test]
+    fn heredoc_operator_after_quotes_found() {
+        assert_eq!(find_heredoc_operator("echo 'x' <<EOF"), Some(9));
+    }
+
+    // ─── 续行判断（引号感知）─────────────────────
+
+    #[test]
+    fn continuation_trailing_backslash() {
+        assert!(needs_continuation("echo a\\"));
+    }
+
+    #[test]
+    fn continuation_double_backslash_not_continuation() {
+        assert!(!needs_continuation("echo a\\\\"));
+    }
+
+    #[test]
+    fn continuation_inside_single_quotes_not_continuation() {
+        assert!(!needs_continuation("echo 'a\\'"));
+    }
+
+    #[test]
+    fn continuation_plain_line() {
+        assert!(!needs_continuation("echo hello"));
     }
 }

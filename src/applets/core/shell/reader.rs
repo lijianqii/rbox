@@ -40,9 +40,54 @@ pub fn enable_raw_mode() -> Option<RawGuard> {
     Some(RawGuard { fd, original })
 }
 
-/// 计算字符串在终端中的显示宽度（ASCII 为 1，其他字符按 1 计算）。
+/// 临时开启/关闭 ISIG（前台命令运行期间开启，使 Ctrl-C 产生 SIGINT 信号，
+/// 由 SIGINT 处理器转发给前台进程组；结束后关闭恢复 raw 模式）。
+/// 非 tty（管道模式）时 tcgetattr 失败，静默跳过。
+pub fn set_isig(enabled: bool) {
+    let fd = io::stdin().as_raw_fd();
+    let mut t: termios = unsafe { std::mem::zeroed() };
+    if unsafe { tcgetattr(fd, &mut t) } != 0 {
+        return;
+    }
+    if enabled {
+        t.c_lflag |= libc::ISIG;
+    } else {
+        t.c_lflag &= !libc::ISIG;
+    }
+    unsafe {
+        tcsetattr(fd, TCSANOW, &t);
+    }
+}
+
+/// 计算字符串在终端中的显示宽度（控制字符 0，CJK/全角 2，其余 1）。
 pub fn display_width(s: &str) -> usize {
-    s.chars().count()
+    s.chars().map(char_display_width).sum()
+}
+
+/// 单字符显示宽度：控制字符 0，CJK 统一表意文字/全角标点/谚文等宽字符 2，其余 1。
+fn char_display_width(c: char) -> usize {
+    let code = c as u32;
+    match code {
+        // 控制字符与 DEL：不占位
+        0x00..=0x1f | 0x7f => 0,
+        // 零宽字符
+        0x200b..=0x200f | 0x202a..=0x202e | 0x2060..=0x2064 => 0,
+        // CJK / 全角 / 谚文等宽区间（wcwidth 常用区间）
+        0x1100..=0x115f
+        | 0x2e80..=0x303e
+        | 0x3041..=0x33ff
+        | 0x3400..=0x4dbf
+        | 0x4e00..=0x9fff
+        | 0xa000..=0xa4cf
+        | 0xac00..=0xd7a3
+        | 0xf900..=0xfaff
+        | 0xfe10..=0xfe19
+        | 0xfe30..=0xfe6f
+        | 0xff00..=0xff60
+        | 0xffe0..=0xffe6
+        | 0x20000..=0x3fffd => 2,
+        _ => 1,
+    }
 }
 
 /// 重绘当前行：`\r` + 清除行 + prompt + line + 光标定位。
@@ -226,5 +271,20 @@ mod tests {
     fn display_width_ascii() {
         assert_eq!(display_width("hello"), 5);
         assert_eq!(display_width(""), 0);
+    }
+
+    #[test]
+    fn display_width_cjk() {
+        // 中文/全角字符显示宽度为 2
+        assert_eq!(display_width("你好"), 4);
+        assert_eq!(display_width("a你"), 3);
+        assert_eq!(display_width("全角Ａ"), 6);
+    }
+
+    #[test]
+    fn display_width_control_chars_zero() {
+        // 单个控制字符不占位
+        assert_eq!(display_width("\x1b"), 0);
+        assert_eq!(display_width("\x07"), 0);
     }
 }

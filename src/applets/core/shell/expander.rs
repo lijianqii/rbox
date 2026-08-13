@@ -102,6 +102,7 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
 // ─── 历史扩展 ──────────────────────────────────────────
 
 /// 历史扩展：`!!` → 上一条命令，`!n` → 第 n 条，`!-n` → 倒数第 n 条，`!$` → 上一条最后参数。
+/// 单引号内的 `!` 不展开（字面保留）；双引号内与引号外展开。
 pub fn expand_history(line: &str, history: &[String]) -> String {
     if !line.contains('!') || history.is_empty() {
         return line.to_string();
@@ -110,9 +111,16 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
     let mut result = String::new();
     let bytes = line.as_bytes();
     let mut i = 0;
+    let mut in_squote = false;
 
     while i < bytes.len() {
-        if bytes[i] == b'!' && i + 1 < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_squote = !in_squote;
+            result.push('\'');
+            i += 1;
+            continue;
+        }
+        if !in_squote && bytes[i] == b'!' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             match next {
                 b'!' => {
@@ -396,6 +404,22 @@ mod tests {
     fn hist_no_bang() {
         let history = vec!["echo hello".to_string()];
         assert_eq!(expand_history("echo hi", &history), "echo hi");
+    }
+
+    #[test]
+    fn hist_bang_in_single_quotes_not_expanded() {
+        let history = vec!["echo hello".to_string()];
+        // 单引号内 !! 字面保留
+        assert_eq!(expand_history("echo '!!'", &history), "echo '!!'");
+    }
+
+    #[test]
+    fn hist_bang_outside_single_quotes_expands() {
+        let history = vec!["echo hello".to_string()];
+        assert_eq!(
+            expand_history("echo 'a' !!", &history),
+            "echo 'a' echo hello"
+        );
     }
 
     // ─── Tilde 展开 ─────────────────────────────

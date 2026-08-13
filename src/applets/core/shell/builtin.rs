@@ -19,12 +19,14 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
     }
     match cmd.argv[0].as_str() {
         "exit" => {
+            // bash 语义：退出码取低 8 位（exit 300 -> 44）；非数字保持 last_rc
             let code = cmd
                 .argv
                 .get(1)
-                .and_then(|s| s.parse::<u8>().ok())
-                .unwrap_or(*last_rc as u8);
-            *last_rc = code as i32;
+                .and_then(|s| s.parse::<i32>().ok())
+                .map(|c| c & 0xff)
+                .unwrap_or(*last_rc & 0xff);
+            *last_rc = code;
             BuiltinResult::Exit
         }
         "cd" => {
@@ -248,5 +250,16 @@ mod tests {
         try_builtin(&make_cmd(&["exit", "abc"]), &mut rc, &[]);
         // Non-numeric exit code -> keeps last rc
         assert_eq!(rc, 5);
+    }
+
+    #[test]
+    fn exit_truncates_to_8_bits() {
+        // bash 语义：exit 300 -> 300 & 0xff = 44
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["exit", "300"]), &mut rc, &[]);
+        assert_eq!(rc, 44);
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["exit", "-1"]), &mut rc, &[]);
+        assert_eq!(rc, 255);
     }
 }

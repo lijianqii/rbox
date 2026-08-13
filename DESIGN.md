@@ -255,7 +255,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 
 ### 实现细节
 
-**输入模式**：逐字节读取 stdin，支持以下按键：
+**输入模式**：逐字节读取 stdin（普通字符按 UTF-8 首字节聚合多字节序列），支持以下按键：
 
 | 按键 | 功能 |
 |------|------|
@@ -386,25 +386,23 @@ impl Drop for RawGuard {
 
 ### Ctrl-C 前台进程中断
 
-raw 模式下 **ISIG 已关闭**，Ctrl-C 不产生 SIGINT 信号，而是作为 `0x03` 字节到达 stdin。shell 主线程在 `wait()` 中阻塞等待子进程，无法读 stdin，因此使用一个**后台监控线程**轮询 stdin 的 `0x03` 字节：
+shell 在 `execute_pipeline()` 中设置 `FOREGROUND_PGID`（第一个子进程的 pid）后，前台等待期间**临时开启 ISIG**（`set_isig(true)`），使 Ctrl-C 产生 SIGINT 信号；SIGINT 处理器读取 `FOREGROUND_PGID` 并 `kill(-pgid, SIGINT)` 转发给子进程组，等待结束后关闭 ISIG 恢复 raw 模式：
 
 1. `execute_pipeline()` 设置 `FOREGROUND_PGID`（第一个子进程的 pid）
-2. 启动 stdin 监控线程，非阻塞 read stdin：
-   - 收到 `0x03` -> `kill(-pgid, SIGINT)` 转发给子进程组，线程退出
-   - 收到其他字节 -> `ioctl(TIOCSTI)` 推回 stdin，供 shell 后续读取
-3. shell 主线程 `wait()` 子进程退出
-4. 设置 stop_flag 停止监控线程，`join()` 等待退出
+2. 屏蔽 SIGCHLD（见下文）+ `set_isig(true)` 开启 ISIG
+3. shell 主线程 `wait()` 子进程退出；期间 Ctrl-C -> SIGINT -> 处理器转发给前台进程组
+4. `set_isig(false)` 关闭 ISIG，收割后台僵尸，解除 SIGCHLD 屏蔽
 5. 清除 `FOREGROUND_PGID`，如果退出码为 130 则打印换行
 
 子进程在 `pre_exec` 中通过 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（不继承 shell handler）。
 
 如果 shell 在编辑行时（无前台子进程），REPL 的 `0x03` 分支直接清除当前行并显示新提示符。
 
-SIGINT handler 仍注册为后备（管道模式下 ISIG 仍然开启时生效）。
+SIGINT handler 同时作为管道模式后备（管道模式下 ISIG 本来就开启）。
 
 ### SIGCHLD 后台进程回收
 
-shell 注册 `SIGCHLD` handler，自动回收后台子进程（`&` 启动的），避免僵尸进程。handler 内部循环 `waitpid(-1, WNOHANG)` 直到无子进程可回收。
+shell 注册 `SIGCHLD` handler，自动回收后台子进程（`&` 启动的），避免僵尸进程。handler 内部循环 `waitpid(-1, WNOHANG)` 直到无子进程可回收。前台命令等待期间主线程用 `pthread_sigmask(SIG_BLOCK, SIGCHLD)` 屏蔽该信号，避免 handler 用 `waitpid(-1)` 抢收前台子进程导致 `child.wait()` 返回 ECHILD、退出码被误判为 1；等待结束后统一 `waitpid` 收割后台僵尸再解除屏蔽。
 
 ### 命令历史持久化
 
@@ -646,12 +644,13 @@ make unittest
 |------|------|------|
 | shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 29 |
 | shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 30 |
-| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n）、expand_tilde、expand_glob（* ? []） | 37 |
+| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知）、expand_tilde、expand_glob（* ? []） | 39 |
 | shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 29 |
-| shell/builtin | cd、exit、export、unset、pwd、history 内置命令 | 17 |
-| shell/reader | make_prompt（PS1 展开）、display_width | 14 |
+| shell/builtin | cd、exit（8 位截断）、export、unset、pwd、history 内置命令 | 18 |
+| shell/reader | make_prompt（PS1 展开）、display_width（CJK/全角宽度）、set_isig | 16 |
 | shell/executor | 重定向打开、命令解析回退 | 5 |
 | shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 7 |
+| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation | 11 |
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 15 |
 | init/server | 控制协议处理 | 8 |
 | init/services | 服务生命周期、schedule_restart、finish_daemonize | 10 |
@@ -661,7 +660,7 @@ make unittest
 | file/* | ls 12、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 51 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1 | 10 |
-| **合计** | | **357** |
+| **合计** | | **373** |
 
 测试结果示例：
 
@@ -834,7 +833,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（357 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（373 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
