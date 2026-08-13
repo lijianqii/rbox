@@ -83,19 +83,17 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
         entries = filter_entries(entries, show_all);
 
         if long {
-            for name in &entries {
-                let full = Path::new(path).join(name);
-                let m = fs::metadata(&full)?;
-                print_long(name, &m);
+            let items = collect_metadata(path, &entries)?;
+            for line in format_long(&items) {
+                println!("{}", line);
             }
         } else if one {
             for name in &entries {
                 println!("{}", name);
             }
         } else {
-            // 横向输出，空格分隔
-            let line = entries.join("  ");
-            if !line.is_empty() {
+            // 默认多列对齐输出（按终端宽度分列）
+            for line in format_columns(&entries, terminal_width()) {
                 println!("{}", line);
             }
         }
@@ -106,7 +104,9 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string());
-            print_long(&name, &meta);
+            for line in format_long(&[(name, meta)]) {
+                println!("{}", line);
+            }
         } else {
             println!("{}", path);
         }
@@ -114,18 +114,104 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
     Ok(())
 }
 
-fn print_long(name: &str, m: &fs::Metadata) {
-    let mode = mode_string(m);
-    let nlink = m.nlink();
-    let uid = m.uid();
-    let gid = m.gid();
-    let size = m.size();
-    let mtime = m.mtime();
-    let time_str = format_time(mtime);
-    println!(
-        "{} {} {} {} {:>8} {} {}",
-        mode, nlink, uid, gid, size, time_str, name
-    );
+/// 收集目录条目的 (名称, metadata)。
+fn collect_metadata(path: &str, entries: &[String]) -> std::io::Result<Vec<(String, fs::Metadata)>> {
+    let mut items = Vec::with_capacity(entries.len());
+    for name in entries {
+        let full = Path::new(path).join(name);
+        let m = fs::metadata(&full)?;
+        items.push((name.clone(), m));
+    }
+    Ok(items)
+}
+
+/// 查询 stdout 终端宽度；非 tty 时回退 80 列。
+fn terminal_width() -> usize {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            ws.ws_col as usize
+        } else {
+            80
+        }
+    }
+}
+
+/// 按列优先（column-major）将条目排版为多行：列宽 = 最长名 + 2 空格，
+/// 列数由终端宽度决定（至少 1 列）。
+fn format_columns(entries: &[String], term_width: usize) -> Vec<String> {
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let max_len = entries.iter().map(|s| s.len()).max().unwrap_or(0);
+    let col_width = max_len + 2;
+    let ncols = (term_width / col_width.max(1)).max(1);
+    let nrows = entries.len().div_ceil(ncols);
+    let mut lines = Vec::with_capacity(nrows);
+    for r in 0..nrows {
+        let mut line = String::new();
+        for c in 0..ncols {
+            let idx = c * nrows + r;
+            if idx >= entries.len() {
+                break;
+            }
+            if c > 0 {
+                let target = col_width * c;
+                if line.len() < target {
+                    line.push_str(&" ".repeat(target - line.len()));
+                }
+            }
+            line.push_str(&entries[idx]);
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// 长格式：nlink/uid/gid/size 按各自列的最大宽度右对齐。
+fn format_long(items: &[(String, fs::Metadata)]) -> Vec<String> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let nlink_w = items
+        .iter()
+        .map(|(_, m)| m.nlink().to_string().len())
+        .max()
+        .unwrap_or(1);
+    let uid_w = items
+        .iter()
+        .map(|(_, m)| m.uid().to_string().len())
+        .max()
+        .unwrap_or(1);
+    let gid_w = items
+        .iter()
+        .map(|(_, m)| m.gid().to_string().len())
+        .max()
+        .unwrap_or(1);
+    let size_w = items
+        .iter()
+        .map(|(_, m)| m.size().to_string().len())
+        .max()
+        .unwrap_or(1);
+    items
+        .iter()
+        .map(|(name, m)| {
+            format!(
+                "{} {:>nw$} {:>uw$} {:>gw$} {:>sw$} {} {}",
+                mode_string(m),
+                m.nlink(),
+                m.uid(),
+                m.gid(),
+                m.size(),
+                format_time(m.mtime()),
+                name,
+                nw = nlink_w,
+                uw = uid_w,
+                gw = gid_w,
+                sw = size_w,
+            )
+        })
+        .collect()
 }
 
 /// 将文件 mode 转为 `drwxr-xr-x` 格式字符串。
@@ -227,5 +313,53 @@ mod tests {
     fn filter_empty() {
         let entries: Vec<String> = vec![];
         assert_eq!(filter_entries(entries, false), Vec::<String>::new());
+    }
+
+    #[test]
+    fn columns_empty() {
+        assert!(format_columns(&[], 80).is_empty());
+    }
+
+    #[test]
+    fn columns_single_column() {
+        let entries = vec!["a".into(), "bb".into(), "ccc".into()];
+        // col_width = 3+2 = 5 > term_width 3，只有 1 列
+        let lines = format_columns(&entries, 3);
+        assert_eq!(lines, vec!["a", "bb", "ccc"]);
+    }
+
+    #[test]
+    fn columns_multi_column_aligned() {
+        let entries = vec![
+            "aaa".into(),
+            "bbb".into(),
+            "ccc".into(),
+            "dddd".into(),
+            "eee".into(),
+            "fff".into(),
+        ];
+        // max_len=4, col_width=6, term_width=20 => 3 列 2 行，column-major
+        let lines = format_columns(&entries, 20);
+        assert_eq!(lines[0], "aaa   ccc   eee");
+        assert_eq!(lines[1], "bbb   dddd  fff");
+    }
+
+    #[test]
+    fn long_format_aligns_columns() {
+        let dir = std::env::temp_dir().join(format!("rbox_ls_long_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f1 = dir.join("a");
+        let f2 = dir.join("b");
+        std::fs::write(&f1, "12345").unwrap(); // size 列宽 5
+        std::fs::write(&f2, "1").unwrap();
+        let items = vec![
+            ("a".to_string(), std::fs::metadata(&f1).unwrap()),
+            ("b".to_string(), std::fs::metadata(&f2).unwrap()),
+        ];
+        let lines = format_long(&items);
+        assert_eq!(lines.len(), 2);
+        // 两行 name 均为 1 字符；size 列按最大宽度 5 右对齐 ⟹ 两行总长相等
+        assert_eq!(lines[0].len(), lines[1].len(), "列未对齐: {:?}", lines);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
