@@ -103,8 +103,8 @@ rbox/
 │       │   │   └── syscall.rs  # libc 系统调用封装
 │       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
 │       │   ├── shell/       # 命令解释器（模块目录：mod/tokenizer/parser/expander/completion/builtin/executor/reader/types）
-│       │   ├── getty.rs    # rgetty（终端登录提示，exec rlogin）
-│       │   ├── login.rs    # rlogin（密码校验、降权、exec 用户 shell）
+│       │   ├── rgetty.rs    # rgetty（终端登录提示，exec rlogin）
+│       │   ├── rlogin.rs    # rlogin（密码校验、降权、exec 用户 shell）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
 │       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
@@ -452,7 +452,7 @@ shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u
 
 ## 终端登录（rgetty / rlogin）
 
-文件：src/applets/core/getty.rs、src/applets/core/login.rs
+文件：src/applets/core/rgetty.rs、src/applets/core/rlogin.rs
 
 生产 rootfs 的 console 服务由原来的直接 shell 改为 `rgetty`，登录流程如下：
 
@@ -580,9 +580,9 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 | libc::uname | 获取系统信息 | uname.rs |
 | libc::time / localtime_r | 获取时间 | date.rs, ls.rs |
 | libc::utimensat | 设置文件时间戳 | touch.rs |
-| libc::dup2 | rgetty 把指定 tty 复制到 stdin/stdout/stderr | getty.rs |
-| libc::tcgetattr / tcsetattr | rgetty 恢复终端模式；rlogin 关闭密码回显 | getty.rs, login.rs |
-| libc::initgroups / setgid / setuid | rlogin 登录后降权 | login.rs |
+| libc::dup2 | rgetty 把指定 tty 复制到 stdin/stdout/stderr | rgetty.rs |
+| libc::tcgetattr / tcsetattr | rgetty 恢复终端模式；rlogin 关闭密码回显 | rgetty.rs, rlogin.rs |
+| libc::initgroups / setgid / setuid | rlogin 登录后降权 | rlogin.rs |
 
 libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手动传递 magic number。
 

@@ -1,9 +1,9 @@
 //! 系统核心 applet：init 与配套管理工具。
 pub(crate) mod control;
-pub mod getty;
 pub mod init;
-pub mod login;
 pub mod reboot;
+pub mod rgetty;
+pub mod rlogin;
 pub mod rservice;
 pub mod shell;
 pub mod shutdown;
