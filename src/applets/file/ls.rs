@@ -98,13 +98,15 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
             }
         }
     } else {
-        // 普通文件
+        // 普通文件/符号链接
         if long {
+            let lmeta = fs::symlink_metadata(path)?;
             let name = Path::new(path)
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.to_string());
-            for line in format_long(&[(name, meta)]) {
+            let target = symlink_target(Path::new(path), &lmeta);
+            for line in format_long(&[(name, lmeta, target)]) {
                 println!("{}", line);
             }
         } else {
@@ -114,15 +116,31 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
     Ok(())
 }
 
-/// 收集目录条目的 (名称, metadata)。
-fn collect_metadata(path: &str, entries: &[String]) -> std::io::Result<Vec<(String, fs::Metadata)>> {
+/// 收集目录条目的 (名称, metadata, 符号链接目标)。
+fn collect_metadata(
+    path: &str,
+    entries: &[String],
+) -> std::io::Result<Vec<(String, fs::Metadata, Option<String>)>> {
     let mut items = Vec::with_capacity(entries.len());
     for name in entries {
         let full = Path::new(path).join(name);
-        let m = fs::metadata(&full)?;
-        items.push((name.clone(), m));
+        // 使用 symlink_metadata，避免跟随符号链接后丢失链接类型
+        let m = fs::symlink_metadata(&full)?;
+        let target = symlink_target(&full, &m);
+        items.push((name.clone(), m, target));
     }
     Ok(items)
+}
+
+/// 若文件是符号链接，返回其目标字符串。
+fn symlink_target(path: &Path, meta: &fs::Metadata) -> Option<String> {
+    if meta.file_type().is_symlink() {
+        fs::read_link(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    }
 }
 
 /// 查询 stdout 终端宽度；非 tty 时回退 80 列。
@@ -169,34 +187,35 @@ fn format_columns(entries: &[String], term_width: usize) -> Vec<String> {
 }
 
 /// 长格式：nlink/uid/gid/size 按各自列的最大宽度右对齐。
-fn format_long(items: &[(String, fs::Metadata)]) -> Vec<String> {
+/// 符号链接额外追加 `-> target`。
+fn format_long(items: &[(String, fs::Metadata, Option<String>)]) -> Vec<String> {
     if items.is_empty() {
         return Vec::new();
     }
     let nlink_w = items
         .iter()
-        .map(|(_, m)| m.nlink().to_string().len())
+        .map(|(_, m, _)| m.nlink().to_string().len())
         .max()
         .unwrap_or(1);
     let uid_w = items
         .iter()
-        .map(|(_, m)| m.uid().to_string().len())
+        .map(|(_, m, _)| m.uid().to_string().len())
         .max()
         .unwrap_or(1);
     let gid_w = items
         .iter()
-        .map(|(_, m)| m.gid().to_string().len())
+        .map(|(_, m, _)| m.gid().to_string().len())
         .max()
         .unwrap_or(1);
     let size_w = items
         .iter()
-        .map(|(_, m)| m.size().to_string().len())
+        .map(|(_, m, _)| m.size().to_string().len())
         .max()
         .unwrap_or(1);
     items
         .iter()
-        .map(|(name, m)| {
-            format!(
+        .map(|(name, m, target)| {
+            let mut line = format!(
                 "{} {:>nw$} {:>uw$} {:>gw$} {:>sw$} {} {}",
                 mode_string(m),
                 m.nlink(),
@@ -209,7 +228,12 @@ fn format_long(items: &[(String, fs::Metadata)]) -> Vec<String> {
                 uw = uid_w,
                 gw = gid_w,
                 sw = size_w,
-            )
+            );
+            if let Some(t) = target {
+                line.push_str(" -> ");
+                line.push_str(t);
+            }
+            line
         })
         .collect()
 }
@@ -353,13 +377,40 @@ mod tests {
         std::fs::write(&f1, "12345").unwrap(); // size 列宽 5
         std::fs::write(&f2, "1").unwrap();
         let items = vec![
-            ("a".to_string(), std::fs::metadata(&f1).unwrap()),
-            ("b".to_string(), std::fs::metadata(&f2).unwrap()),
+            (
+                "a".to_string(),
+                std::fs::symlink_metadata(&f1).unwrap(),
+                None,
+            ),
+            (
+                "b".to_string(),
+                std::fs::symlink_metadata(&f2).unwrap(),
+                None,
+            ),
         ];
         let lines = format_long(&items);
         assert_eq!(lines.len(), 2);
         // 两行 name 均为 1 字符；size 列按最大宽度 5 右对齐 ⟹ 两行总长相等
         assert_eq!(lines[0].len(), lines[1].len(), "列未对齐: {:?}", lines);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_format_symlink_arrow() {
+        let dir = std::env::temp_dir().join(format!("rbox_ls_symlink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        let m = std::fs::symlink_metadata(&link).unwrap();
+        let target_str = std::fs::read_link(&link)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let lines = format_long(&[("link".to_string(), m, Some(target_str))]);
+        assert!(lines[0].contains("lrwxrwxrwx"), "{}", lines[0]);
+        assert!(lines[0].contains("-> target"), "{}", lines[0]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

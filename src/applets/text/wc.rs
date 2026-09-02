@@ -55,6 +55,7 @@ impl Applet for Wc {
         let mut count_words = false;
         let mut count_bytes = false;
         let mut any_specified = false;
+        let mut option_error = false;
         let mut files: Vec<&String> = Vec::new();
 
         for a in args {
@@ -79,6 +80,7 @@ impl Applet for Wc {
                         }
                         _ => {
                             eprintln!("wc: unknown option: -{}", c);
+                            option_error = true;
                         }
                     }
                 }
@@ -98,66 +100,91 @@ impl Applet for Wc {
         let mut total_w = 0usize;
         let mut total_b = 0usize;
 
-        let process = |content: &str| -> (usize, usize, usize) {
-            let lines = content.lines().count();
-            let words = content.split_whitespace().count();
-            let bytes = content.len();
-            (lines, words, bytes)
-        };
+        let mut had_error = option_error;
 
         if files.is_empty() {
-            let mut buf = String::new();
-            if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
-                let (l, w, b) = process(&buf);
-                counts.print(l, w, b, "", &mut out);
+            let mut buf = Vec::new();
+            match std::io::stdin().lock().read_to_end(&mut buf) {
+                Ok(_) => {
+                    let (l, w, b) = count_bytes_data(&buf);
+                    counts.print(l, w, b, "", &mut out);
+                }
+                Err(e) => {
+                    eprintln!("wc: stdin: {}", e);
+                    had_error = true;
+                }
             }
         } else {
             for f in &files {
-                match std::fs::read_to_string(f) {
+                match std::fs::read(f) {
                     Ok(content) => {
-                        let (l, w, b) = process(&content);
+                        let (l, w, b) = count_bytes_data(&content);
                         total_l += l;
                         total_w += w;
                         total_b += b;
                         counts.print(l, w, b, f, &mut out);
                     }
-                    Err(e) => eprintln!("wc: {}: {}", f, e),
+                    Err(e) => {
+                        eprintln!("wc: {}: {}", f, e);
+                        had_error = true;
+                    }
                 }
             }
             if files.len() > 1 {
                 counts.print(total_l, total_w, total_b, "total", &mut out);
             }
         }
-        ExitCode::SUCCESS
+
+        if had_error {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        }
     }
+}
+
+/// 统计字节内容的行数/单词数/字节数。
+/// 行数按 `\n` 字节计数（与 GNU wc 一致）；单词数通过 lossy UTF-8 文本切分。
+fn count_bytes_data(content: &[u8]) -> (usize, usize, usize) {
+    let lines = content.iter().filter(|&&b| b == b'\n').count();
+    let text = String::from_utf8_lossy(content);
+    let words = text.split_whitespace().count();
+    let bytes = content.len();
+    (lines, words, bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn count_basic() {
-        // 2 lines, 4 words, 20 bytes
-        let content = "hello world\nfoo bar\n";
-        let lines = content.lines().count();
-        let words = content.split_whitespace().count();
-        let bytes = content.len();
-        assert_eq!((lines, words, bytes), (2, 4, 20));
+        // 2 newlines, 4 words, 20 bytes
+        let content = b"hello world\nfoo bar\n";
+        assert_eq!(count_bytes_data(content), (2, 4, 20));
     }
 
     #[test]
     fn count_empty() {
-        let content = "";
-        assert_eq!(content.lines().count(), 0);
-        assert_eq!(content.split_whitespace().count(), 0);
-        assert_eq!(content.len(), 0);
+        assert_eq!(count_bytes_data(b""), (0, 0, 0));
     }
 
     #[test]
     fn count_single_line() {
-        let content = "hello";
-        assert_eq!(content.lines().count(), 1);
-        assert_eq!(content.split_whitespace().count(), 1);
-        assert_eq!(content.len(), 5);
+        // GNU wc -l 按换行符计数，"hello" 没有换行所以行数为 0
+        assert_eq!(count_bytes_data(b"hello"), (0, 1, 5));
+    }
+
+    #[test]
+    fn count_binary_bytes() {
+        // 非法 UTF-8 不应导致统计失败，字节数按原始长度计算
+        let content = b"\xff\xfe\n\x00abc";
+        assert_eq!(count_bytes_data(content), (1, 2, 7));
+    }
+
+    #[test]
+    fn unknown_option_returns_failure() {
+        let code = WC.run(&["-x".to_string()]);
+        assert_ne!(code, std::process::ExitCode::SUCCESS);
     }
 }

@@ -243,10 +243,16 @@ fn print_completions(items: &[String]) {
 /// 找到最后一个词的开始位置（用于 Tab 补全时提取当前正在输入的词）。
 fn find_last_word_start(line: &str) -> usize {
     let bytes = line.as_bytes();
-    let mut i = bytes.len();
-    // 跳过尾部空白
+    let original_len = bytes.len();
+    let mut i = original_len;
+    // 跳过尾部空白；如果确实存在尾部空白，说明当前词为空，应返回行尾
+    let mut trailing_ws = false;
     while i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
         i -= 1;
+        trailing_ws = true;
+    }
+    if trailing_ws {
+        return original_len;
     }
     // 找到词的开始
     while i > 0 {
@@ -294,7 +300,15 @@ mod tests {
     #[test]
     fn word_start_trailing_space() {
         // trailing space -> word_start at end (empty prefix)
-        assert_eq!(find_last_word_start("echo "), 0);
+        assert_eq!(find_last_word_start("echo "), 5);
+        assert_eq!(find_last_word_start("echo  "), 6);
+        assert_eq!(find_last_word_start("cat | "), 6);
+    }
+
+    #[test]
+    fn word_start_only_spaces_returns_end() {
+        assert_eq!(find_last_word_start("   "), 3);
+        assert_eq!(find_last_word_start("\t"), 1);
     }
 
     // ─── common_prefix ──────────────────────────
@@ -416,11 +430,6 @@ mod tests {
     #[test]
     fn word_start_empty_line() {
         assert_eq!(find_last_word_start(""), 0);
-    }
-
-    #[test]
-    fn word_start_only_spaces() {
-        assert_eq!(find_last_word_start("   "), 0);
     }
 
     #[test]

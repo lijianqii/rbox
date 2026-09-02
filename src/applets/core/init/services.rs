@@ -352,8 +352,7 @@ pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
         ));
         return;
     }
-    svc.next_restart_at =
-        Some(now + std::time::Duration::from_secs(svc.restart_sec));
+    svc.next_restart_at = Some(now + std::time::Duration::from_secs(svc.restart_sec));
 }
 
 /// 重新拉起服务（自动重启与手动 start 共用）。
@@ -373,10 +372,7 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
     svc.pgid = svc.child.as_ref().map(|c| c.id());
     svc.waiting_daemonize = svc.child.is_some();
     svc.daemonize_deadline = if svc.waiting_daemonize {
-        Some(
-            std::time::Instant::now()
-                + std::time::Duration::from_secs(svc.timeout_start_sec),
-        )
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_start_sec))
     } else {
         None
     };
@@ -398,8 +394,7 @@ pub(crate) fn run_command_with_timeout(argv: &[String], timeout_secs: u64) -> bo
         Ok(c) => c,
         Err(_) => return false,
     };
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return true,
@@ -598,9 +593,15 @@ mod tests {
             svc.next_restart_at = None;
             schedule_restart(&mut svc, true);
             if attempt <= 5 {
-                assert!(svc.next_restart_at.is_some(), "attempt {attempt} should restart");
+                assert!(
+                    svc.next_restart_at.is_some(),
+                    "attempt {attempt} should restart"
+                );
             } else {
-                assert!(svc.next_restart_at.is_none(), "attempt {attempt} should give up");
+                assert!(
+                    svc.next_restart_at.is_none(),
+                    "attempt {attempt} should give up"
+                );
             }
         }
         assert_eq!(svc.fail_count, 6);
@@ -610,8 +611,7 @@ mod tests {
     fn restart_window_resets_after_interval() {
         let mut svc = test_svc("t.service", true);
         svc.fail_count = 5;
-        svc.first_failure_at =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
+        svc.first_failure_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
         svc.next_restart_at = None;
         schedule_restart(&mut svc, true);
         // 时间窗过期 → 计数重置 → 本次失败计数为 1（允许重启）

@@ -28,7 +28,7 @@ trap cleanup EXIT
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
 # 注意：整个命令块在外层 bash -c '...' 单引号中，内部 printf 必须用双引号，
 #       $ 需转义为 \$，单引号用 \x27 代替，避免破坏外层引号。
-OUT=$(timeout 200 bash -c '
+OUT=$(timeout 300 bash -c '
 {
   sleep 15
   # 基本 applet

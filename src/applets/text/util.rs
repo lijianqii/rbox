@@ -11,12 +11,16 @@ pub(crate) fn parse_n_files<'a>(args: &'a [String], app: &str) -> (usize, Vec<&'
             "-n" => {
                 i += 1;
                 if i < args.len() {
-                    n = args[i].parse().unwrap_or(10);
+                    match args[i].parse() {
+                        Ok(v) => n = v,
+                        Err(_) => eprintln!("{}: invalid number: {}", app, args[i]),
+                    }
                 }
             }
-            s if s.starts_with("-n") && s.len() > 2 => {
-                n = s[2..].parse().unwrap_or(10);
-            }
+            s if s.starts_with("-n") && s.len() > 2 => match s[2..].parse() {
+                Ok(v) => n = v,
+                Err(_) => eprintln!("{}: invalid number: {}", app, &s[2..]),
+            },
             "-" => {}
             s if s.starts_with('-') && s.len() > 1 => {
                 eprintln!("{}: unknown option: {}", app, s);
@@ -38,9 +42,10 @@ pub(crate) fn each_input(
 ) -> bool {
     let mut ok = true;
     if files.is_empty() {
-        let mut buf = String::new();
-        if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
-            f(&buf, out);
+        let mut buf = Vec::new();
+        if std::io::stdin().lock().read_to_end(&mut buf).is_ok() {
+            let content = String::from_utf8_lossy(&buf);
+            f(&content, out);
         } else {
             ok = false;
         }
@@ -49,8 +54,11 @@ pub(crate) fn each_input(
             if files.len() > 1 {
                 let _ = writeln!(out, "==> {} <==", file);
             }
-            match std::fs::read_to_string(file) {
-                Ok(content) => f(&content, out),
+            match std::fs::read(file) {
+                Ok(bytes) => {
+                    let content = String::from_utf8_lossy(&bytes);
+                    f(&content, out);
+                }
                 Err(e) => {
                     eprintln!("{}: {}: {}", app, file, e);
                     ok = false;

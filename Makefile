@@ -15,6 +15,12 @@ PROFILE  := release
 ROOTFS   := rootfs
 KERNEL   := kernel
 INITRD   := initramfs.cpio.gz
+# 内核版本与源码下载源（本地无 tarball 时从清华开源镜像站自动下载）
+KERNEL_VERSION := 6.12.36
+KERNEL_TARBALL := linux-$(KERNEL_VERSION).tar.xz
+KERNEL_URL := https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/$(KERNEL_TARBALL)
+# 可选：设置后下载/复用 tarball 前做 sha256 校验（供应链加固；留空则跳过）
+KERNEL_SHA256 ?=
 QEMU     := qemu-system-aarch64
 QEMU_OPTS := -M virt -cpu cortex-a72 -m 128M -nographic
 QEMU_KCMD := console=ttyAMA0 rdinit=/init
@@ -29,7 +35,7 @@ GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc
 # applet 列表：从 rbox --list 自动提取，避免与 src/applet.rs 手动同步
 APPLETS := $(shell cargo run --target x86_64-unknown-linux-gnu --quiet -- --list 2>/dev/null)
 
-.PHONY: all build strip rootfs initramfs rootfs-test run test unittest verify kernel clean help
+.PHONY: all build strip rootfs initramfs rootfs-test run test unittest verify fmt kernel clean help
 
 all: build rootfs initramfs
 
@@ -106,12 +112,47 @@ test: initramfs
 	@bash tests/run_tests.sh
 
 # ─── 内核编译 ────────────────────────────────────
+# 幂等：
+#   1) 若 kernel/ 源码不存在（无 Makefile），先用 xz -t 校验根目录已有的 tarball，
+#      校验通过则复用，损坏/缺失则自动从清华开源镜像站下载并解压到 kernel/
+#      （--strip-components=1 去掉顶层目录）；若设置 KERNEL_SHA256 则额外做 sha256 校验
+#   2) 若 .config 不存在才生成 defconfig（避免覆盖已有配置）
+#   3) 若 Image 不存在才编译（已存在则跳过）
 kernel:
-	cd $(KERNEL) && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-	cd $(KERNEL) && make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$$(nproc) Image
+	@if [ ! -f $(KERNEL)/Makefile ]; then \
+		if [ -f $(KERNEL_TARBALL) ] && xz -t $(KERNEL_TARBALL) >/dev/null 2>&1; then \
+			echo "使用本地内核源码包: $(KERNEL_TARBALL)"; \
+		else \
+			[ -f $(KERNEL_TARBALL) ] && echo "本地内核包损坏/缺失，重新下载" || echo "内核源码缺失，从清华镜像站下载: $(KERNEL_URL)"; \
+			rm -f $(KERNEL_TARBALL); \
+			(wget -q -O $(KERNEL_TARBALL) $(KERNEL_URL) || curl -fsSL -o $(KERNEL_TARBALL) $(KERNEL_URL)) || { echo "下载失败" >&2; exit 1; }; \
+		fi; \
+		if [ -n "$(KERNEL_SHA256)" ]; then \
+			echo "校验内核源码包 (sha256) ..."; \
+			echo "$(KERNEL_SHA256)  $(KERNEL_TARBALL)" | sha256sum -c - >/dev/null 2>&1 || { echo "校验和不符，已删除，请重新运行 make kernel" >&2; rm -f $(KERNEL_TARBALL); exit 1; }; \
+		fi; \
+		echo "解压内核源码到 $(KERNEL)/ ..."; \
+		tar -xf $(KERNEL_TARBALL) -C $(KERNEL) --strip-components=1 || { echo "解压失败" >&2; rm -f $(KERNEL_TARBALL); exit 1; }; \
+	fi
+	@if [ ! -f $(KERNEL)/.config ]; then \
+		echo "生成内核默认配置 (defconfig) ..."; \
+		cd $(KERNEL) && $(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig; \
+	else \
+		echo "内核配置已存在，跳过 defconfig"; \
+	fi
+	@if [ ! -f $(KERNEL)/arch/arm64/boot/Image ]; then \
+		echo "编译内核镜像 (Image) ..."; \
+		cd $(KERNEL) && $(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$$(nproc) Image; \
+	else \
+		echo "内核镜像已存在: $(KERNEL)/arch/arm64/boot/Image"; \
+	fi
+
+# ─── 格式检查 ──────────────────────────────────────
+fmt:
+	cargo fmt --check
 
 # ─── 验证（CI 用）────────────────────────────────
-verify: check clippy unittest
+verify: check clippy fmt unittest
 
 check:
 	cargo check --target x86_64-unknown-linux-gnu
@@ -137,6 +178,7 @@ help:
 	@echo "  make run       - QEMU 启动"
 	@echo "  make test      - 集成测试"
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"
-	@echo "  make verify    - check + clippy + unittest（CI 用）"
-	@echo "  make kernel    - 编译 ARM64 内核"
+	@echo "  make fmt       - cargo fmt --check 格式检查"
+	@echo "  make verify    - check + clippy + fmt + unittest（CI 用）"
+	@echo "  make kernel    - 编译 ARM64 内核（源码缺失时自动从清华镜像下载）"
 	@echo "  make clean     - 清理产物"

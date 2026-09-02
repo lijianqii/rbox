@@ -21,7 +21,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、370 个单元测试、106 个集成断言、rustfmt、make strip
+- **工程化**：Clippy 零警告、376 个单元测试、106 个集成断言、rustfmt、make strip
 
 ## 快速开始
 
@@ -30,7 +30,7 @@ make all       # 交叉编译 + rootfs + initramfs
 make run       # QEMU 全系统模拟启动
 make test      # 集成测试（QEMU 自动化验证）
 make unittest  # 宿主机单元测试
-make verify    # check + clippy + unittest 一键验证
+make verify    # check + clippy + fmt + unittest 一键验证
 ```
 
 依赖：Rust 工具链（`rustup target add aarch64-unknown-linux-gnu`）、

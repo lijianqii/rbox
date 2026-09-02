@@ -203,10 +203,7 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
             Ok(child) => children.push(child),
             Err(e) => {
                 eprintln!("shell: {}: {}", cmd.argv[0], e);
-                // 关闭未消费的 pipe stdout，避免 fd 泄漏
-                for child in &mut children {
-                    child.stdout = None;
-                }
+                cleanup_spawned_children(&mut children);
                 return 127;
             }
         }
@@ -320,6 +317,20 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
     last_code
 }
 
+/// 管道中途 spawn 失败时，终止并回收已经成功启动的子进程，避免残留进程/僵尸。
+fn cleanup_spawned_children(children: &mut [Child]) {
+    for child in children {
+        // 前台子进程通过 pre_exec 创建了独立进程组；尽量整组清理。
+        // 后台子进程可能仍在 shell 进程组中，此时负 pid kill 会失败，回退 child.kill()。
+        let pid = child.id() as i32;
+        let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if rc != 0 {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
+
 /// 注册 SIGCHLD 处理器：自动回收后台僵尸子进程。
 /// 前台命令等待期间主线程用 pthread_sigmask 屏蔽 SIGCHLD，此时处理器不执行，
 /// 前台子进程由 child.wait() 收割，后台僵尸在等待结束后统一回收。
@@ -416,5 +427,15 @@ mod tests {
         let (program, args) = resolve_command("nonexistent_cmd_xyz");
         assert!(program.contains("rbox") || program.contains("cargo"));
         assert_eq!(args, vec!["nonexistent_cmd_xyz"]);
+    }
+
+    #[test]
+    fn cleanup_spawned_children_terminates() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("100")
+            .spawn()
+            .unwrap();
+        cleanup_spawned_children(std::slice::from_mut(&mut child));
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

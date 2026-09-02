@@ -228,7 +228,7 @@ fn append_history(line: &str) {
 }
 
 /// 执行 source 命令：逐行读取文件并执行。
-fn source_file(path: &str, last_rc: &mut i32, history: &mut Vec<String>) -> i32 {
+fn source_file(path: &str, last_rc: &mut i32, history: &mut [String]) -> i32 {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -244,11 +244,8 @@ fn source_file(path: &str, last_rc: &mut i32, history: &mut Vec<String>) -> i32 
         *last_rc = executor::execute_line(line, last_rc, history, |_rc: i32| {
             // source 中不支持 exit
         });
-        // 追加历史
-        if !line.is_empty() && history.last() != Some(&line.to_string()) {
-            history.push(line.to_string());
-            append_history(line);
-        }
+        // 注意：source 的行不应进入交互式历史（与 bash 一致），
+        // 否则 /etc/profile 等启动脚本会污染 `history` 输出与 `!n` 历史索引。
     }
     *last_rc
 }
@@ -667,5 +664,22 @@ mod tests {
     #[test]
     fn continuation_plain_line() {
         assert!(!needs_continuation("echo hello"));
+    }
+
+    // ─── source 历史隔离 ────────────────────────
+
+    #[test]
+    fn source_file_does_not_add_to_history() {
+        let dir = std::env::temp_dir().join(format!("rbox_source_hist_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s.sh");
+        std::fs::write(&f, "echo hi\n").unwrap();
+        let mut rc = 0;
+        let mut history = vec!["pre-existing".to_string()];
+        let ret = source_file(f.to_str().unwrap(), &mut rc, &mut history);
+        assert_eq!(ret, 0);
+        // source 的行不应进入交互式历史
+        assert_eq!(history, vec!["pre-existing".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,8 +2,8 @@
 
 use crate::applets::core::control::STATUS_SOCKET;
 use crate::applets::core::init::services::{
-    ServiceInstance, EXEC_COMMAND_TIMEOUT, parse_environment, respawn_service, run_command_with_timeout,
-    start_forking_service, start_service, stop_service_instance,
+    EXEC_COMMAND_TIMEOUT, ServiceInstance, parse_environment, respawn_service,
+    run_command_with_timeout, start_forking_service, start_service, stop_service_instance,
 };
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;

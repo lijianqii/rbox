@@ -59,7 +59,19 @@ sudo apt install libelf-dev flex bison bc cpio libssl-dev
 
 ### 内核编译
 
-内核源码放在 kernel/ 目录（Linux 6.12.36 LTS），使用 defconfig：
+内核源码放在 kernel/ 目录（Linux 6.12.36 LTS），使用 defconfig。`make kernel`
+为幂等目标：若 `kernel/` 源码缺失（无 Makefile），先用 `xz -t` 校验根目录已有的
+`linux-6.12.36.tar.xz`，校验通过则复用，损坏/缺失则自动从**清华开源镜像站**
+(`https://mirrors.tuna.tsinghua.edu.cn/kernel/v6.x/linux-6.12.36.tar.xz`)
+下载并解压到 `kernel/`（下载或解压失败会自动删除损坏包以便下次重试）；若设置了
+`KERNEL_SHA256` 还会做 sha256 校验。随后仅在 `.config` 缺失时生成 defconfig、
+仅在 `Image` 缺失时编译。
+
+```bash
+make kernel   # 源码缺失时自动下载清华镜像并编译，已存在则跳过对应步骤
+```
+
+也可手动分步：
 
 ```bash
 cd kernel
@@ -275,7 +287,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | Delete | 删除光标处字符 |
 | ESC [N~ | Home/End/Delete 的数字编码变体 |
 
-**命令历史**：`history: Vec<String>` 存储已执行命令（非空且与最后一条不同才入栈）。上键（\x1b[A）向上翻阅历史，下键（\x1b[B）向下翻阅，回到最新后恢复原始行。进入历史模式前保存当前行（`saved_line`），退出历史模式时恢复。
+**命令历史**：`history: Vec<String>` 存储已执行命令（非空且与最后一条不同才入栈）。`source`/`/etc/profile` 中的行**不进入交互历史**（与 bash 一致），避免污染 `history` 输出与 `!n` 历史索引。上键（\x1b[A）向上翻阅历史，下键（\x1b[B）向下翻阅，回到最新后恢复原始行。进入历史模式前保存当前行（`saved_line`），退出历史模式时恢复。
 
 **光标移动**：维护 `cursor: usize`（字节偏移），左键（\x1b[D）/右键（\x1b[C）移动时按 UTF-8 字符边界对齐。插入/删除字符在光标处操作，而非末尾。`redraw()` 用 `\r\x1b[K` 清除当前行后重绘，并用 `\x1b[NC` 将光标定位到正确位置。
 
@@ -421,7 +433,7 @@ shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u
 
 ### source 内置命令
 
-`source file` 或 `. file`：逐行读取文件并执行，跳过空行和 `#` 注释行。不支持 `exit`（source 中直接 return）。
+`source file` 或 `. file`：逐行读取文件并执行，跳过空行和 `#` 注释行。不支持 `exit`（source 中直接 return）。被 source 的行不会写入交互式历史/历史文件。
 
 ### stderr 重定向
 
@@ -481,8 +493,8 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop；`Console = true` 的服务作为前台 console 等待
 6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`，供 rbox status / rservice 使用）；检测关机标志
 
-`Type=` 目前仅支持 `simple`，遇到其他值会打印警告并按 simple 处理。
-`Restart=` 目前仅支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
+`Type=` 目前支持 `simple` 与 `forking`；其他值会打印警告并按 simple 处理。
+`Restart=` 目前支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
 
 关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。
 
@@ -649,23 +661,23 @@ make unittest
 |------|------|------|
 | shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 29 |
 | shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 30 |
-| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知）、expand_tilde、expand_glob（* ? []） | 36 |
+| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知/UTF-8 保留）、expand_tilde、expand_glob（* ? []） | 37 |
 | shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 29 |
 | shell/builtin | cd、exit（8 位截断）、export、unset、pwd、history 内置命令 | 18 |
 | shell/reader | make_prompt（PS1 展开）、display_width（CJK/全角宽度）、set_isig | 16 |
-| shell/executor | 重定向打开、命令解析回退 | 5 |
+| shell/executor | 重定向打开、命令解析回退、管道失败清理 | 6 |
 | shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 7 |
-| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation | 11 |
+| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation、source 历史隔离 | 12 |
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 15 |
 | init/server | 控制协议处理 | 8 |
 | init/services | 服务生命周期、schedule_restart、finish_daemonize | 10 |
 | init/mount | fstab 挂载 | 5 |
 | init/mod | failed_required_dep、compute_next_timeout | 6 |
-| text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 3、util 4 | 64 |
-| file/* | ls 12、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 51 |
+| text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
+| file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1 | 10 |
-| **合计** | | **370** |
+| **合计** | | **376** |
 
 测试结果示例：
 
@@ -838,10 +850,10 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（370 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（376 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
-| Makefile verify 目标 | check + clippy + unittest 一键验证 | ✅ 已实现 |
+| Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
 | Makefile APPLETS 自动同步 | 从 cargo run --list 提取 applet 列表 | ✅ 已实现 |
 | 共享工具提取 | file/util.rs（remove_recursive/is_dir/resolve_dest/copy_recursive） | ✅ 已实现 |
 | applet --help 支持 | `rbox <applet> --help` 打印帮助 | ✅ 已实现 |

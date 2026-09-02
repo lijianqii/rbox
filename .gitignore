@@ -13,3 +13,6 @@
 # Linux 内核源码与编译产物（体积大，由 make kernel 从源码包构建）
 /kernel
 /linux-*.tar.xz
+
+# 第三方 agent/任务缓存（非构建产物）
+/.reasonix/

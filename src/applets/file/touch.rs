@@ -95,16 +95,14 @@ mod tests {
 }
 
 fn touch_one(path: &str) -> io::Result<()> {
-    // 确保文件存在（目录跳过创建，仅更新时间戳）
-    match OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(path)
-    {
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::IsADirectory => {}
-        Err(e) => return Err(e),
+    // 已存在（包括目录、符号链接）直接更新时间戳；不存在才创建空文件。
+    // 这样可以避免对只读文件因 open(O_WRONLY) 失败而无法 touch。
+    if std::fs::symlink_metadata(path).is_err() {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
     }
 
     // 设置修改/访问时间为当前时间

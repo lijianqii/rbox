@@ -41,14 +41,16 @@ impl Applet for Grep {
                 };
 
                 if files.is_empty() {
-                    let mut buf = String::new();
-                    if std::io::stdin().lock().read_to_string(&mut buf).is_ok() {
-                        search(&buf, None);
+                    let mut buf = Vec::new();
+                    if std::io::stdin().lock().read_to_end(&mut buf).is_ok() {
+                        let content = String::from_utf8_lossy(&buf);
+                        search(&content, None);
                     }
                 } else {
                     for f in &files {
-                        match std::fs::read_to_string(f) {
-                            Ok(content) => {
+                        match std::fs::read(f) {
+                            Ok(bytes) => {
+                                let content = String::from_utf8_lossy(&bytes);
                                 let fname = if multi { Some(f.as_str()) } else { None };
                                 search(&content, fname);
                             }

@@ -114,13 +114,14 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
     let mut in_squote = false;
 
     while i < bytes.len() {
-        if bytes[i] == b'\'' {
+        let ch = line[i..].chars().next().unwrap();
+        if ch == '\'' {
             in_squote = !in_squote;
-            result.push('\'');
-            i += 1;
+            result.push(ch);
+            i += ch.len_utf8();
             continue;
         }
-        if !in_squote && bytes[i] == b'!' && i + 1 < bytes.len() {
+        if !in_squote && ch == '!' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             match next {
                 b'!' => {
@@ -177,8 +178,8 @@ pub fn expand_history(line: &str, history: &[String]) -> String {
                 _ => {}
             }
         }
-        result.push(bytes[i] as char);
-        i += 1;
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result
@@ -419,6 +420,17 @@ mod tests {
         assert_eq!(
             expand_history("echo 'a' !!", &history),
             "echo 'a' echo hello"
+        );
+    }
+
+    #[test]
+    fn hist_utf8_with_bang_preserved() {
+        let history = vec!["echo 你好".to_string()];
+        // 非 ASCII 字符应原样保留，不被按字节拆坏
+        assert_eq!(expand_history("echo 你好!", &history), "echo 你好!");
+        assert_eq!(
+            expand_history("echo 你好!!", &history),
+            "echo 你好echo 你好"
         );
     }
 

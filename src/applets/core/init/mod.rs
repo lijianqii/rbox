@@ -240,7 +240,10 @@ impl Applet for Init {
 
 /// 检查单元的 Requires 依赖中是否有启动失败的，返回第一个失败依赖名。
 /// After 仅排序，不参与失败传播。
-fn failed_required_dep<'a>(unit: &'a Unit, started_ok: &HashMap<String, bool>) -> Option<&'a String> {
+fn failed_required_dep<'a>(
+    unit: &'a Unit,
+    started_ok: &HashMap<String, bool>,
+) -> Option<&'a String> {
     unit.unit
         .requires
         .iter()
@@ -536,8 +539,7 @@ fn reap_with_shutdown(
                     units,
                 );
             }
-        } else if n < 0
-            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
             // 非 EINTR 的 poll 错误：短暂休眠避免忙循环
             std::thread::sleep(std::time::Duration::from_millis(200));
@@ -654,11 +656,8 @@ mod tests {
             .map(|r| format!("\"{}\"", r))
             .collect::<Vec<_>>()
             .join(", ");
-        let mut u: Unit = toml::from_str(&format!(
-            "[Unit]\nName = \"t\"\nRequires = [{}]\n",
-            quoted
-        ))
-        .unwrap();
+        let mut u: Unit =
+            toml::from_str(&format!("[Unit]\nName = \"t\"\nRequires = [{}]\n", quoted)).unwrap();
         u.name = "t".to_string();
         u
     }
@@ -697,8 +696,7 @@ mod tests {
     #[test]
     fn timeout_uses_earliest_restart() {
         let mut svc = test_svc("a.service", true);
-        svc.next_restart_at =
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        svc.next_restart_at = Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
         let t = compute_next_timeout(&[svc]);
         assert!((1800..=2000).contains(&t), "timeout={t}");
     }

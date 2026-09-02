@@ -9,7 +9,7 @@ BusyBox 风格 multi-call 二进制（Rust, edition 2024），交叉编译为 aa
 注意：`.cargo/config.toml` 把默认 target 设为 aarch64，宿主机上跑 Rust 命令必须显式
 加 `--target x86_64-unknown-linux-gnu`。
 
-- `make verify` — CI 一键：`cargo check` + `cargo clippy -- -D warnings` + `make unittest`
+- `make verify` — CI 一键：`cargo check` + `cargo clippy -- -D warnings` + `cargo fmt --check` + `make unittest`
 - `make unittest` — 宿主机单元测试：`cargo test --target x86_64-unknown-linux-gnu`
 - `make all` — 交叉编译(release) + rootfs + initramfs.cpio.gz（`make build`/`rootfs`/`initramfs` 分步）
 - `make run` — QEMU 启动（需先 `make kernel`；退出 Ctrl-A X）
@@ -38,7 +38,7 @@ BusyBox 风格 multi-call 二进制（Rust, edition 2024），交叉编译为 aa
 - 新增 applet：在对应分组（core/file/text/sys）加模块，实现 `Applet`，并在
   `src/applet.rs` 的 `declare_applets!` 加一行注册（Makefile 的 applet 列表由 `rbox --list` 自动提取）
 - 注释、文档、错误消息用中文；标识符/路径/命令保持英文
-- Clippy 必须零警告（`-D warnings`）；格式用 rustfmt（rustfmt.toml）
+- Clippy 必须零警告（`-D warnings`）；格式用 rustfmt（rustfmt.toml），`make verify` 会执行 `cargo fmt --check`
 - applet 以 `ExitCode` 返回退出码；解析 `&[String]` 参数
 - 宿主机单元测试（`#[cfg(test)]` 或 tests/）须在 x86_64 上跑，勿依赖 ARM64 交叉环境
 - 新增 applet/功能时：同时补 `#[cfg(test)]` 单元测试与 `tests/run_tests.sh` 断言
