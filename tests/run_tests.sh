@@ -10,6 +10,7 @@ cd "$(dirname "$0")/.."
 
 KERNEL=kernel/arch/arm64/boot/Image
 TEST_INITRD=initramfs.test.cpio.gz
+INITRD=initramfs.cpio.gz
 QEMU="qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic"
 APPEND="console=ttyAMA0 rdinit=/init"
 
@@ -23,6 +24,50 @@ cleanup() {
     rm -f "$TEST_INITRD"
 }
 trap cleanup EXIT
+
+# 断言输出包含某字符串（QEMU 串口输出为 CRLF，先去除 \r 再匹配）
+assert_contains_in() {
+    local out="$1"
+    local desc="$2"
+    local pattern="$3"
+    if echo "$out" | tr -d '\r' | grep -q "$pattern"; then
+        echo "  PASS  $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  $desc (期望包含: '$pattern')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+assert_contains() {
+    assert_contains_in "$OUT" "$1" "$2"
+}
+
+# ─── rgetty/rlogin 登录流程（使用生产 initramfs，console 为 rgetty）───
+# 放在主会话之前：机器空闲时先跑短会话，避免连续两个 QEMU 负载叠加。
+# 验证：登录提示、错误密码拒绝、登录后 shell 可用、shell 退出后 init
+# respawn 重新登录。
+echo ""
+echo "[rgetty/rlogin 登录流程]"
+LOGIN_OUT=$(timeout 150 bash -c '
+{
+  sleep 18
+  printf "root\n"; sleep 2
+  printf "wrongpass\n"; sleep 2
+  printf "root\n"; sleep 2
+  printf "root\n"; sleep 2
+  printf "echo LOGIN_OK\n"; sleep 1
+  printf "exit\n"; sleep 3
+  printf "root\n"; sleep 2
+  printf "root\n"; sleep 2
+  printf "echo LOGIN_AGAIN\n"; sleep 1
+  printf "shutdown\n"; sleep 8
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel '"$KERNEL"' -initrd '"$INITRD"' -append '"'$APPEND'"'
+' 2>&1) || true
+assert_contains_in "$LOGIN_OUT" "rgetty 登录提示" "rbox login:"
+assert_contains_in "$LOGIN_OUT" "错误密码被拒绝" "Login incorrect"
+assert_contains_in "$LOGIN_OUT" "登录后 shell 可用" "LOGIN_OK"
+assert_contains_in "$LOGIN_OUT" "退出后重新登录" "LOGIN_AGAIN"
 
 # 单次 QEMU 运行所有测试命令
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
@@ -179,26 +224,13 @@ OUT=$(timeout 300 bash -c '
   printf "echo intr_rc=\$?\n"; sleep 0.5
   # 25. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
   printf "echo before_reboot\n"; sleep 0.5
-  printf "reboot\n"; sleep 30
+  printf "reboot\n"; sleep 35
   printf "echo after_reboot\n"; sleep 0.5
   # 关机
-  printf "shutdown\n"; sleep 10
+  printf "shutdown\n"; sleep 12
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel '"$KERNEL"' -initrd '"$TEST_INITRD"' -append "'"$APPEND"'"
 ' 2>&1) || true
-
-# 断言输出包含某字符串（QEMU 串口输出为 CRLF，先去除 \r 再匹配）
-assert_contains() {
-    local desc="$1"
-    local pattern="$2"
-    if echo "$OUT" | tr -d '\r' | grep -q "$pattern"; then
-        echo "  PASS  $desc"
-        PASS=$((PASS + 1))
-    else
-        echo "  FAIL  $desc (期望包含: '$pattern')"
-        FAIL=$((FAIL + 1))
-    fi
-}
 
 echo "========================================"
 echo "rbox 集成测试"

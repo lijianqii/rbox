@@ -94,11 +94,20 @@ run: initramfs
 # 然后清理注入的文件，生产 rootfs 保持干净。
 rootfs-test: rootfs
 	@echo "注入测试服务单元..."
+	# 备份会被测试单元覆盖的生产单元（如 console-shell），打包后恢复
+	@for f in $(notdir $(wildcard $(TEST_UNITS))); do \
+		if [ -f $(ROOTFS)/etc/rbox/system/$$f ]; then \
+			cp $(ROOTFS)/etc/rbox/system/$$f /tmp/rbox_unit_bak_$$f; \
+		fi; \
+	done
 	cp $(TEST_UNITS) $(ROOTFS)/etc/rbox/system/
 	cd $(ROOTFS) && find . | cpio -o -H newc 2>/dev/null | gzip > ../$(TEST_INITRD)
 	@echo "清理注入的测试服务..."
 	@for f in $(notdir $(wildcard $(TEST_UNITS))); do \
 		rm -f $(ROOTFS)/etc/rbox/system/$$f; \
+		if [ -f /tmp/rbox_unit_bak_$$f ]; then \
+			mv /tmp/rbox_unit_bak_$$f $(ROOTFS)/etc/rbox/system/$$f; \
+		fi; \
 	done
 	@echo "测试 initramfs 构建完成: $(TEST_INITRD) ($$(du -h $(TEST_INITRD) | cut -f1))"
 

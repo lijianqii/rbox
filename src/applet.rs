@@ -40,6 +40,8 @@ declare_applets! {
     crate::applets::sys::uname::UNAME,
     crate::applets::core::init::INIT,
     crate::applets::core::shell::SHELL,
+    crate::applets::core::getty::GETTY,
+    crate::applets::core::login::LOGIN,
     crate::applets::file::ls::LS,
     crate::applets::file::cp::CP,
     crate::applets::file::mv::MV,

@@ -1,13 +1,11 @@
 [Unit]
-Description = "Console shell"
+Description = "Console login (rgetty)"
 Name = "console-shell"
 
 [Service]
 Type = "simple"
-ExecStart = "/bin/sh"
+ExecStart = "/bin/rgetty"
 Console = true
-# 标记 console shell 环境，集成测试用它验证 shell respawn 后配置保留
-Environment = ["RBOX_CONSOLE=1"]
 
 [Install]
 WantedBy = ["default.target"]

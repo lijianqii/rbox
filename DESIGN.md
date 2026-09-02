@@ -103,6 +103,8 @@ rbox/
 │       │   │   └── syscall.rs  # libc 系统调用封装
 │       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
 │       │   ├── shell/       # 命令解释器（模块目录：mod/tokenizer/parser/expander/completion/builtin/executor/reader/types）
+│       │   ├── getty.rs    # rgetty（终端登录提示，exec rlogin）
+│       │   ├── login.rs    # rlogin（密码校验、降权、exec 用户 shell）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
 │       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
@@ -176,7 +178,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 29 个 applet：
+共 31 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -209,6 +211,8 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 27 | dirname | dirname PATH | 取目录部分 |
 | 28 | status | status [unit] | 通过 unix socket 查询 init 服务状态 |
 | 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
+| 30 | rgetty | rgetty [TTY] | 终端登录提示，读取用户名后 exec rlogin（由 init Console 服务拉起） |
+| 31 | rlogin | rlogin [username] | 校验密码（/etc/passwd + /etc/shadow），成功后降权并 exec 用户 shell |
 ## Shell
 
 文件：src/applets/core/shell/（模块目录，含单元测试）
@@ -340,7 +344,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 28 个测试组、106 个断言（涵盖 29 个 applet、Shell 全功能、init 服务管理、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 29 个测试组、110 个断言（涵盖 31 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -370,9 +374,10 @@ enum Token {
 | here-doc | <<EOF | 1 |
 | console respawn | 初始环境变量、exit 后 respawn 保留配置 | 2 |
 | 前台 Ctrl-C 中断 | sleep 被 SIGINT 中断，$?=130 | 1 |
+| rgetty/rlogin 登录 | 登录提示、错误密码拒绝、登录后 shell 可用、退出后重新登录 | 4 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **106** |
+| **合计** | | **110** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -444,6 +449,34 @@ shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u
 支持 `<<EOF` 语法。REPL 检测到 `<<` 后，提示 `> ` 逐行读取内容直到遇到 delimiter，写入临时文件 `/tmp/heredoc_<pid>`，然后替换为 `< /tmp/heredoc_<pid>` 执行。仅在交互式 tty 模式下可用。
 
 文件：src/applets/core/shell/executor.rs、src/applets/core/shell/reader.rs、src/applets/core/shell/mod.rs
+
+## 终端登录（rgetty / rlogin）
+
+文件：src/applets/core/getty.rs、src/applets/core/login.rs
+
+生产 rootfs 的 console 服务由原来的直接 shell 改为 `rgetty`，登录流程如下：
+
+```
+init ──Console=true 服务──► rgetty ──读取用户名──► exec rlogin ──校验通过──► exec 用户 shell
+                ▲                                                             │
+                └─────────────── 进程退出后由 init respawn ─────────────────────┘
+```
+
+- **rgetty**：打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
+  登录失败/shell 退出时进程结束，init 的 `Console = true` 机制自动重新拉起，回到登录提示。
+  支持 `rgetty [TTY]`（打开指定终端并 dup 到 stdin/stdout/stderr），启动时会把终端恢复为
+  行缓冲模式，避免残留 raw/cbreak 设置。
+- **rlogin**：无参数时先提示用户名；随后关闭回显读取密码。密码校验规则：
+  - `/etc/passwd` 密码字段为 `x` 时读取 `/etc/shadow`；空字段 = 免密登录，
+    `!`/`*` 开头 = 账户锁定，其余明文比对；
+  - `/etc/passwd` 密码字段为空 = 免密登录；其余明文比对。
+  （不引入 crypt 依赖，明文仅用于教学/嵌入式场景）
+  - 校验失败输出 `Login incorrect` 并延迟 1 秒后退出（由 init respawn 重新提示）；
+  - 校验通过后：initgroups/setgid/setuid 降权、chdir 到 home（失败回退 `/`）、设置
+    USER/LOGNAME/HOME/SHELL 环境变量、打印 `/etc/motd`，最后 exec 用户 shell。
+
+生产 rootfs 的账号数据：`/etc/passwd`（root/nobody，密码字段为 `x`）+
+`/etc/shadow`（root 密码明文 `root`；nobody 锁定 `!`）。
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
@@ -547,6 +580,9 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 | libc::uname | 获取系统信息 | uname.rs |
 | libc::time / localtime_r | 获取时间 | date.rs, ls.rs |
 | libc::utimensat | 设置文件时间戳 | touch.rs |
+| libc::dup2 | rgetty 把指定 tty 复制到 stdin/stdout/stderr | getty.rs |
+| libc::tcgetattr / tcsetattr | rgetty 恢复终端模式；rlogin 关闭密码回显 | getty.rs, login.rs |
+| libc::initgroups / setgid / setuid | rlogin 登录后降权 | login.rs |
 
 libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手动传递 magic number。
 
@@ -555,9 +591,9 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 | 文件 | 类型 | Name | 说明 |
 |------|------|------|------|
 | default.target.toml | target | default.target | 启动根节点（无 Name 字段，回退文件名） |
-| console-shell.service.toml | service | console-shell | ExecStart=/bin/rbox shell，Console=true 前台交互 shell |
+| console-shell.service.toml | service | console-shell | ExecStart=/bin/rgetty，Console=true 登录提示（登录成功后 exec shell） |
 
-测试专用服务（hello、restart-test、longrun、forktest、forktimeout、usertest）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理，不进入生产镜像。
+测试专用服务（hello、restart-test、longrun、forktest、forktimeout、usertest、console-shell 覆盖单元）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理并恢复被覆盖的生产单元，不进入生产镜像。
 
 ### fstab 挂载表
 
@@ -591,7 +627,7 @@ make test      # 集成测试
 |------|------|
 | make all | 编译 + 构建 rootfs + 打包 initramfs |
 | make build | 交叉编译 rbox（cargo build --target aarch64-unknown-linux-gnu --release） |
-| make rootfs | 拷贝 rbox 二进制 + 创建 29 个 applet 符号链接 + 拷贝 glibc 运行时 |
+| make rootfs | 拷贝 rbox 二进制 + 创建 31 个 applet 符号链接 + 拷贝 glibc 运行时 |
 | make initramfs | 将 rootfs/ 打包为 initramfs.cpio.gz（newc 格式 + gzip） |
 | make run | QEMU 全系统模拟启动 |
 | make strip | strip 符号表（1.4M -> 965K） |
@@ -637,7 +673,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 28 个测试组、106 个断言，覆盖全部 29 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 29 个测试组、110 个断言，覆盖全部 31 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -676,8 +712,8 @@ make unittest
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1 | 10 |
-| **合计** | | **376** |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 3、rlogin 10 | 23 |
+| **合计** | | **389** |
 
 测试结果示例：
 
@@ -690,6 +726,11 @@ rbox 集成测试
   PASS  uname -m -> aarch64
   PASS  uname -n -> 主机名
   ...
+[rgetty/rlogin 登录流程]
+  PASS  rgetty 登录提示
+  PASS  错误密码被拒绝
+  PASS  登录后 shell 可用
+  PASS  退出后重新登录
 [重启流程]
   PASS  reboot 触发有序关机
   PASS  重启后系统恢复
@@ -699,7 +740,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 106 通过, 0 失败
+结果: 110 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -730,10 +771,13 @@ rootfs/
 └── etc/
     ├── hostname                 # 主机名（init 启动时读取）
     ├── fstab                    # init 挂载表
+    ├── passwd                   # 用户账号（密码字段为 x，实际在 shadow）
+    ├── shadow                   # 影子密码（本项目为明文，root 密码为 root）
+    ├── motd                     # 登录成功后的欢迎信息
     └── rbox/
         └── system/              # init TOML 单元文件（生产：仅 default.target + console-shell）
             ├── default.target.toml
-            └── console-shell.service.toml
+            └── console-shell.service.toml   # ExecStart=/bin/rgetty，登录成功后 exec shell
 ```
 
 glibc 运行时从交叉编译器的 multiarch 库目录拷贝（用 `-print-file-name` 解析真实路径，`-print-sysroot` 在部分发行版上不可靠）：
@@ -850,7 +894,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（376 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（389 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
