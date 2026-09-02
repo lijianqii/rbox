@@ -344,7 +344,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 29 个测试组、110 个断言（涵盖 31 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 29 个测试组、111 个断言（涵盖 31 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -374,10 +374,10 @@ enum Token {
 | here-doc | <<EOF | 1 |
 | console respawn | 初始环境变量、exit 后 respawn 保留配置 | 2 |
 | 前台 Ctrl-C 中断 | sleep 被 SIGINT 中断，$?=130 | 1 |
-| rgetty/rlogin 登录 | 登录提示、错误密码拒绝、登录后 shell 可用、退出后重新登录 | 4 |
+| rgetty/rlogin 登录 | 登录提示、错误密码拒绝、登录后 shell 可用、串口自动识别、退出后重新登录 | 5 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **110** |
+| **合计** | | **111** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -464,8 +464,10 @@ init ──Console=true 服务──► rgetty ──读取用户名──► ex
 
 - **rgetty**：打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
   登录失败/shell 退出时进程结束，init 的 `Console = true` 机制自动重新拉起，回到登录提示。
-  支持 `rgetty [TTY]`（打开指定终端并 dup 到 stdin/stdout/stderr），启动时会把终端恢复为
-  行缓冲模式，避免残留 raw/cbreak 设置。
+  **终端选择优先级**：显式参数 `rgetty [TTY]` > `/sys/class/tty/console/active`
+  （内核实际激活的 console）> `/proc/cmdline` 的 `console=` 参数 > 继承父进程 stdio。
+  推导出的 tty 节点不存在时自动回退继承 stdio；因此换平台/换串口（ttyAMA0 ↔ ttyS0）
+  无需改配置。启动时会把终端恢复为行缓冲模式，避免残留 raw/cbreak 设置。
 - **rlogin**：无参数时先提示用户名；随后关闭回显读取密码。密码校验规则：
   - `/etc/passwd` 密码字段为 `x` 时读取 `/etc/shadow`；空字段 = 免密登录，
     `!`/`*` 开头 = 账户锁定，其余明文比对；
@@ -673,7 +675,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 29 个测试组、110 个断言，覆盖全部 31 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 29 个测试组、111 个断言，覆盖全部 31 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -712,8 +714,8 @@ make unittest
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 3、rlogin 10 | 23 |
-| **合计** | | **389** |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 8、rlogin 10 | 28 |
+| **合计** | | **394** |
 
 测试结果示例：
 
@@ -740,7 +742,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 110 通过, 0 失败
+结果: 111 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -894,7 +896,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（389 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（394 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

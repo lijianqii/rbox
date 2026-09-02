@@ -56,6 +56,7 @@ LOGIN_OUT=$(timeout 150 bash -c '
   printf "root\n"; sleep 2
   printf "root\n"; sleep 2
   printf "echo LOGIN_OK\n"; sleep 1
+  printf "ls -l /proc/self/fd/0\n"; sleep 1
   printf "exit\n"; sleep 3
   printf "root\n"; sleep 2
   printf "root\n"; sleep 2
@@ -67,6 +68,7 @@ LOGIN_OUT=$(timeout 150 bash -c '
 assert_contains_in "$LOGIN_OUT" "rgetty 登录提示" "rbox login:"
 assert_contains_in "$LOGIN_OUT" "错误密码被拒绝" "Login incorrect"
 assert_contains_in "$LOGIN_OUT" "登录后 shell 可用" "LOGIN_OK"
+assert_contains_in "$LOGIN_OUT" "rgetty 使用内核 console 串口" "0 -> /dev/ttyAMA0"
 assert_contains_in "$LOGIN_OUT" "退出后重新登录" "LOGIN_AGAIN"
 
 # 单次 QEMU 运行所有测试命令
