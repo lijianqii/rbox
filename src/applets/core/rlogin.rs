@@ -5,7 +5,9 @@
 //! 密码校验（/etc/passwd 密码字段为 `x` 时读取 /etc/shadow）：
 //! - 空密码字段：免密登录（任意输入均可）；
 //! - `!` / `*` 开头：账户锁定，拒绝登录；
-//! - 其余：明文比对（本项目不引入 crypt 依赖，仅适用于教学/嵌入式场景）。
+//! - `$5$...`（或任意 `$id$` 格式）：用 libc crypt() 校验（与 glibc/busybox 兼容，
+//!   支持 SHA-256/SHA-512/MD5 等）；
+//! - 其余：明文比对（兼容旧格式）。
 //!
 //! 校验通过后：initgroups/setgid/setuid 降权、chdir 到 home（失败回退 `/`）、
 //! 设置 USER/LOGNAME/HOME/SHELL 环境变量，最后 exec 用户的 shell。
@@ -162,26 +164,59 @@ fn read_shadow_password(user: &str) -> Option<String> {
 }
 
 /// 校验密码：
-/// - stored 为 `x`：读取 shadow 字段；空 = 免密，`!`/`*` = 锁定，否则明文比对；
+/// - stored 为 `x`：读取 shadow 字段；空 = 免密，`!`/`*` = 锁定，`$` 开头 = crypt 哈希，否则明文比对；
 /// - stored 为空：免密；
-/// - 其余：明文比对。
+/// - 其余：同上（`$` 开头走 crypt，否则明文比对）。
 pub(crate) fn password_matches(stored: &str, shadow: Option<&str>, input: &str) -> bool {
-    if stored == "x" || stored == "X" {
-        let Some(sp) = shadow else {
-            return false;
-        };
-        if sp.is_empty() {
-            return true;
+    // 实际密码串：passwd 字段为 x 时使用 shadow 字段
+    let actual = if stored == "x" || stored == "X" {
+        match shadow {
+            Some(sp) => sp,
+            None => return false,
         }
-        if sp.starts_with('!') || sp.starts_with('*') {
-            return false;
-        }
-        sp == input
-    } else if stored.is_empty() {
-        true
     } else {
-        stored == input
+        stored
+    };
+    if actual.is_empty() {
+        return true;
     }
+    if actual.starts_with('!') || actual.starts_with('*') {
+        return false;
+    }
+    if actual.starts_with('$') {
+        crypt_verify(input, actual)
+    } else {
+        actual == input
+    }
+}
+
+/// 用 libc crypt() 校验密码（glibc libcrypt，与 busybox/标准 shadow 兼容）。
+/// salt 传完整存储串（crypt 只解析其中的盐部分）。
+fn crypt_verify(password: &str, stored: &str) -> bool {
+    let p = match std::ffi::CString::new(password) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let s = match std::ffi::CString::new(stored) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let r = unsafe { crypt(p.as_ptr(), s.as_ptr()) };
+    if r.is_null() {
+        return false;
+    }
+    // crypt 返回指向静态缓冲区的指针，立即转换为 String 再比较
+    let hash = unsafe { std::ffi::CStr::from_ptr(r) };
+    hash.to_str().map(|h| h == stored).unwrap_or(false)
+}
+
+// libcrypt 的 crypt(3)：`$5$`/`$6$` 等标准密码哈希。
+#[link(name = "crypt")]
+unsafe extern "C" {
+    fn crypt(
+        passwd: *const std::ffi::c_char,
+        salt: *const std::ffi::c_char,
+    ) -> *mut std::ffi::c_char;
 }
 
 /// 认证：用户存在且密码正确时返回 passwd 条目。
@@ -339,5 +374,16 @@ locked:*LK*:19437:0:99999:7:::
     #[test]
     fn password_matches_empty_stored_is_free() {
         assert!(password_matches("", None, "anything"));
+    }
+
+    #[test]
+    fn password_matches_crypt_hash() {
+        // 由 `openssl passwd -5 -salt saltstring root` 生成的标准 SHA-256 crypt
+        let hash = "$5$saltstring$YFMF7yiQ9V9eCIH9D6jFVOaMhMNpjWG6qrbzxOBzQO8";
+        assert!(password_matches(hash, None, "root"));
+        assert!(!password_matches(hash, None, "wrong"));
+        // passwd 字段为 x + shadow 存哈希
+        assert!(password_matches("x", Some(hash), "root"));
+        assert!(!password_matches("x", Some(hash), "nope"));
     }
 }

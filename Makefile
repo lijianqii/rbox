@@ -67,6 +67,12 @@ rootfs: strip
 	cp -L $(GLIBC_DIR)/ld-linux-aarch64.so.1 $(ROOTFS)/lib/
 	cp -L $(GLIBC_DIR)/libc.so.6 $(ROOTFS)/lib/aarch64-linux-gnu/
 	cp -L $(GLIBC_DIR)/libgcc_s.so.1 $(ROOTFS)/lib/aarch64-linux-gnu/
+	# libcrypt（rlogin 的 crypt 密码校验依赖），用 -print-file-name 单独解析
+	CRYPT_LIB=$$(aarch64-linux-gnu-gcc -print-file-name=libcrypt.so.1 2>/dev/null); \
+	if [ -z "$$CRYPT_LIB" ] || [ ! -f "$$CRYPT_LIB" ]; then \
+		echo "错误: 找不到 libcrypt.so.1（aarch64-linux-gnu-gcc -print-file-name），rlogin 的 crypt 校验将无法工作" >&2; exit 1; \
+	fi; \
+	cp -L $$CRYPT_LIB $(ROOTFS)/lib/aarch64-linux-gnu/
 	@echo "rootfs 构建完成"
 
 # ─── 打包 initramfs ──────────────────────────────

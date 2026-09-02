@@ -462,23 +462,37 @@ init ──Console=true 服务──► rgetty ──读取用户名──► ex
                 └─────────────── 进程退出后由 init respawn ─────────────────────┘
 ```
 
-- **rgetty**：打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
+- **rgetty**：用法 `rgetty [-L] [-t SEC] [TTY]`。
+  - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
+  - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
+  - 打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
   登录失败/shell 退出时进程结束，init 的 `Console = true` 机制自动重新拉起，回到登录提示。
-  **终端选择优先级**：显式参数 `rgetty [TTY]` > `/sys/class/tty/console/active`
-  （内核实际激活的 console）> `/proc/cmdline` 的 `console=` 参数 > 继承父进程 stdio。
-  推导出的 tty 节点不存在时自动回退继承 stdio；因此换平台/换串口（ttyAMA0 ↔ ttyS0）
-  无需改配置。启动时会把终端恢复为行缓冲模式，避免残留 raw/cbreak 设置。
+  **终端选择优先级**：service 配置（`[Service] TTY = ...`，由 init 拼成命令行参数）>
+  `/sys/class/tty/console/active`（内核实际激活的 console）> `/proc/cmdline` 的
+  `console=` 参数 > 继承父进程 stdio。推导出的 tty 节点不存在时自动回退继承 stdio；
+  TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
 - **rlogin**：无参数时先提示用户名；随后关闭回显读取密码。密码校验规则：
   - `/etc/passwd` 密码字段为 `x` 时读取 `/etc/shadow`；空字段 = 免密登录，
-    `!`/`*` 开头 = 账户锁定，其余明文比对；
-  - `/etc/passwd` 密码字段为空 = 免密登录；其余明文比对。
-  （不引入 crypt 依赖，明文仅用于教学/嵌入式场景）
+    `!`/`*` 开头 = 账户锁定；
+  - 存储串以 `$` 开头（`$5$...` 等）：用 libc crypt() 校验（与 glibc/busybox 兼容，
+    支持 SHA-256/SHA-512/MD5）；其余按明文比对（兼容旧格式）。
   - 校验失败输出 `Login incorrect` 并延迟 1 秒后退出（由 init respawn 重新提示）；
   - 校验通过后：initgroups/setgid/setuid 降权、chdir 到 home（失败回退 `/`）、设置
     USER/LOGNAME/HOME/SHELL 环境变量、打印 `/etc/motd`，最后 exec 用户 shell。
 
 生产 rootfs 的账号数据：`/etc/passwd`（root/nobody，密码字段为 `x`）+
-`/etc/shadow`（root 密码明文 `root`；nobody 锁定 `!`）。
+`/etc/shadow`（root 密码为 SHA-256 crypt 哈希，明文是 `root`；nobody 锁定 `!`）。
+rootfs 携带 `libcrypt.so.1`（由 Makefile 从交叉工具链拷贝，rlogin 的 crypt 校验依赖）。
+
+`[Service] TTY` 字段示例（生产 console 单元，rgetty 第一优先级）：
+
+```toml
+[Service]
+Type = "simple"
+ExecStart = "/bin/rgetty -L -t 60"
+TTY = "ttyAMA0"        # init 拼到 ExecStart 末尾 → /bin/rgetty -L -t 60 ttyAMA0
+Console = true
+```
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
@@ -583,7 +597,9 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
 | libc::time / localtime_r | 获取时间 | date.rs, ls.rs |
 | libc::utimensat | 设置文件时间戳 | touch.rs |
 | libc::dup2 | rgetty 把指定 tty 复制到 stdin/stdout/stderr | rgetty.rs |
-| libc::tcgetattr / tcsetattr | rgetty 恢复终端模式；rlogin 关闭密码回显 | rgetty.rs, rlogin.rs |
+| libc::tcgetattr / tcsetattr | rgetty 恢复终端模式/CLOCAL；rlogin 关闭密码回显 | rgetty.rs, rlogin.rs |
+| libc::poll | rgetty 带超时读取用户名 | rgetty.rs |
+| crypt(3)（libcrypt） | rlogin 校验 $5$/$6$ 等密码哈希 | rlogin.rs |
 | libc::initgroups / setgid / setuid | rlogin 登录后降权 | rlogin.rs |
 
 libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手动传递 magic number。
@@ -714,8 +730,8 @@ make unittest
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 8、rlogin 10 | 28 |
-| **合计** | | **394** |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 13、rlogin 11 | 32 |
+| **合计** | | **401** |
 
 测试结果示例：
 
@@ -769,12 +785,13 @@ rootfs/
 │   ├── ld-linux-aarch64.so.1    # glibc 动态链接器
 │   └── aarch64-linux-gnu/       # multiarch 目录（glibc 默认搜索路径）
 │       ├── libc.so.6            # glibc
+│       ├── libcrypt.so.1        # crypt 密码校验（rlogin 依赖）
 │       └── libgcc_s.so.1        # GCC 运行时
 └── etc/
     ├── hostname                 # 主机名（init 启动时读取）
     ├── fstab                    # init 挂载表
     ├── passwd                   # 用户账号（密码字段为 x，实际在 shadow）
-    ├── shadow                   # 影子密码（本项目为明文，root 密码为 root）
+    ├── shadow                   # 影子密码（SHA-256 crypt，root 明文为 root）
     ├── motd                     # 登录成功后的欢迎信息
     └── rbox/
         └── system/              # init TOML 单元文件（生产：仅 default.target + console-shell）
@@ -896,7 +913,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（394 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（401 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

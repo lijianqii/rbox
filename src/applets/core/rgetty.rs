@@ -5,50 +5,124 @@
 //! rgetty，形成登录循环；登录成功时 rlogin 会继续 exec 用户 shell，
 //! shell 退出后同样由 init respawn，回到登录提示。
 //!
+//! 用法：`rgetty [-L] [-t SEC] [TTY]`
+//! - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
+//! - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
+//! - `TTY`：可写裸设备名（`ttyAMA0`）或完整路径（`/dev/ttyAMA0`）。
+//!
 //! 终端选择优先级：
-//! 1. 显式参数 `rgetty [TTY]`；
+//! 1. service 配置（`[Service] TTY = ...`，经 init 拼成命令行参数传入）；
 //! 2. 内核信息：`/sys/class/tty/console/active`（实际激活的 console），
 //!    回退解析 `/proc/cmdline` 的 `console=` 参数；
 //! 3. 以上均不可用时继承父进程的 stdin/stdout/stderr（init console 服务）。
 
 use crate::applet::Applet;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 
 pub struct Getty;
 pub static GETTY: &Getty = &Getty;
 
+/// rgetty 命令行选项。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct GettyOpts {
+    /// `-t SEC`：读取用户名的超时秒数；None 表示不超时。
+    pub(crate) timeout_secs: Option<u64>,
+    /// `-L`：设置 CLOCAL（忽略载波检测）。
+    pub(crate) clocal: bool,
+    /// 位置参数：指定的 tty（service 配置传入或命令行显式给出）。
+    pub(crate) tty: Option<String>,
+}
+
 impl Applet for Getty {
     fn name(&self) -> &'static str {
         "rgetty"
     }
     fn help(&self) -> &'static str {
-        "rgetty [TTY] - login prompt (tty auto-detected from kernel console)"
+        "rgetty [-L] [-t SEC] [TTY] - login prompt (tty from service config or kernel console)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
-        let explicit: Option<String> = args.first().cloned();
-        // 优先级：显式参数 > 内核实际激活的 console > console= 内核参数 > 继承 stdio
-        let tty = explicit
+        let opts = match parse_args(args) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("rgetty: {}", e);
+                eprintln!("usage: rgetty [-L] [-t SEC] [TTY]");
+                return ExitCode::FAILURE;
+            }
+        };
+        // 优先级：service/显式参数 > 内核实际激活的 console > console= 内核参数 > 继承 stdio
+        let tty = opts
+            .tty
             .clone()
             .or_else(active_console_tty)
             .or_else(console_tty_from_cmdline);
         if let Some(tty) = tty {
-            match setup_tty(&tty) {
+            let path = normalize_tty_path(&tty);
+            match setup_tty(&path) {
                 Ok(()) => {}
                 Err(e) => {
-                    if explicit.is_some() {
-                        // 显式指定的 tty 打不开：直接失败（由 init respawn）
-                        eprintln!("rgetty: cannot open {}: {}", tty, e);
+                    if opts.tty.is_some() {
+                        // service/显式指定的 tty 打不开：直接失败（由 init respawn）
+                        eprintln!("rgetty: cannot open {}: {}", path, e);
                         return ExitCode::FAILURE;
                     }
                     // 内核信息推导的 tty 打不开：回退继承的 stdio
-                    eprintln!("rgetty: cannot open {}: {}, using inherited stdio", tty, e);
+                    eprintln!("rgetty: cannot open {}: {}, using inherited stdio", path, e);
                 }
             }
         }
-        run_getty()
+        if opts.clocal {
+            set_clocal();
+        }
+        run_getty(opts.timeout_secs)
     }
+}
+
+/// 解析 rgetty 命令行：`[-L] [-t SEC] [TTY]`。
+pub(crate) fn parse_args(args: &[String]) -> Result<GettyOpts, String> {
+    let mut opts = GettyOpts::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-L" => opts.clocal = true,
+            "-t" => {
+                i += 1;
+                let v = args.get(i).ok_or("option -t requires SECONDS")?;
+                opts.timeout_secs =
+                    Some(v.parse().map_err(|_| format!("invalid -t value: {}", v))?);
+            }
+            s if s.starts_with('-') && s.len() > 1 => {
+                return Err(format!("unknown option: {}", s));
+            }
+            _ => {
+                if opts.tty.is_none() {
+                    opts.tty = Some(args[i].clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(opts)
+}
+
+/// 把 tty 参数规范化为 /dev 路径：`ttyAMA0` → `/dev/ttyAMA0`。
+pub(crate) fn normalize_tty_path(tty: &str) -> String {
+    if tty.starts_with('/') {
+        tty.to_string()
+    } else {
+        format!("/dev/{}", tty)
+    }
+}
+
+/// 设置 CLOCAL（忽略载波检测）。非 tty 时静默跳过。
+fn set_clocal() {
+    let mut term: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut term) } != 0 {
+        return;
+    }
+    term.c_cflag |= libc::CLOCAL;
+    unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) };
 }
 
 /// 从 /sys/class/tty/console/active 读取内核实际激活的 console 设备名。
@@ -148,19 +222,20 @@ fn reset_terminal() {
     unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) };
 }
 
-/// 主循环：打印提示、读取用户名、exec rlogin。
-fn run_getty() -> ExitCode {
+/// 主循环：打印提示、读取用户名（带超时）、exec rlogin。
+fn run_getty(timeout_secs: Option<u64>) -> ExitCode {
     loop {
         reset_terminal();
         let _ = write!(io::stdout(), "\r\nrbox login: ");
         let _ = io::stdout().flush();
 
-        let mut user = String::new();
-        let n = io::stdin().lock().read_line(&mut user).unwrap_or(0);
-        if n == 0 {
-            // EOF：退出，由 init respawn
+        let Some(user) = read_username(timeout_secs) else {
+            // 超时或 EOF：退出，由 init respawn
+            if timeout_secs.is_some() {
+                let _ = writeln!(io::stdout(), "timed out, respawning");
+            }
             return ExitCode::SUCCESS;
-        }
+        };
         let Some(user) = normalize_username(&user) else {
             continue;
         };
@@ -170,6 +245,42 @@ fn run_getty() -> ExitCode {
         eprintln!("rgetty: cannot exec rlogin: {}", err);
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
+}
+
+/// 读取一行用户名；超过 timeout_secs 未输入或 EOF 时返回 None。
+/// 用 poll 实现超时，避免设置终端 VTIME 影响其他行为。
+fn read_username(timeout_secs: Option<u64>) -> Option<String> {
+    let fd = libc::STDIN_FILENO;
+    let deadline =
+        timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        if let Some(d) = deadline {
+            let now = std::time::Instant::now();
+            if now >= d {
+                return None;
+            }
+            let mut fds = [libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ms = (d - now).as_millis().min(i32::MAX as u128) as i32;
+            if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
+                return None; // 超时或 poll 错误
+            }
+        }
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 {
+            return None; // EOF / 读错误
+        }
+        if b[0] == b'\n' || b[0] == b'\r' {
+            break;
+        }
+        line.push(b[0]);
+    }
+    Some(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// 规范化用户名：去掉首尾空白，空输入返回 None。
@@ -190,6 +301,47 @@ mod tests {
     fn name_and_help() {
         assert_eq!(GETTY.name(), "rgetty");
         assert!(GETTY.help().contains("login prompt"));
+    }
+
+    #[test]
+    fn parse_args_basic() {
+        let opts = parse_args(&[]).unwrap();
+        assert_eq!(opts, GettyOpts::default());
+
+        let opts = parse_args(&["ttyAMA0".to_string()]).unwrap();
+        assert_eq!(opts.tty.as_deref(), Some("ttyAMA0"));
+    }
+
+    #[test]
+    fn parse_args_options() {
+        let opts = parse_args(&["-L".to_string(), "-t".to_string(), "60".to_string()]).unwrap();
+        assert!(opts.clocal);
+        assert_eq!(opts.timeout_secs, Some(60));
+
+        let opts = parse_args(&[
+            "-t".to_string(),
+            "30".to_string(),
+            "-L".to_string(),
+            "ttyS0".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.clocal);
+        assert_eq!(opts.timeout_secs, Some(30));
+        assert_eq!(opts.tty.as_deref(), Some("ttyS0"));
+    }
+
+    #[test]
+    fn parse_args_errors() {
+        assert!(parse_args(&["-t".to_string()]).is_err());
+        assert!(parse_args(&["-t".to_string(), "abc".to_string()]).is_err());
+        assert!(parse_args(&["-x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn normalize_tty_path_works() {
+        assert_eq!(normalize_tty_path("ttyAMA0"), "/dev/ttyAMA0");
+        assert_eq!(normalize_tty_path("/dev/ttyS0"), "/dev/ttyS0");
+        assert_eq!(normalize_tty_path("console"), "/dev/console");
     }
 
     #[test]

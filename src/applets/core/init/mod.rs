@@ -185,12 +185,16 @@ impl Applet for Init {
                     let spawned_ok = if unit.service.console {
                         console_name = unit.name.clone();
                         console_reload = unit.service.exec_reload.clone();
+                        // TTY 字段作为 rgetty 参数（第一优先级）：
+                        // ExecStart="/bin/rgetty -L -t 60" + TTY="ttyAMA0" →
+                        // 实际执行 "/bin/rgetty -L -t 60 ttyAMA0"
+                        let exec_cmd = console_exec_cmd(cmd, unit.service.tty.as_deref());
                         let cfg = SpawnConfig::from_unit(unit);
-                        console_child = spawn_unit_command(&unit.name, cmd, &env, &cfg);
+                        console_child = spawn_unit_command(&unit.name, &exec_cmd, &env, &cfg);
                         // 保存 respawn 配置，避免 shell 重启后丢失 Environment/LogFile/User/Group
                         console_cfg = Some(ConsoleConfig {
                             name: unit.name.clone(),
-                            cmd: cmd.clone(),
+                            cmd: exec_cmd,
                             env: env.clone(),
                             logfile: unit.service.logfile.clone(),
                             user: unit.service.user.clone(),
@@ -235,6 +239,14 @@ impl Applet for Init {
             &units,
             status_listener,
         )
+    }
+}
+
+/// console 服务的实际启动命令：TTY 字段拼到 ExecStart 末尾（rgetty 第一优先级）。
+pub(crate) fn console_exec_cmd(exec_start: &str, tty: Option<&str>) -> String {
+    match tty {
+        Some(t) => format!("{} {}", exec_start.trim_end(), t),
+        None => exec_start.to_string(),
     }
 }
 
@@ -685,6 +697,19 @@ mod tests {
         let u = unit_with_requires(&["ghost.service"]);
         let ok = HashMap::new();
         assert_eq!(failed_required_dep(&u, &ok), None);
+    }
+
+    #[test]
+    fn console_exec_cmd_appends_tty() {
+        assert_eq!(
+            console_exec_cmd("/bin/rgetty", Some("ttyAMA0")),
+            "/bin/rgetty ttyAMA0"
+        );
+        assert_eq!(
+            console_exec_cmd("/bin/rgetty -L -t 60", Some("/dev/ttyAMA0")),
+            "/bin/rgetty -L -t 60 /dev/ttyAMA0"
+        );
+        assert_eq!(console_exec_cmd("/bin/rgetty", None), "/bin/rgetty");
     }
 
     #[test]

@@ -4,7 +4,10 @@ Name = "console-shell"
 
 [Service]
 Type = "simple"
-ExecStart = "/bin/rgetty"
+ExecStart = "/bin/rgetty -L -t 60"
+# TTY 指定登录终端（rgetty 第一优先级）：可写裸设备名或 /dev/ 路径。
+# init 会把它拼到 ExecStart 末尾，实际执行: /bin/rgetty -L -t 60 ttyAMA0
+TTY = "ttyAMA0"
 Console = true
 
 [Install]
