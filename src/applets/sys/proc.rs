@@ -12,6 +12,8 @@ pub(crate) struct ProcMem {
     /// 进程状态（stat 第 3 字段，如 S/R/Z）
     pub(crate) state: String,
     pub(crate) name: String,
+    /// 可执行文件路径（/proc/<pid>/exe；内核线程/不可读时为空）
+    pub(crate) exe: String,
 }
 
 /// 遍历 /proc 收集所有进程的信息（statm 的 size/resident + stat 的 ppid/state）。
@@ -31,6 +33,7 @@ pub(crate) fn collect_processes() -> Vec<ProcMem> {
         let ppid = parse_stat_ppid(&read_proc_file(pid, "stat"));
         let state = parse_stat_state(&read_proc_file(pid, "stat"));
         let comm = read_proc_file(pid, "comm").trim().to_string();
+        let exe = read_proc_exe(pid);
         out.push(ProcMem {
             pid,
             ppid,
@@ -38,6 +41,7 @@ pub(crate) fn collect_processes() -> Vec<ProcMem> {
             rss_kb: rss_pages * page_kb,
             state,
             name: comm,
+            exe,
         });
     }
     out
@@ -63,6 +67,31 @@ pub(crate) fn mem_total_kb() -> u64 {
             })
         })
         .unwrap_or(0)
+}
+
+/// 读取 /proc/<pid>/exe 符号链接（路径根可配置）；
+/// 失败（内核线程/受限环境）时回退 cmdline 的 argv[0]，再失败返回空串。
+fn read_proc_exe(pid: u32) -> String {
+    let proc_root = &crate::config::load().paths.proc;
+    let exe = std::fs::read_link(format!("{}/{}/exe", proc_root, pid))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !exe.is_empty() {
+        return exe;
+    }
+    std::fs::read(format!("{}/{}/cmdline", proc_root, pid))
+        .ok()
+        .map(|b| cmdline_argv0(&b))
+        .unwrap_or_default()
+}
+
+/// 取 cmdline 字节中的第一个参数（argv[0]，NUL 分隔）。
+pub(crate) fn cmdline_argv0(bytes: &[u8]) -> String {
+    bytes
+        .split(|&b| b == 0)
+        .next()
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .unwrap_or_default()
 }
 
 /// 读取 /proc/<pid>/<file> 内容（路径根可配置）；失败返回空串。
@@ -133,6 +162,14 @@ mod tests {
     }
 
     #[test]
+    fn cmdline_argv0_parses() {
+        assert_eq!(cmdline_argv0(b"hello\0world\0"), "hello");
+        assert_eq!(cmdline_argv0(b"rbox\0processes"), "rbox");
+        assert_eq!(cmdline_argv0(b""), "");
+        assert_eq!(cmdline_argv0(b"\0\0"), "");
+    }
+
+    #[test]
     fn sort_processes_by_rss_desc() {
         let mut procs = vec![
             ProcMem {
@@ -142,6 +179,7 @@ mod tests {
                 rss_kb: 100,
                 state: "S".into(),
                 name: "a".into(),
+                exe: "/bin/a".into(),
             },
             ProcMem {
                 pid: 2,
@@ -150,6 +188,7 @@ mod tests {
                 rss_kb: 300,
                 state: "S".into(),
                 name: "b".into(),
+                exe: "/bin/b".into(),
             },
             ProcMem {
                 pid: 3,
@@ -158,6 +197,7 @@ mod tests {
                 rss_kb: 300,
                 state: "R".into(),
                 name: "c".into(),
+                exe: "/bin/c".into(),
             },
         ];
         sort_processes(&mut procs);

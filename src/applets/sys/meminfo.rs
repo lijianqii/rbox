@@ -501,6 +501,7 @@ Shmem:              4104 kB
                 rss_kb: 11264,
                 state: "S".to_string(),
                 name: "rgetty".to_string(),
+                exe: "/bin/rbox".to_string(),
             },
             ProcMem {
                 pid: 1,
@@ -509,6 +510,7 @@ Shmem:              4104 kB
                 rss_kb: 4096,
                 state: "S".to_string(),
                 name: "init".to_string(),
+                exe: "/bin/rbox".to_string(),
             },
         ];
         let lines = format_processes(&procs, Unit::Kb, 91768);

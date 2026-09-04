@@ -22,6 +22,8 @@ pub(crate) struct ProcTree {
     pub(crate) name: String,
     /// 进程状态（stat 第 3 字段，如 S/R/Z）
     pub(crate) state: String,
+    /// 可执行文件路径（为空表示无，如内核线程）
+    pub(crate) exe: String,
     /// 常驻内存（kB）
     pub(crate) rss_kb: u64,
     /// 虚拟内存（kB）
@@ -61,6 +63,7 @@ pub(crate) fn build_process_tree(procs: &[ProcMem]) -> ProcTree {
         ppid: 0,
         name: "system".to_string(),
         state: String::new(),
+        exe: String::new(),
         rss_kb: 0,
         vsz_kb: 0,
         children: roots.iter().map(|r| build_node(r, procs)).collect(),
@@ -76,6 +79,7 @@ fn build_node(p: &ProcMem, procs: &[ProcMem]) -> ProcTree {
         ppid: p.ppid,
         name: p.name.clone(),
         state: p.state.clone(),
+        exe: p.exe.clone(),
         rss_kb: p.rss_kb,
         vsz_kb: p.vsz_kb,
         children: children.iter().map(|c| build_node(c, procs)).collect(),
@@ -104,21 +108,27 @@ fn truncate_name(name: &str, width: usize) -> String {
     s
 }
 
-/// 节点行内容（不含树缩进）：`PID 名称 状态 RSS %MEM`，名称列宽动态。
+/// 节点行内容（不含树缩进）：
+/// `PID 名称(Command: 路径) State(S) RSS MEM: x%`，左对齐；无路径时省略 Command 部分。
 fn node_fields(node: &ProcTree, mem_total_kb: u64, name_width: usize) -> String {
     let pct = if mem_total_kb > 0 {
         node.rss_kb as f64 * 100.0 / mem_total_kb as f64
     } else {
         0.0
     };
+    let cmd = if node.exe.is_empty() {
+        String::new()
+    } else {
+        format!("(Command: {})", node.exe)
+    };
     format!(
-        "{:>5}  {:<width$} {:<2} {:>8} {:>6.1}%",
+        "{} {}{} State({}) {} MEM: {:.1}%",
         node.pid,
         truncate_name(&node.name, name_width),
+        cmd,
         node.state,
         format_size(node.rss_kb),
-        pct,
-        width = name_width
+        pct
     )
 }
 
@@ -140,7 +150,8 @@ fn max_name_width(root: &ProcTree) -> usize {
 pub(crate) fn render_process_tree(root: &ProcTree, mem_total_kb: u64) -> Vec<String> {
     let name_width = max_name_width(root).clamp(6, 20);
     let mut out = Vec::new();
-    out.push(node_fields(root, mem_total_kb, name_width));
+    // 虚拟根作为分组标题，不显示列信息
+    out.push(root.name.clone());
     render_children(root, "", mem_total_kb, name_width, &mut out);
     out
 }
@@ -173,14 +184,7 @@ mod tests {
     use super::*;
 
     fn proc(pid: u32, ppid: u32, name: &str) -> ProcMem {
-        ProcMem {
-            pid,
-            ppid,
-            vsz_kb: 0,
-            rss_kb: 0,
-            state: "S".to_string(),
-            name: name.to_string(),
-        }
+        proc_rss(pid, ppid, name, 0, "S")
     }
 
     fn proc_rss(pid: u32, ppid: u32, name: &str, rss_kb: u64, state: &str) -> ProcMem {
@@ -191,6 +195,7 @@ mod tests {
             rss_kb,
             state: state.to_string(),
             name: name.to_string(),
+            exe: format!("/bin/{}", name),
         }
     }
 
@@ -266,17 +271,17 @@ mod tests {
             ppid: 1,
             name: "rgetty".to_string(),
             state: "S".to_string(),
+            exe: "/bin/rbox".to_string(),
             rss_kb: 2528,
             vsz_kb: 3908,
             children: Vec::new(),
         };
         let line = node_fields(&node, 91768, 10);
-        assert!(line.contains("49"), "out: {}", line);
-        assert!(line.contains("rgetty"), "out: {}", line);
-        assert!(line.contains("S"), "out: {}", line);
+        assert!(line.starts_with("49 rgetty"), "out: {}", line);
+        assert!(line.contains("(Command: /bin/rbox)"), "out: {}", line);
+        assert!(line.contains("State(S)"), "out: {}", line);
         assert!(line.contains("2.5MB"), "out: {}", line);
-        // %MEM = 2528 / 91768 * 100 = 2.8
-        assert!(line.contains("2.8%"), "out: {}", line);
+        assert!(line.contains("MEM: 2.8%"), "out: {}", line);
     }
 
     #[test]
@@ -291,11 +296,7 @@ mod tests {
         ];
         let root = build_process_tree(&procs);
         let lines = render_process_tree(&root, 91768);
-        assert!(
-            lines[0].trim_start().starts_with("0  system"),
-            "{}",
-            lines[0]
-        );
+        assert_eq!(lines[0], "system", "{}", lines[0]);
         assert!(lines[1].starts_with("├── "), "{}", lines[1]);
         assert!(lines[1].contains("init"), "{}", lines[1]);
         assert!(lines[2].starts_with("│   ├── "), "{}", lines[2]);
@@ -315,7 +316,6 @@ mod tests {
     fn render_tree_empty() {
         let root = build_process_tree(&[]);
         let lines = render_process_tree(&root, 0);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("0  system"), "{}", lines[0]);
+        assert_eq!(lines, vec!["system".to_string()]);
     }
 }

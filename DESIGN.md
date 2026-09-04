@@ -215,7 +215,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 30 | rgetty | rgetty [-L] [-t SEC] [TTY] | 终端登录提示，fork rlogin 常驻重试（由 init 的 Restart=always 服务拉起） |
 | 31 | rlogin | rlogin [username] | 校验密码（/etc/passwd + /etc/shadow），成功后降权并 exec 用户 shell |
 | 32 | meminfo | meminfo [-bkmg] [-a] | 内存总览 + 详细字段明细（两列）+ iomem 树 + 进程 VSZ/RSS/%MEM 列表 |
-| 33 | processes | processes | btop 风格进程树：system 大分组 + PID/状态/RSS/%MEM 列 |
+| 33 | processes | processes | 进程树：system 大分组，每行 PID 名称(Command) State RSS MEM% |
 ## Shell
 
 文件：src/applets/core/shell/（模块目录，含单元测试）
@@ -769,9 +769,9 @@ make unittest
 | config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
-| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 15、proc 4、processes 9 | 49 |
+| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 15、proc 5、processes 10 | 50 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 10、rlogin 11 | 31 |
-| **合计** | | **436** |
+| **合计** | | **437** |
 
 测试结果示例：
 
@@ -955,7 +955,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（436 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（437 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
