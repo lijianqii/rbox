@@ -385,6 +385,8 @@ assert_contains "meminfo 进程列表标题" "PID"
 assert_contains "meminfo 列出 init 进程" "init"
 assert_contains "meminfo 详细明细" "Memory detail"
 assert_contains "meminfo 详细字段" "AnonPages"
+assert_contains "meminfo 内存映射" "Memory map"
+assert_contains "meminfo System RAM" "System RAM"
 assert_contains "meminfo 数值非零" "Mem: "
 
 echo ""

@@ -103,9 +103,15 @@ impl Applet for Meminfo {
             println!("{}", line);
         }
 
-        // 详细内存明细（/proc/meminfo 常见字段）
+        // 详细内存明细（/proc/meminfo 常见字段，两列排布压缩行数）
         println!();
         for line in format_detail(&fields, unit) {
+            println!("{}", line);
+        }
+
+        // 物理内存映射（/proc/iomem）
+        println!();
+        for line in read_iomem() {
             println!("{}", line);
         }
 
@@ -282,13 +288,41 @@ const DETAIL_FIELDS: &[&str] = &[
     "VmallocChunk",
 ];
 
-/// 生成详细内存明细行（字段缺失自动跳过）。
+/// 生成详细内存明细行（两列排布，字段缺失自动跳过）。
 fn format_detail(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
+    let values: Vec<(&str, u64)> = DETAIL_FIELDS
+        .iter()
+        .filter_map(|n| fields.get(*n).map(|v| (*n, unit.convert(*v))))
+        .collect();
     let mut lines = Vec::new();
     lines.push(format!("Memory detail ({}):", unit.label()));
-    for name in DETAIL_FIELDS {
-        if let Some(v) = fields.get(*name) {
-            lines.push(format!("  {:<20}{:>12}", name, unit.convert(*v)));
+    let mut i = 0;
+    while i < values.len() {
+        let left = format!("  {:<20}{:>12}", values[i].0, values[i].1);
+        let right = if i + 1 < values.len() {
+            format!("  {:<20}{:>12}", values[i + 1].0, values[i + 1].1)
+        } else {
+            String::new()
+        };
+        lines.push(format!("{}{}", left, right));
+        i += 2;
+    }
+    lines
+}
+
+/// 读取 /proc/iomem 并生成物理内存映射输出（保留原有层级缩进）。
+fn read_iomem() -> Vec<String> {
+    let path = &crate::config::load().paths.iomem;
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+    format_iomem(&content)
+}
+
+/// 生成内存映射输出（纯函数，便于测试）。
+pub(crate) fn format_iomem(content: &str) -> Vec<String> {
+    let mut lines = vec!["Memory map (/proc/iomem):".to_string()];
+    for line in content.lines() {
+        if !line.trim().is_empty() {
+            lines.push(format!("  {}", line));
         }
     }
     lines
@@ -509,6 +543,8 @@ Shmem:              4104 kB
         assert!(out.contains("MemTotal"), "out: {}", out);
         assert!(out.contains("AnonPages"), "out: {}", out);
         assert!(out.contains("SwapTotal"), "out: {}", out);
+        // 两列排布：样例含 18 个字段 → 9 行 + 标题 = 10 行
+        assert_eq!(lines.len(), 10, "out: {}", out);
         // 值跟随单位换算：MemTotal 1928844 / 1024 = 1883 (MB)
         let lines_m = format_detail(&fields, Unit::Mb);
         let memtotal_line = lines_m
@@ -526,5 +562,27 @@ Shmem:              4104 kB
         let out = lines.join("\n");
         assert!(out.contains("MemTotal"), "out: {}", out);
         assert!(!out.contains("AnonPages"), "out: {}", out);
+    }
+
+    #[test]
+    fn format_iomem_preserves_hierarchy() {
+        let content = "00000000-3effffff : System RAM\n  3eff0000-3effffff : PCI ECAM\n\n40000000-47ffffff : System RAM\n";
+        let lines = format_iomem(content);
+        assert_eq!(lines[0], "Memory map (/proc/iomem):");
+        assert!(
+            lines[1].contains("00000000-3effffff : System RAM"),
+            "{}",
+            lines[1]
+        );
+        // 子区域保留缩进，空行被跳过
+        assert!(lines[2].contains("PCI ECAM"), "{}", lines[2]);
+        assert!(lines[3].contains("40000000-47ffffff"), "{}", lines[3]);
+        assert_eq!(lines.len(), 4);
+    }
+
+    #[test]
+    fn format_iomem_empty() {
+        let lines = format_iomem("");
+        assert_eq!(lines, vec!["Memory map (/proc/iomem):".to_string()]);
     }
 }
