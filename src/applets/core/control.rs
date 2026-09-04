@@ -5,13 +5,15 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// 控制协议 socket 路径（服务端 init 与客户端 status/rservice 保持一致）。
-pub const STATUS_SOCKET: &str = "/tmp/rbox.sock";
+/// 控制协议 socket 路径（/etc/rbox.conf [paths] status_socket，默认 /tmp/rbox.sock）。
+pub fn status_socket() -> String {
+    crate::config::load().paths.status_socket.clone()
+}
 
 /// 发送一行控制请求并读取完整响应。
 pub fn send_request(req: &str) -> Result<String, String> {
-    let mut stream =
-        UnixStream::connect(STATUS_SOCKET).map_err(|e| format!("cannot connect to init: {}", e))?;
+    let mut stream = UnixStream::connect(status_socket())
+        .map_err(|e| format!("cannot connect to init: {}", e))?;
     stream
         .write_all(format!("{}\n", req).as_bytes())
         .map_err(|_| "write failed".to_string())?;

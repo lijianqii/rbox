@@ -9,6 +9,7 @@
 
 mod applet;
 mod applets;
+mod config;
 
 use crate::applet::Applet;
 use std::process::ExitCode;

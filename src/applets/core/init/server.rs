@@ -1,6 +1,6 @@
 //! init 控制协议服务端：监听 unix socket，处理 status/start/stop/restart/reload。
 
-use crate::applets::core::control::STATUS_SOCKET;
+use crate::applets::core::control::status_socket;
 use crate::applets::core::init::services::{
     EXEC_COMMAND_TIMEOUT, ServiceInstance, parse_environment, respawn_service,
     run_command_with_timeout, start_forking_service, start_service, stop_service_instance,
@@ -13,7 +13,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 /// 创建控制 socket（非阻塞）；失败时返回 None（不影响启动）。
 pub(crate) fn create_status_listener() -> Option<UnixListener> {
-    match UnixListener::bind(STATUS_SOCKET) {
+    match UnixListener::bind(status_socket()) {
         Ok(l) => {
             let _ = l.set_nonblocking(true);
             Some(l)

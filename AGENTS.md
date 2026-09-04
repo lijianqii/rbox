@@ -22,10 +22,11 @@ BusyBox 风格 multi-call 二进制（Rust, edition 2024），交叉编译为 aa
 
 - `src/main.rs` — 入口与分发：argv[0] basename 分发（symlink）或 `rbox <applet>` 子命令；
   内置 `--list/--help/--version` 元命令
+- `src/config.rs` — 全局配置（/etc/rbox.conf TOML：路径/提示/超时/缺省 shell，可选字段）
 - `src/applet.rs` — `Applet` trait（name/help/run -> ExitCode）+ `declare_applets!` 注册表
 - `src/applets/core/` — 系统核心：`init/`（PID 1，TOML 单元、依赖拓扑、Type/Restart、降权）、
   `shell/`（tokenizer/parser/expander/executor/reader/completion/builtin）、
-  rgetty.rs（rgetty 登录提示）、rlogin.rs（rlogin 密码校验/降权）、shutdown、reboot、status、rservice
+  rgetty.rs（rgetty 登录提示，常驻 fork/wait 原地重试）、rlogin.rs（rlogin 密码校验/降权）、shutdown、reboot、status、rservice
 - `src/applets/file/` — ls、cp、mv、rm、mkdir、touch、ln、cat
 - `src/applets/text/` — head、tail、wc、grep、printf、echo、basename、dirname
 - `src/applets/sys/` — true、false、pwd、uname、date、sleep、env

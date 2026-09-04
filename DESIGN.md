@@ -90,6 +90,7 @@ rbox/
 ├── src/
 │   ├── main.rs             # 入口，argv[0]/subcommand 分发 + --list/--help/--version
 │   ├── applet.rs           # Applet trait + 全局 APPLETS 注册表
+│   ├── config.rs           # 全局配置（/etc/rbox.conf TOML：路径/提示/超时/缺省 shell）
 │   └── applets/            # 按功能分四组（core/file/text/sys）
 │       ├── mod.rs          # 子模块声明
 │       ├── core/           # 系统核心 applet + init 内部实现
@@ -103,7 +104,7 @@ rbox/
 │       │   │   └── syscall.rs  # libc 系统调用封装
 │       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
 │       │   ├── shell/       # 命令解释器（模块目录：mod/tokenizer/parser/expander/completion/builtin/executor/reader/types）
-│       │   ├── rgetty.rs    # rgetty（终端登录提示，exec rlogin）
+│       │   ├── rgetty.rs    # rgetty（终端登录提示，常驻 fork/wait 原地重试）
 │       │   ├── rlogin.rs    # rlogin（密码校验、降权、exec 用户 shell）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
@@ -344,7 +345,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 29 个测试组、111 个断言（涵盖 31 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 29 个测试组、112 个断言（涵盖 31 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -374,10 +375,10 @@ enum Token {
 | here-doc | <<EOF | 1 |
 | console respawn | 初始环境变量、exit 后 respawn 保留配置 | 2 |
 | 前台 Ctrl-C 中断 | sleep 被 SIGINT 中断，$?=130 | 1 |
-| rgetty/rlogin 登录 | 登录提示、错误密码拒绝、登录后 shell 可用、串口自动识别、退出后重新登录 | 5 |
+| rgetty/rlogin 登录 | 登录提示、issue 横幅、错误密码拒绝、登录后 shell 可用、串口指定、退出后重新登录 | 6 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| **合计** | | **111** |
+| **合计** | | **112** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -457,27 +458,33 @@ shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u
 生产 rootfs 的 console 服务由原来的直接 shell 改为 `rgetty`，登录流程如下：
 
 ```
-init ──Restart=always 服务──► rgetty ──读取用户名──► exec rlogin ──校验通过──► exec 用户 shell
-                ▲                                                            │
-                └──────────── 进程退出后由 init 按 Restart=always 重启 ────────┘
+init ──Restart=always 服务──► rgetty（常驻）──fork──► rlogin ──exec──► 用户 shell
+        ▲                        │     ▲                    │
+        │                        │     └──── 登录失败/shell 退出 ────┘
+        │                        │            （rgetty 原地重新提示）
+        └──── rgetty 崩溃/被杀时才由 init 按 Restart=always 重启 ────┘
 ```
 
 - **rgetty**：用法 `rgetty [-L] [-t SEC] [TTY]`。
   - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
-  - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
-  - 打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
-  登录失败/shell 退出时进程结束，init 的 `Restart = "always"` 机制自动重新拉起，回到登录提示。
+  - `-t SEC`：超过 SEC 秒未输入用户名则**原地重新提示**（rgetty 常驻不退出，防占终端）；
+  - 启动时打印 `/etc/issue` 横幅（路径可配置，不存在则跳过）；
+  - 打印提示（`/etc/rbox.conf [getty] prompt`）后读取用户名，**fork 子进程**执行
+    `/bin/rlogin <user>`（路径可配置）；父进程 wait：登录失败（非零退出）按
+    `failure_delay` 延迟后原地重新提示，shell 正常退出立即重新提示；
+    rgetty 本身常驻，只有崩溃/被杀才由 init 的 `Restart = "always"` 拉起。
   **终端选择**：仅使用命令行显式 TTY 参数（由 `ExecStart` 完整命令直接传给 rgetty）；
   未指定时使用继承的 stdin/stdout/stderr（init 启动服务时继承的 stdio 即登录终端）。
   TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
-- **rlogin**：无参数时先提示用户名；随后关闭回显读取密码。密码校验规则：
-  - `/etc/passwd` 密码字段为 `x` 时读取 `/etc/shadow`；空字段 = 免密登录，
-    `!`/`*` 开头 = 账户锁定；
+- **rlogin**：无参数时先提示用户名（提示文本可配置）；随后关闭回显读取密码。密码校验规则：
+  - `/etc/passwd`（路径可配置）密码字段为 `x` 时读取 `/etc/shadow`（路径可配置）；
+    空字段 = 免密登录，`!`/`*` 开头 = 账户锁定；
   - 存储串以 `$` 开头（`$5$...` 等）：用 libc crypt() 校验（与 glibc/busybox 兼容，
     支持 SHA-256/SHA-512/MD5）；其余按明文比对（兼容旧格式）。
-  - 校验失败输出 `Login incorrect` 并延迟 1 秒后退出（由 init respawn 重新提示）；
+  - 校验失败输出 `Login incorrect` 并直接退出（失败延迟由常驻的 rgetty 处理）；
   - 校验通过后：initgroups/setgid/setuid 降权、chdir 到 home（失败回退 `/`）、设置
-    USER/LOGNAME/HOME/SHELL 环境变量、打印 `/etc/motd`，最后 exec 用户 shell。
+    USER/LOGNAME/HOME/SHELL 环境变量、打印 MOTD（路径可配置），最后 exec 用户 shell
+    （passwd 无 shell 字段时用配置的缺省 shell）。
 
 生产 rootfs 的账号数据：`/etc/passwd`（root/nobody，密码字段为 `x`）+
 `/etc/shadow`（root 密码为 SHA-256 crypt 哈希，明文是 `root`；nobody 锁定 `!`）。
@@ -493,6 +500,33 @@ ExecStart = "/bin/rgetty -L -t 60 ttyAMA0"   # -L + 超时 + 登录终端
 Restart = "always"
 RestartSec = 1
 ```
+
+## 全局配置（/etc/rbox.conf）
+
+文件：src/config.rs
+
+所有"环境相关"的硬编码集中到 `/etc/rbox.conf`（TOML，可选字段，缺省用代码内默认值，进程内只解析一次）。字段一览：
+
+| 分组 | 字段 | 默认值 | 使用方 |
+|------|------|--------|--------|
+| [paths] | system_dir | /etc/rbox/system | init 单元目录 |
+| [paths] | default_target | default.target | 启动根 target |
+| [paths] | status_socket | /tmp/rbox.sock | 控制协议 socket（status/rservice 客户端同源） |
+| [paths] | passwd / shadow | /etc/passwd / /etc/shadow | rlogin 账号校验 |
+| [paths] | motd | /etc/motd | 登录后欢迎信息 |
+| [paths] | profile | /etc/profile | shell 启动时 source |
+| [paths] | history_file | 空 = $HOME/.rbox_history | shell 历史（支持 ~ 前缀） |
+| [paths] | fstab / hostname / sysctl_conf | /etc/fstab 等 | init 系统初始化 |
+| [getty] | login_program | /bin/rlogin | rgetty fork 的登录程序 |
+| [getty] | prompt | "rbox login: " | 登录提示 |
+| [getty] | default_timeout | 无 | 未给 -t 时的默认超时 |
+| [getty] | issue_file | /etc/issue | 登录前横幅 |
+| [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |
+| [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
+| [login] | password_prompt | "Password: " | 密码提示 |
+| [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
+
+生产 rootfs 内置一份带注释的 `/etc/rbox.conf` 作为示例。
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
 
@@ -690,7 +724,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 29 个测试组、111 个断言，覆盖全部 31 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 29 个测试组、112 个断言，覆盖全部 31 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -726,11 +760,12 @@ make unittest
 | init/services | 服务生命周期、schedule_restart（on-failure/always）、finish_daemonize | 13 |
 | init/mount | fstab 挂载 | 5 |
 | init/mod | failed_required_dep、compute_next_timeout | 6 |
+| config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 8、rlogin 11 | 27 |
-| **合计** | | **398** |
+| **合计** | | **402** |
 
 测试结果示例：
 
@@ -757,7 +792,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 111 通过, 0 失败
+结果: 112 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -792,6 +827,8 @@ rootfs/
     ├── passwd                   # 用户账号（密码字段为 x，实际在 shadow）
     ├── shadow                   # 影子密码（SHA-256 crypt，root 明文为 root）
     ├── motd                     # 登录成功后的欢迎信息
+    ├── issue                    # 登录前横幅（rgetty 启动时打印）
+    ├── rbox.conf                # 全局配置（TOML，路径/提示/超时等）
     └── rbox/
         └── system/              # init TOML 单元文件（生产：仅 default.target + console-shell）
             ├── default.target.toml
@@ -912,7 +949,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（398 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（402 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

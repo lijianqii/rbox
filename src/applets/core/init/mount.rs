@@ -45,10 +45,11 @@ fn parse_fstab(content: &str) -> Vec<FstabEntry> {
     content.lines().filter_map(parse_fstab_line).collect()
 }
 
-/// 挂载所有文件系统：优先读取 /etc/fstab，缺失时回退到内置默认集。
+/// 挂载所有文件系统：优先读取配置的 fstab，缺失时回退到内置默认集。
 /// 单个挂载失败只记录日志，不中断其余挂载。
 pub(crate) fn mount_all_fs() {
-    let entries: Vec<FstabEntry> = match fs::read_to_string("/etc/fstab") {
+    let fstab_path = &crate::config::load().paths.fstab;
+    let entries: Vec<FstabEntry> = match fs::read_to_string(fstab_path) {
         Ok(content) => parse_fstab(&content),
         Err(_) => {
             log("rbox init: /etc/fstab not found, using built-in defaults");
@@ -73,17 +74,19 @@ pub(crate) fn mount_all_fs() {
     }
 }
 
-/// 为所有子进程（shell、服务）提供默认 PATH。
+/// 为所有子进程（shell、服务）提供默认 PATH（可配置）。
 pub(crate) fn setup_environment() {
     if std::env::var_os("PATH").is_none() {
+        let path = crate::config::load().init.default_path.clone();
         // SAFETY: init 是单线程 PID 1，无并发修改环境变量风险
-        unsafe { std::env::set_var("PATH", "/bin:/sbin:/usr/bin:/usr/sbin") };
+        unsafe { std::env::set_var("PATH", path) };
     }
 }
 
-/// 读取 /etc/hostname（取第一行）并设置主机名；文件缺失或为空时静默跳过。
+/// 读取配置的主机名文件（取第一行）并设置主机名；文件缺失或为空时静默跳过。
 pub(crate) fn setup_hostname() {
-    let Ok(content) = fs::read_to_string("/etc/hostname") else {
+    let hostname_path = &crate::config::load().paths.hostname;
+    let Ok(content) = fs::read_to_string(hostname_path) else {
         return;
     };
     let hostname = content.lines().next().unwrap_or("").trim();

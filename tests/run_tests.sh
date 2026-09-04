@@ -66,6 +66,7 @@ LOGIN_OUT=$(timeout 150 bash -c '
   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append '"'$APPEND'"'
 ' 2>&1) || true
 assert_contains_in "$LOGIN_OUT" "rgetty 登录提示" "rbox login:"
+assert_contains_in "$LOGIN_OUT" "登录前 issue 横幅" "rbox console"
 assert_contains_in "$LOGIN_OUT" "错误密码被拒绝" "Login incorrect"
 assert_contains_in "$LOGIN_OUT" "登录后 shell 可用" "LOGIN_OK"
 assert_contains_in "$LOGIN_OUT" "rgetty 使用命令行指定串口" "0 -> /dev/ttyAMA0"

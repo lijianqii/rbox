@@ -48,8 +48,9 @@ impl Applet for Getty {
                 return ExitCode::FAILURE;
             }
         };
+        let cfg = crate::config::load().getty.clone();
         // 只使用命令行显式指定的 TTY；未指定时使用继承的 stdin/stdout/stderr
-        // （init console 服务的 stdio 即登录终端）。
+        // （init 服务继承的 stdio 即登录终端）。
         if let Some(tty) = &opts.tty {
             let path = normalize_tty_path(tty);
             if let Err(e) = setup_tty(&path) {
@@ -60,7 +61,9 @@ impl Applet for Getty {
         if opts.clocal {
             set_clocal();
         }
-        run_getty(opts.timeout_secs)
+        // 超时：命令行 -t 优先，缺省用配置 default_timeout
+        let timeout = opts.timeout_secs.or(cfg.default_timeout);
+        run_getty(&cfg, timeout)
     }
 }
 
@@ -140,28 +143,77 @@ fn reset_terminal() {
     unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) };
 }
 
-/// 主循环：打印提示、读取用户名（带超时）、exec rlogin。
-fn run_getty(timeout_secs: Option<u64>) -> ExitCode {
+/// 打印登录前横幅（/etc/issue，配置可改；文件不存在则跳过）。
+fn print_issue(issue_file: &str) {
+    if let Ok(content) = std::fs::read_to_string(issue_file) {
+        let _ = write!(io::stdout(), "{}", content);
+        let _ = io::stdout().flush();
+    }
+}
+
+/// 主循环：打印提示、读取用户名（带超时）、fork 子进程执行 rlogin。
+/// rgetty 常驻：登录失败/超时/shell 退出后原地重新提示，
+/// 不经过 init 重启（init 的 Restart=always 仅兜底 rgetty 本身崩溃）。
+fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> ExitCode {
+    print_issue(&cfg.issue_file);
     loop {
         reset_terminal();
-        let _ = write!(io::stdout(), "\r\nrbox login: ");
+        let _ = write!(io::stdout(), "\r\n{}", cfg.prompt);
         let _ = io::stdout().flush();
 
         let Some(user) = read_username(timeout_secs) else {
-            // 超时或 EOF：退出，由 init respawn
-            if timeout_secs.is_some() {
-                let _ = writeln!(io::stdout(), "timed out, respawning");
-            }
-            return ExitCode::SUCCESS;
+            // 超时/EOF：原地重新提示（-t 语义：防占终端，但不退出）
+            let _ = writeln!(io::stdout(), "timed out, retrying");
+            continue;
         };
         let Some(user) = normalize_username(&user) else {
             continue;
         };
 
-        // exec rlogin（替换当前进程）；失败时继续循环重新提示
-        let err = std::process::Command::new("/bin/rlogin").arg(&user).exec();
-        eprintln!("rgetty: cannot exec rlogin: {}", err);
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // fork 子进程执行 rlogin（子进程内 exec shell），父进程等待；
+        // 登录失败（非零退出）延迟后再提示，防暴力刷屏。
+        run_login(&user, &cfg.login_program, cfg.failure_delay);
+    }
+}
+
+/// fork 子进程执行登录程序；父进程 waitpid 后按退出码决定是否延迟。
+fn run_login(user: &str, login_program: &str, failure_delay: u64) {
+    unsafe {
+        let pid = libc::fork();
+        if pid < 0 {
+            eprintln!("rgetty: fork failed");
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            return;
+        }
+        if pid == 0 {
+            // 子进程：exec 登录程序（成功则被替换，不会返回）
+            let err = std::process::Command::new(login_program).arg(user).exec();
+            let _ = writeln!(
+                io::stderr(),
+                "rgetty: cannot exec {}: {}",
+                login_program,
+                err
+            );
+            libc::_exit(127);
+        }
+        // 父进程：等待登录/用户 shell 退出
+        let mut status: libc::c_int = 0;
+        loop {
+            let r = libc::waitpid(pid, &mut status, 0);
+            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // 被信号打断，继续等待
+            }
+            break;
+        }
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            1
+        };
+        // 登录失败（非零退出）后延迟再提示，避免失败刷屏
+        if code != 0 && failure_delay > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(failure_delay));
+        }
     }
 }
 

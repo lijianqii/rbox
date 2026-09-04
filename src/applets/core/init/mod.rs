@@ -25,9 +25,7 @@ use crate::applets::core::init::services::{
     spawn_fresh_shell, start_forking_service, start_service, stop_service_instance,
 };
 use crate::applets::core::init::syscall::{kill_all, reboot_syscall, sync_fs};
-use crate::applets::core::init::units::{
-    DEFAULT_TARGET, Unit, compute_start_order, load_all_units,
-};
+use crate::applets::core::init::units::{Unit, compute_start_order, load_all_units};
 use crate::applets::core::{LogLevel, log, log_at};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
@@ -87,7 +85,7 @@ impl Applet for Init {
         setup_environment();
         mount_all_fs();
         setup_hostname();
-        apply_sysctl("/etc/sysctl.conf");
+        apply_sysctl(&crate::config::load().paths.sysctl_conf);
         log("rbox init: basic filesystems mounted");
 
         // 2. 解析所有单元文件
@@ -105,8 +103,9 @@ impl Applet for Init {
             }
         };
 
-        // 3. 计算从 default.target 出发的启动顺序（拓扑排序）
-        let order = match compute_start_order(&units, DEFAULT_TARGET) {
+        // 3. 计算从 default.target 出发的启动顺序（拓扑排序；target 名可配置）
+        let default_target = crate::config::load().paths.default_target.as_str();
+        let order = match compute_start_order(&units, default_target) {
             Ok(o) => {
                 log_at(LogLevel::Debug, &format!("rbox init: start order: {:?}", o));
                 o

@@ -198,11 +198,31 @@ fn abort_line(
     let _ = io::stdout().flush();
 }
 
-/// 历史文件路径。
+/// 历史文件路径：配置了 [paths] history_file 则用它（支持 `~` 前缀）；
+/// 未配置时保持默认 $HOME/.rbox_history（HOME 未设置用 /tmp/.rbox_history）。
 fn history_file() -> String {
+    let configured = &crate::config::load().paths.history_file;
+    if !configured.is_empty() {
+        return expand_tilde_path(configured);
+    }
     std::env::var("HOME")
         .map(|h| format!("{}/.rbox_history", h))
         .unwrap_or_else(|_| "/tmp/.rbox_history".to_string())
+}
+
+/// 展开路径中的 `~` 前缀为 $HOME（未设置时保持原样）。
+fn expand_tilde_path(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!(
+            "{}/{}",
+            std::env::var("HOME").unwrap_or_else(|_| "".to_string()),
+            rest
+        );
+    }
+    path.to_string()
 }
 
 /// 加载历史文件。
@@ -279,11 +299,12 @@ impl Shell {
         // 注册 SIGCHLD handler：自动回收后台僵尸子进程
         executor::install_sigchld_handler();
 
-        // 加载 /etc/profile（如果存在）
+        // 加载 profile（路径可配置；默认 /etc/profile）
+        let profile_path = &crate::config::load().paths.profile;
         let mut boot_rc: i32 = 0;
         let mut boot_history: Vec<String> = Vec::new();
-        if std::path::Path::new("/etc/profile").exists() {
-            source_file("/etc/profile", &mut boot_rc, &mut boot_history);
+        if std::path::Path::new(profile_path).exists() {
+            source_file(profile_path, &mut boot_rc, &mut boot_history);
         }
 
         let stdin = io::stdin();

@@ -40,11 +40,12 @@ impl Applet for Login {
         "rlogin [username] - verify password and start user shell"
     }
     fn run(&self, args: &[String]) -> ExitCode {
+        let cfg = crate::config::load();
         // 用户名：优先取参数，否则提示输入
         let user = match args.first() {
             Some(u) => u.clone(),
             None => {
-                let _ = write!(io::stdout(), "rbox login: ");
+                let _ = write!(io::stdout(), "{}", cfg.getty.prompt);
                 let _ = io::stdout().flush();
                 let mut line = String::new();
                 if io::stdin().lock().read_line(&mut line).unwrap_or(0) == 0 {
@@ -59,7 +60,7 @@ impl Applet for Login {
         };
 
         // 读取密码（关闭回显）
-        let _ = write!(io::stdout(), "Password: ");
+        let _ = write!(io::stdout(), "{}", cfg.login.password_prompt);
         let _ = io::stdout().flush();
         let password = read_password();
         let _ = writeln!(io::stdout());
@@ -75,8 +76,7 @@ impl Applet for Login {
             },
             None => {
                 let _ = writeln!(io::stdout(), "Login incorrect");
-                // 短暂延迟，减缓暴力尝试
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                // 失败延迟（防暴力刷屏）由常驻的 rgetty 处理，这里直接退出
                 ExitCode::FAILURE
             }
         }
@@ -157,9 +157,10 @@ pub(crate) fn shadow_password_of(content: &str, user: &str) -> Option<String> {
     })
 }
 
-/// 读取 /etc/shadow 中指定用户的密码字段。
+/// 读取 /etc/shadow 中指定用户的密码字段（路径可配置）。
 fn read_shadow_password(user: &str) -> Option<String> {
-    let content = std::fs::read_to_string("/etc/shadow").ok()?;
+    let path = &crate::config::load().paths.shadow;
+    let content = std::fs::read_to_string(path).ok()?;
     shadow_password_of(&content, user)
 }
 
@@ -221,7 +222,8 @@ unsafe extern "C" {
 
 /// 认证：用户存在且密码正确时返回 passwd 条目。
 fn authenticate(user: &str, password: &str) -> Option<PasswdEntry> {
-    let content = std::fs::read_to_string("/etc/passwd").ok()?;
+    let path = &crate::config::load().paths.passwd;
+    let content = std::fs::read_to_string(path).ok()?;
     let entries = parse_passwd(&content);
     let entry = find_passwd_entry(&entries, user)?.clone();
     let shadow = read_shadow_password(user);
@@ -266,15 +268,16 @@ fn login_shell(entry: &PasswdEntry) -> io::Result<()> {
         std::env::set_var("SHELL", &entry.shell);
     }
 
-    // 打印 MOTD
-    if let Ok(motd) = std::fs::read_to_string("/etc/motd") {
+    // 打印 MOTD（路径可配置）
+    let motd_path = &crate::config::load().paths.motd;
+    if let Ok(motd) = std::fs::read_to_string(motd_path) {
         let _ = write!(io::stdout(), "{}", motd);
         let _ = io::stdout().flush();
     }
 
-    // exec 用户 shell（exec 只在失败时返回）
+    // exec 用户 shell（passwd 无 shell 字段时用配置的缺省 shell）
     let shell = if entry.shell.is_empty() {
-        "/bin/sh"
+        crate::config::load().login.shell.as_str()
     } else {
         entry.shell.as_str()
     };

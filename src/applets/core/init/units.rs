@@ -6,9 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-pub(crate) const SYSTEM_DIR: &str = "/etc/rbox/system";
-pub(crate) const DEFAULT_TARGET: &str = "default.target";
-
 /// 解析后的单元文件（TOML 反序列化）。
 /// TOML 表名使用 systemd 风格的 [Unit]/[Service]/[Install]。
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -134,10 +131,10 @@ pub(crate) fn is_target_file(file_stem: &str) -> bool {
     file_stem.ends_with(".target")
 }
 
-/// 加载 SYSTEM_DIR 下所有 .toml 单元文件。
+/// 加载单元目录（路径可配置，见 /etc/rbox.conf [paths] system_dir）下所有 .toml 单元文件。
 pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     let mut units: HashMap<String, Unit> = HashMap::new();
-    let dir = Path::new(SYSTEM_DIR);
+    let dir = Path::new(&crate::config::load().paths.system_dir);
     if !dir.exists() {
         return Ok(units);
     }
