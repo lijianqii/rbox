@@ -93,33 +93,66 @@ fn format_size(kb: u64) -> String {
     }
 }
 
-/// 节点行内容（不含树缩进）：`PID 名称 状态 RSS %MEM`。
-fn node_fields(node: &ProcTree, mem_total_kb: u64) -> String {
+/// 名称超宽时截断并追加省略号（按字符计数）。
+fn truncate_name(name: &str, width: usize) -> String {
+    let count = name.chars().count();
+    if count <= width {
+        return name.to_string();
+    }
+    let mut s: String = name.chars().take(width.saturating_sub(1)).collect();
+    s.push('…');
+    s
+}
+
+/// 节点行内容（不含树缩进）：`PID 名称 状态 RSS %MEM`，名称列宽动态。
+fn node_fields(node: &ProcTree, mem_total_kb: u64, name_width: usize) -> String {
     let pct = if mem_total_kb > 0 {
         node.rss_kb as f64 * 100.0 / mem_total_kb as f64
     } else {
         0.0
     };
     format!(
-        "{:>5}  {:<20} {:<3} {:>10} {:>6.1}%",
+        "{:>5}  {:<width$} {:<2} {:>8} {:>6.1}%",
         node.pid,
-        node.name,
+        truncate_name(&node.name, name_width),
         node.state,
         format_size(node.rss_kb),
-        pct
+        pct,
+        width = name_width
     )
 }
 
+/// 计算整棵树中名称的最大显示宽度（至少 6，容纳 "system"）。
+fn max_name_width(root: &ProcTree) -> usize {
+    fn walk(node: &ProcTree, max: &mut usize) {
+        *max = (*max).max(node.name.chars().count());
+        for c in &node.children {
+            walk(c, max);
+        }
+    }
+    let mut m = 6;
+    walk(root, &mut m);
+    m
+}
+
 /// 渲染进程树（btop/tree 风格）：虚拟根直显，子进程 ├──/└──，祖先用 │ 延续。
+/// 名称列宽 = 树中最长名称（限制在 6..=20，超长名称截断）。
 pub(crate) fn render_process_tree(root: &ProcTree, mem_total_kb: u64) -> Vec<String> {
+    let name_width = max_name_width(root).clamp(6, 20);
     let mut out = Vec::new();
-    out.push(node_fields(root, mem_total_kb));
-    render_children(root, "", mem_total_kb, &mut out);
+    out.push(node_fields(root, mem_total_kb, name_width));
+    render_children(root, "", mem_total_kb, name_width, &mut out);
     out
 }
 
 /// 递归渲染节点的子进程。
-fn render_children(node: &ProcTree, prefix: &str, mem_total_kb: u64, out: &mut Vec<String>) {
+fn render_children(
+    node: &ProcTree,
+    prefix: &str,
+    mem_total_kb: u64,
+    name_width: usize,
+    out: &mut Vec<String>,
+) {
     let n = node.children.len();
     for (i, child) in node.children.iter().enumerate() {
         let last = i == n - 1;
@@ -128,10 +161,10 @@ fn render_children(node: &ProcTree, prefix: &str, mem_total_kb: u64, out: &mut V
             "{}{}{}",
             prefix,
             conn,
-            node_fields(child, mem_total_kb)
+            node_fields(child, mem_total_kb, name_width)
         ));
         let child_prefix = format!("{}{}", prefix, if last { "    " } else { "│   " });
-        render_children(child, &child_prefix, mem_total_kb, out);
+        render_children(child, &child_prefix, mem_total_kb, name_width, out);
     }
 }
 
@@ -214,6 +247,19 @@ mod tests {
     }
 
     #[test]
+    fn truncate_name_works() {
+        assert_eq!(truncate_name("short", 20), "short");
+        assert_eq!(
+            truncate_name("kworker/R-kvfree_rcu_reclaim", 20)
+                .chars()
+                .count(),
+            20
+        );
+        assert!(truncate_name("kworker/R-kvfree_rcu_reclaim", 20).ends_with('…'));
+        assert_eq!(truncate_name("abcdef", 6), "abcdef");
+    }
+
+    #[test]
     fn node_fields_columns() {
         let node = ProcTree {
             pid: 49,
@@ -224,7 +270,7 @@ mod tests {
             vsz_kb: 3908,
             children: Vec::new(),
         };
-        let line = node_fields(&node, 91768);
+        let line = node_fields(&node, 91768, 10);
         assert!(line.contains("49"), "out: {}", line);
         assert!(line.contains("rgetty"), "out: {}", line);
         assert!(line.contains("S"), "out: {}", line);
