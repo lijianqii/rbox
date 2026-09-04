@@ -1,10 +1,16 @@
-//! `meminfo` - 查看内存使用情况（类似 free，读取 /proc/meminfo）。
+//! `meminfo` - 查看内存使用情况与进程内存占用（读 /proc）。
 //!
-//! 用法：`meminfo [-b] [-k] [-m] [-g]`
-//! - 默认以 KB 显示；`-b` 字节、`-k` KB、`-m` MB、`-g` GB。
+//! 用法：`meminfo [-bkmg] [-a]`
+//! - 单位：`-b` 字节、`-k` KB（默认）、`-m` MB、`-g` GB；
+//! - `-a`：进程列表显示全部（默认过滤 RSS=0 的内核线程）。
 //!
-//! 输出列：total / used / free / shared / buff/cache / available。
-//! used = total - free - buff/cache（与 free 一致）；buff/cache = Buffers + Cached。
+//! 输出三部分：
+//! 1. 总览（free 风格）：total/used/free/shared/buff/cache/available；
+//!    used = total - free - buff/cache；buff/cache = Buffers + Cached；
+//! 2. 详细明细（/proc/meminfo 常见字段，两列排布）+ iomem 树状映射；
+//! 3. 进程列表（PID/PPID/VSZ/RSS/%MEM/STATE/COMMAND，按 RSS 降序）。
+//!
+//! 数据来源路径均可配置（/etc/rbox.conf [paths] proc/meminfo/iomem）。
 
 use crate::applet::Applet;
 use std::collections::HashMap;
@@ -33,7 +39,7 @@ impl Unit {
         }
     }
 
-    /// 单位标签（用于 RSS 列表标题）。
+    /// 单位标签（用于明细/进程列表标题）。
     fn label(self) -> &'static str {
         match self {
             Unit::Bytes => "B",
@@ -109,7 +115,7 @@ impl Applet for Meminfo {
             println!("{}", line);
         }
 
-        // 物理内存映射（/proc/iomem）
+        // 物理内存映射（/proc/iomem；文件不可读时静默输出空表）
         println!();
         for line in read_iomem() {
             println!("{}", line);
@@ -117,7 +123,7 @@ impl Applet for Meminfo {
 
         // 进程内存占用（按 RSS 降序；默认过滤 RSS=0 的内核线程，-a 显示全部）
         let mut procs = collect_processes();
-        procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then(a.pid.cmp(&b.pid)));
+        sort_processes(&mut procs);
         if !show_all {
             procs.retain(|p| p.rss_kb > 0);
         }
@@ -130,7 +136,7 @@ impl Applet for Meminfo {
     }
 }
 
-/// 一个进程的内存信息（RSS 单位 kB）。
+/// 一个进程的内存信息（VSZ/RSS 单位 kB）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProcMem {
     pub(crate) pid: u32,
@@ -144,11 +150,12 @@ pub(crate) struct ProcMem {
     pub(crate) name: String,
 }
 
-/// 遍历 /proc 收集所有进程的内存信息（RSS 来自 statm 的 resident 页数）。
+/// 遍历 /proc 收集所有进程的内存信息（statm 的 size/resident + stat 的 ppid/state）。
 fn collect_processes() -> Vec<ProcMem> {
     let page_kb = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64) / 1024;
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let proc_root = &crate::config::load().paths.proc;
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         return out;
     };
     for entry in entries.flatten() {
@@ -172,9 +179,19 @@ fn collect_processes() -> Vec<ProcMem> {
     out
 }
 
+/// 读取 /proc/<pid>/<file> 内容（路径根可配置）；失败返回空串。
+fn read_proc_file(pid: u32, file: &str) -> String {
+    let proc_root = &crate::config::load().paths.proc;
+    std::fs::read_to_string(format!("{}/{}/{}", proc_root, pid, file)).unwrap_or_default()
+}
+
+/// 按 RSS 降序、同值按 PID 升序排序。
+fn sort_processes(procs: &mut [ProcMem]) {
+    procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then(a.pid.cmp(&b.pid)));
+}
+
 fn read_statm(pid: u32) -> (u64, u64) {
-    let content = std::fs::read_to_string(format!("/proc/{}/statm", pid)).unwrap_or_default();
-    parse_statm(&content)
+    parse_statm(&read_proc_file(pid, "statm"))
 }
 
 /// 解析 statm 文本，返回 (size 页数, resident 页数)（第 1、2 个字段）。
@@ -186,38 +203,41 @@ pub(crate) fn parse_statm(content: &str) -> (u64, u64) {
 }
 
 fn read_ppid(pid: u32) -> u32 {
-    let content = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
-    parse_stat_ppid(&content)
+    parse_stat_ppid(&read_proc_file(pid, "stat"))
 }
 
-/// 解析 stat 文本，返回 ppid（第 4 字段；comm 可能含空格/括号，从 ")" 后取）。
-pub(crate) fn parse_stat_ppid(content: &str) -> u32 {
-    let Some(rest) = content.split(')').nth(1) else {
-        return 0;
-    };
-    rest.split_whitespace()
+/// stat 文本中 ")" 之后的字段（comm 可能含空格/括号）。
+fn stat_tail(content: &str) -> Vec<&str> {
+    content
+        .split(')')
         .nth(1)
+        .map(|s| s.split_whitespace().collect())
+        .unwrap_or_default()
+}
+
+/// 解析 stat 文本，返回 ppid（")" 后第 2 个字段）。
+pub(crate) fn parse_stat_ppid(content: &str) -> u32 {
+    stat_tail(content)
+        .get(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
 
 fn read_state(pid: u32) -> String {
-    let content = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
-    parse_stat_state(&content)
+    parse_stat_state(&read_proc_file(pid, "stat"))
 }
 
 /// 解析 stat 文本，返回进程状态（")" 后第 1 个字段，如 S/R/Z）。
 pub(crate) fn parse_stat_state(content: &str) -> String {
-    let Some(rest) = content.split(')').nth(1) else {
-        return String::new();
-    };
-    rest.split_whitespace().next().unwrap_or("").to_string()
+    stat_tail(content)
+        .first()
+        .copied()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn read_comm(pid: u32) -> String {
-    std::fs::read_to_string(format!("/proc/{}/comm", pid))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    read_proc_file(pid, "comm").trim().to_string()
 }
 
 /// 解析 /proc/meminfo 内容为字段 map（单位 kB，忽略非数字字段）。
@@ -316,16 +336,13 @@ fn format_detail(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
         .collect();
     let mut lines = Vec::new();
     lines.push(format!("Memory detail ({}):", unit.label()));
-    let mut i = 0;
-    while i < values.len() {
-        let left = format!("  {:<20}{:>12}", values[i].0, values[i].1);
-        let right = if i + 1 < values.len() {
-            format!("  {:<20}{:>12}", values[i + 1].0, values[i + 1].1)
-        } else {
-            String::new()
-        };
+    for pair in values.chunks(2) {
+        let left = format!("  {:<20}{:>12}", pair[0].0, pair[0].1);
+        let right = pair
+            .get(1)
+            .map(|(n, v)| format!("  {:<20}{:>12}", n, v))
+            .unwrap_or_default();
         lines.push(format!("{}{}", left, right));
-        i += 2;
     }
     lines
 }
@@ -403,7 +420,6 @@ pub(crate) fn format_iomem(content: &str) -> Vec<String> {
     lines
 }
 
-/// 以 free 风格输出统计。
 /// 生成统计输出行（纯函数，便于测试）。
 /// 对齐规则：标签列固定 14 宽（左对齐），数字列 13 宽右对齐，
 /// 标题行与数据行使用相同的列宽，保证各列右缘一致。
@@ -434,8 +450,7 @@ fn format_stats(stats: &MemStats, unit: Unit) -> Vec<String> {
     ]
 }
 
-/// 生成进程内存列表行（按 RSS 降序，单位随 unit）。
-/// 生成进程内存列表行（按 RSS 降序；VSZ/RSS 单位随 unit，%MEM 为 RSS 占总内存百分比）。
+/// 生成进程内存列表行（VSZ/RSS 单位随 unit，%MEM 为 RSS 占总内存百分比）。
 fn format_processes(procs: &[ProcMem], unit: Unit, mem_total_kb: u64) -> Vec<String> {
     let mut lines = Vec::with_capacity(procs.len() + 1);
     lines.push(format!(
@@ -599,6 +614,40 @@ Shmem:              4104 kB
         assert_eq!(parse_stat_state("123 (my proc) S 1 2 3 4\n"), "S");
         assert_eq!(parse_stat_state("1 (rbox) R 0 1 1\n"), "R");
         assert_eq!(parse_stat_state("no parens\n"), "");
+    }
+
+    #[test]
+    fn sort_processes_by_rss_desc() {
+        let mut procs = vec![
+            ProcMem {
+                pid: 1,
+                ppid: 0,
+                vsz_kb: 0,
+                rss_kb: 100,
+                state: "S".into(),
+                name: "a".into(),
+            },
+            ProcMem {
+                pid: 2,
+                ppid: 1,
+                vsz_kb: 0,
+                rss_kb: 300,
+                state: "S".into(),
+                name: "b".into(),
+            },
+            ProcMem {
+                pid: 3,
+                ppid: 1,
+                vsz_kb: 0,
+                rss_kb: 300,
+                state: "R".into(),
+                name: "c".into(),
+            },
+        ];
+        sort_processes(&mut procs);
+        assert_eq!(procs[0].pid, 2);
+        assert_eq!(procs[1].pid, 3); // 同 RSS 按 PID 升序
+        assert_eq!(procs[2].pid, 1);
     }
 
     #[test]
