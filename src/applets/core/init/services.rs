@@ -476,12 +476,13 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
     }
 }
 
-/// 拉起前台 console shell（getty 替代）。
+/// 拉起降级/应急 shell（路径用配置的缺省 shell，默认 /bin/sh）。
 pub(crate) fn spawn_fresh_shell() -> Option<Child> {
+    let shell = crate::config::load().login.shell.clone();
     std::process::Command::new("/bin/rbox")
         .arg("sh")
         .spawn()
-        .or_else(|_| std::process::Command::new("/bin/sh").spawn())
+        .or_else(|_| std::process::Command::new(shell).spawn())
         .ok()
 }
 

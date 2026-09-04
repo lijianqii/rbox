@@ -18,6 +18,8 @@ pub(crate) struct RboxConfig {
     pub(crate) login: LoginConfig,
     #[serde(rename = "init")]
     pub(crate) init: InitConfig,
+    #[serde(rename = "shell")]
+    pub(crate) shell: ShellConfig,
 }
 
 /// 路径类配置。
@@ -129,6 +131,22 @@ impl Default for InitConfig {
     }
 }
 
+/// shell 配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub(crate) struct ShellConfig {
+    /// 未设置 $PS1 时的默认提示符
+    pub(crate) default_ps1: String,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            default_ps1: "rbox# ".to_string(),
+        }
+    }
+}
+
 /// 读取并缓存全局配置（进程内只解析一次）。
 pub(crate) fn load() -> &'static RboxConfig {
     static CONFIG: OnceLock<RboxConfig> = OnceLock::new();
@@ -161,6 +179,7 @@ mod tests {
         assert_eq!(cfg.login.shell, "/bin/sh");
         assert_eq!(cfg.login.password_prompt, "Password: ");
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
+        assert_eq!(cfg.shell.default_ps1, "rbox# ");
     }
 
     #[test]

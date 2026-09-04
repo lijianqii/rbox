@@ -77,8 +77,9 @@ pub(crate) fn parse_args(args: &[String]) -> Result<GettyOpts, String> {
             "-t" => {
                 i += 1;
                 let v = args.get(i).ok_or("option -t requires SECONDS")?;
-                opts.timeout_secs =
-                    Some(v.parse().map_err(|_| format!("invalid -t value: {}", v))?);
+                let secs: u64 = v.parse().map_err(|_| format!("invalid -t value: {}", v))?;
+                // 0 表示不超时（避免 0 秒超时导致无限重试刷屏）
+                opts.timeout_secs = (secs > 0).then_some(secs);
             }
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option: {}", s));
@@ -305,6 +306,13 @@ mod tests {
         assert!(parse_args(&["-t".to_string()]).is_err());
         assert!(parse_args(&["-t".to_string(), "abc".to_string()]).is_err());
         assert!(parse_args(&["-x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_timeout_zero_means_no_timeout() {
+        // -t 0 表示不超时，避免 0 秒超时导致无限重试刷屏
+        let opts = parse_args(&["-t".to_string(), "0".to_string()]).unwrap();
+        assert_eq!(opts.timeout_secs, None);
     }
 
     #[test]

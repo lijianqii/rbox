@@ -525,6 +525,7 @@ RestartSec = 1
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
 | [login] | password_prompt | "Password: " | 密码提示 |
 | [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
+| [shell] | default_ps1 | "rbox# " | 未设置 $PS1 时的默认提示符 |
 
 生产 rootfs 内置一份带注释的 `/etc/rbox.conf` 作为示例。
 
@@ -754,7 +755,7 @@ make unittest
 | shell/reader | make_prompt（PS1 展开）、display_width（CJK/全角宽度）、set_isig | 16 |
 | shell/executor | 重定向打开、命令解析回退、管道失败清理 | 6 |
 | shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 7 |
-| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation、source 历史隔离 | 12 |
+| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation、source 历史隔离、~ 路径展开 | 14 |
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 15 |
 | init/server | 控制协议处理 | 8 |
 | init/services | 服务生命周期、schedule_restart（on-failure/always）、finish_daemonize | 13 |
@@ -764,8 +765,8 @@ make unittest
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 8、rlogin 11 | 27 |
-| **合计** | | **402** |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 9、rlogin 11 | 28 |
+| **合计** | | **405** |
 
 测试结果示例：
 
@@ -949,7 +950,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（402 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（405 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

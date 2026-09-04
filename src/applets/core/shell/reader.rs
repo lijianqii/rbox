@@ -93,7 +93,8 @@ pub fn make_prompt(pending: &str) -> String {
     if let Ok(ps1) = std::env::var("PS1") {
         expand_ps1(&ps1)
     } else {
-        "rbox# ".to_string()
+        // 未设置 $PS1 时用配置的默认提示符（默认 rbox# ）
+        crate::config::load().shell.default_ps1.clone()
     }
 }
 
@@ -124,7 +125,8 @@ pub fn expand_ps1(ps1: &str) -> String {
                         );
                     }
                     'h' => {
-                        let host = std::fs::read_to_string("/etc/hostname")
+                        let hostname_path = &crate::config::load().paths.hostname;
+                        let host = std::fs::read_to_string(hostname_path)
                             .unwrap_or_default()
                             .trim()
                             .to_string();

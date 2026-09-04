@@ -703,4 +703,29 @@ mod tests {
         assert_eq!(history, vec!["pre-existing".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn expand_tilde_path_works() {
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", "/root") };
+        assert_eq!(expand_tilde_path("~"), "/root");
+        assert_eq!(expand_tilde_path("~/.rbox_history"), "/root/.rbox_history");
+        assert_eq!(expand_tilde_path("/var/hist"), "/var/hist");
+        match orig {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn expand_tilde_path_without_home_keeps_original() {
+        let orig = std::env::var_os("HOME");
+        unsafe { std::env::remove_var("HOME") };
+        assert_eq!(expand_tilde_path("~/.rbox_history"), "/.rbox_history");
+        assert_eq!(expand_tilde_path("~"), "~");
+        match orig {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
 }
