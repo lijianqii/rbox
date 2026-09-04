@@ -48,6 +48,23 @@ pub(crate) fn sort_processes(procs: &mut [ProcMem]) {
     procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then(a.pid.cmp(&b.pid)));
 }
 
+/// 读取系统总内存（kB，/proc/meminfo 的 MemTotal）；失败返回 0。
+pub(crate) fn mem_total_kb() -> u64 {
+    let path = &crate::config::load().paths.meminfo;
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| {
+            c.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                if k.trim() != "MemTotal" {
+                    return None;
+                }
+                v.split_whitespace().next()?.parse().ok()
+            })
+        })
+        .unwrap_or(0)
+}
+
 /// 读取 /proc/<pid>/<file> 内容（路径根可配置）；失败返回空串。
 fn read_proc_file(pid: u32, file: &str) -> String {
     let proc_root = &crate::config::load().paths.proc;
