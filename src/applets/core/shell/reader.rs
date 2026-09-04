@@ -72,7 +72,7 @@ fn char_display_width(c: char) -> usize {
 }
 
 /// 重绘当前行：`\r` + 清除行 + prompt + line + 光标定位。
-/// `pending` 非空表示续行模式，显示 `> ` 提示符；否则使用 `rbox# ` 或 $PS1。
+/// `pending` 非空表示续行模式，显示 `> ` 提示符；否则使用默认 `> ` 或 $PS1。
 pub fn redraw(pending: &str, line: &str, cursor: usize) {
     let prompt = make_prompt(pending);
     let _ = write!(io::stdout(), "\r\x1b[K{}{}", prompt, line);
@@ -93,7 +93,7 @@ pub fn make_prompt(pending: &str) -> String {
     if let Ok(ps1) = std::env::var("PS1") {
         expand_ps1(&ps1)
     } else {
-        // 未设置 $PS1 时用配置的默认提示符（默认 rbox# ）
+        // 未设置 $PS1 时用配置的默认提示符（默认 "> "）
         crate::config::load().shell.default_ps1.clone()
     }
 }
@@ -234,7 +234,7 @@ mod tests {
         unsafe {
             std::env::remove_var("PS1");
         }
-        assert_eq!(make_prompt(""), "rbox# ");
+        assert_eq!(make_prompt(""), "> ");
     }
 
     #[test]

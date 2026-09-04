@@ -142,7 +142,7 @@ pub(crate) struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            default_ps1: "rbox# ".to_string(),
+            default_ps1: "> ".to_string(),
         }
     }
 }
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(cfg.login.shell, "/bin/sh");
         assert_eq!(cfg.login.password_prompt, "Password: ");
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
-        assert_eq!(cfg.shell.default_ps1, "rbox# ");
+        assert_eq!(cfg.shell.default_ps1, "> ");
     }
 
     #[test]

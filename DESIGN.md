@@ -218,7 +218,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 
 文件：src/applets/core/shell/（模块目录，含单元测试）
 
-一个命令解释器，REPL 循环逐字节读取输入并执行。提示符：`rbox# `（续行时 `> `）
+一个命令解释器，REPL 循环逐字节读取输入并执行。提示符：`> `（续行时也是 `> `）
 
 ### 功能
 
@@ -433,7 +433,7 @@ shell 启动时从 `~/.rbox_history` 加载历史记录，每条命令执行后�
 
 ### PS1 提示符
 
-shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u`（用户名）、`\h`（主机名）、`\w`（当前路径，`$HOME` 替换为 `~`）、`\$`（`$`）、`\#`（`#`）、`\n`（换行）、`\e`（ESC）、`\\`（反斜杠）。`$PS1` 未设置时默认为 `rbox# `。
+shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u`（用户名）、`\h`（主机名）、`\w`（当前路径，`$HOME` 替换为 `~`）、`\$`（`$`）、`\#`（`#`）、`\n`（换行）、`\e`（ESC）、`\\`（反斜杠）。`$PS1` 未设置时默认为简约的 `> `（`/etc/rbox.conf [shell] default_ps1` 可改）。
 
 `/etc/profile` 在 shell 启动时自动 source，设置默认 PATH、USER、HOSTNAME、PS1 等。
 
@@ -525,7 +525,7 @@ RestartSec = 1
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
 | [login] | password_prompt | "Password: " | 密码提示 |
 | [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
-| [shell] | default_ps1 | "rbox# " | 未设置 $PS1 时的默认提示符 |
+| [shell] | default_ps1 | "> " | 未设置 $PS1 时的默认提示符 |
 
 生产 rootfs 内置一份带注释的 `/etc/rbox.conf` 作为示例。
 

@@ -9,8 +9,9 @@ export HOSTNAME=$(cat /etc/hostname 2>/dev/null || echo rbox)
 export USER=root
 export HOME=/
 
-# Set prompt: user@host:cwd#
-export PS1='\u@\h:\w# '
+# Set prompt (minimal)
+# 简约提示符
+export PS1='> '
 
 # Set default editor
 export EDITOR=vi
