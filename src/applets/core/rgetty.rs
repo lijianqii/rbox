@@ -11,7 +11,7 @@
 //! - `TTY`：可写裸设备名（`ttyAMA0`）或完整路径（`/dev/ttyAMA0`）。
 //!
 //! 终端选择优先级：
-//! 1. service 配置（`[Service] TTY = ...`，经 init 拼成命令行参数传入）；
+//! 1. 命令行显式 TTY 参数（由 `ExecStart` 完整命令直接传给 rgetty）；
 //! 2. 内核信息：`/sys/class/tty/console/active`（实际激活的 console），
 //!    回退解析 `/proc/cmdline` 的 `console=` 参数；
 //! 3. 以上均不可用时继承父进程的 stdin/stdout/stderr（init console 服务）。

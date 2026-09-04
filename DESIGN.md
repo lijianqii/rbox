@@ -467,7 +467,7 @@ init ──Console=true 服务──► rgetty ──读取用户名──► ex
   - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
   - 打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
   登录失败/shell 退出时进程结束，init 的 `Console = true` 机制自动重新拉起，回到登录提示。
-  **终端选择优先级**：service 配置（`[Service] TTY = ...`，由 init 拼成命令行参数）>
+  **终端选择优先级**：命令行显式 TTY 参数（由 `ExecStart` 完整命令直接传给 rgetty）>
   `/sys/class/tty/console/active`（内核实际激活的 console）> `/proc/cmdline` 的
   `console=` 参数 > 继承父进程 stdio。推导出的 tty 节点不存在时自动回退继承 stdio；
   TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
@@ -484,13 +484,12 @@ init ──Console=true 服务──► rgetty ──读取用户名──► ex
 `/etc/shadow`（root 密码为 SHA-256 crypt 哈希，明文是 `root`；nobody 锁定 `!`）。
 rootfs 携带 `libcrypt.so.1`（由 Makefile 从交叉工具链拷贝，rlogin 的 crypt 校验依赖）。
 
-`[Service] TTY` 字段示例（生产 console 单元，rgetty 第一优先级）：
+生产 console 单元示例（getty 参数直接写在 ExecStart 完整命令中）：
 
 ```toml
 [Service]
 Type = "simple"
-ExecStart = "/bin/rgetty -L -t 60"
-TTY = "ttyAMA0"        # init 拼到 ExecStart 末尾 → /bin/rgetty -L -t 60 ttyAMA0
+ExecStart = "/bin/rgetty -L -t 60 ttyAMA0"   # -L + 超时 + 登录终端
 Console = true
 ```
 
@@ -731,7 +730,7 @@ make unittest
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 13、rlogin 11 | 32 |
-| **合计** | | **401** |
+| **合计** | | **400** |
 
 测试结果示例：
 
@@ -913,7 +912,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（401 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（400 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

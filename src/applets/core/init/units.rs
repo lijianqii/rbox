@@ -102,12 +102,6 @@ pub(crate) struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "Console")]
     pub(crate) console: bool,
-    /// 登录终端（rgetty 第一优先级）：可写裸设备名（ttyAMA0）或 /dev/ 路径。
-    /// 由 init 拼到 console 服务命令行末尾，如 `ExecStart = "/bin/rgetty -L -t 60"`
-    /// 配 `TTY = "ttyAMA0"` 实际执行 `/bin/rgetty -L -t 60 ttyAMA0`。
-    #[serde(default)]
-    #[serde(rename = "TTY")]
-    pub(crate) tty: Option<String>,
 }
 
 fn default_restart_sec() -> u64 {
@@ -335,7 +329,6 @@ mod tests {
                 user: None,
                 group: None,
                 console: false,
-                tty: None,
             },
             install: InstallSection {
                 wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),
@@ -485,13 +478,13 @@ mod tests {
     }
 
     #[test]
-    fn service_tty_field_parses() {
+    fn service_exec_start_keeps_full_command() {
+        // getty 参数（-L/-t/tty）应直接写在 ExecStart 完整命令中，init 不做额外字段。
         let u: Unit =
-            toml::from_str("[Service]\nExecStart = \"/bin/rgetty -L -t 60\"\nTTY = \"ttyAMA0\"\n")
-                .unwrap();
-        assert_eq!(u.service.tty.as_deref(), Some("ttyAMA0"));
-
-        let u: Unit = toml::from_str("[Service]\nExecStart = \"/bin/rgetty\"\n").unwrap();
-        assert_eq!(u.service.tty, None);
+            toml::from_str("[Service]\nExecStart = \"/bin/rgetty -L -t 60 ttyAMA0\"\n").unwrap();
+        assert_eq!(
+            u.service.exec_start.as_deref(),
+            Some("/bin/rgetty -L -t 60 ttyAMA0")
+        );
     }
 }

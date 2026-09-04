@@ -12,7 +12,7 @@
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
 - **有序关机/重启**：ExecStop 逆序执行、进程组清理、孤儿进程收割、kmsg 日志
 - **系统初始化**：`/etc/fstab` 挂载、hostname、sysctl、PATH
-- **终端登录**：`rgetty` 登录提示（`-L`/`-t` 选项，TTY 可由 service 配置指定或从内核 console 自动识别）+ `rlogin` 密码校验（/etc/passwd + /etc/shadow、crypt 哈希、降权、MOTD）
+- **终端登录**：`rgetty` 登录提示（`-L`/`-t` 选项，TTY 直接作为 rgetty 参数写在 ExecStart 完整命令中，也可从内核 console 自动识别）+ `rlogin` 密码校验（/etc/passwd + /etc/shadow、crypt 哈希、降权、MOTD）
 - **交互式 shell**：
   - 管道 `|`、重定向 `>` `>>` `<`、后台 `&`
   - 控制操作符 `;` `&&` `||`
@@ -22,7 +22,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、401 个单元测试、111 个集成断言、rustfmt、make strip
+- **工程化**：Clippy 零警告、400 个单元测试、111 个集成断言、rustfmt、make strip
 
 ## 快速开始
 
