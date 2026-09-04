@@ -350,30 +350,34 @@ fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
     };
     let mut lines = Vec::new();
     lines.push(format!("Memory accounting ({}):", unit.label()));
+    // desc 列宽 = 最长描述（含 User/Kernel/Total 汇总行），保证值列对齐
+    let desc_w = acc
+        .items
+        .iter()
+        .map(|i| i.desc.chars().count())
+        .chain(
+            ["user total", "kernel total", "total"]
+                .iter()
+                .map(|s| s.chars().count()),
+        )
+        .max()
+        .unwrap_or(10);
+    let row = |label: &str, desc: &str, kb: u64| {
+        format!(
+            "  {:<12} {:<desc_w$} {:>10} {:>6.1}%",
+            label,
+            desc,
+            unit.convert(kb),
+            pct(kb),
+            desc_w = desc_w
+        )
+    };
     for it in &acc.items {
-        lines.push(format!(
-            "  {:<12} {:<10} {:>10} {:>6.1}%",
-            it.label,
-            it.desc,
-            unit.convert(it.kb),
-            pct(it.kb)
-        ));
+        lines.push(row(it.label, it.desc, it.kb));
     }
     lines.push(format!("  {}", "-".repeat(40)));
-    lines.push(format!(
-        "  {:<12} {:<10} {:>10} {:>6.1}%",
-        "User",
-        "user total",
-        unit.convert(acc.user_kb),
-        pct(acc.user_kb)
-    ));
-    lines.push(format!(
-        "  {:<12} {:<10} {:>10} {:>6.1}%",
-        "Kernel",
-        "kernel total",
-        unit.convert(acc.kernel_kb),
-        pct(acc.kernel_kb)
-    ));
+    lines.push(row("User", "user total", acc.user_kb));
+    lines.push(row("Kernel", "kernel total", acc.kernel_kb));
     // 明细各项之和（含 Other）应等于 MemTotal
     let sum: u64 = acc.items.iter().map(|i| i.kb).sum();
     let check = if sum == total {
@@ -385,14 +389,7 @@ fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
             unit.convert(sum)
         )
     };
-    lines.push(format!(
-        "  {:<12} {:<10} {:>10} {:>6.1}%  {}",
-        "Total",
-        "total",
-        unit.convert(sum),
-        if total > 0 { 100.0 } else { 0.0 },
-        check
-    ));
+    lines.push(format!("{}  {}", row("Total", "total", sum), check));
     lines
 }
 
@@ -737,6 +734,25 @@ Shmem:              4104 kB
         assert!(out.contains("Kernel"), "{}", out);
         assert!(out.contains("== MemTotal"), "{}", out);
         assert!(out.contains("1928844"), "{}", out);
+    }
+
+    #[test]
+    fn format_accounting_columns_aligned() {
+        let fields = parse_meminfo(SAMPLE_MEMINFO);
+        let lines = format_accounting(&fields, Unit::Kb);
+        // 所有含 '%' 的数据行（标题/分隔线除外）百分比列位置一致 → 列对齐
+        let positions: Vec<usize> = lines[1..]
+            .iter()
+            .filter(|l| l.contains('%'))
+            .map(|l| l.rfind('%').unwrap_or(0))
+            .collect();
+        let first = positions[0];
+        assert!(
+            positions.iter().all(|&p| p == first),
+            "pct 列未对齐: {:?}\n{}",
+            positions,
+            lines.join("\n")
+        );
     }
 
     #[test]

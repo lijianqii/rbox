@@ -769,9 +769,9 @@ make unittest
 | config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
-| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 18、proc 5、processes 9 | 52 |
+| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19、proc 5、processes 9 | 53 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 10、rlogin 11 | 31 |
-| **合计** | | **439** |
+| **合计** | | **440** |
 
 测试结果示例：
 
@@ -955,7 +955,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（439 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（440 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
