@@ -91,7 +91,8 @@ impl Applet for Meminfo {
                 return ExitCode::FAILURE;
             }
         };
-        let stats = match compute_stats(&content) {
+        let fields = parse_meminfo(&content);
+        let stats = match compute_stats_from_map(&fields) {
             Some(s) => s,
             None => {
                 eprintln!("meminfo: cannot parse {}", path);
@@ -99,6 +100,12 @@ impl Applet for Meminfo {
             }
         };
         for line in format_stats(&stats, unit) {
+            println!("{}", line);
+        }
+
+        // 详细内存明细（/proc/meminfo 常见字段）
+        println!();
+        for line in format_detail(&fields, unit) {
             println!("{}", line);
         }
 
@@ -199,9 +206,14 @@ fn parse_meminfo(content: &str) -> HashMap<String, u64> {
         .collect()
 }
 
-/// 由 /proc/meminfo 内容计算统计值；关键字段缺失时返回 None。
+/// 由 /proc/meminfo 内容计算统计值（仅测试使用；run 用 compute_stats_from_map）。
+#[cfg(test)]
 pub(crate) fn compute_stats(content: &str) -> Option<MemStats> {
-    let m = parse_meminfo(content);
+    compute_stats_from_map(&parse_meminfo(content))
+}
+
+/// 由解析后的字段 map 计算统计值（run 与 compute_stats 共用，避免重复解析）。
+pub(crate) fn compute_stats_from_map(m: &HashMap<String, u64>) -> Option<MemStats> {
     let total = *m.get("MemTotal")?;
     let free = *m.get("MemFree")?;
     let shared = *m.get("Shmem").unwrap_or(&0);
@@ -228,6 +240,58 @@ pub(crate) fn compute_stats(content: &str) -> Option<MemStats> {
         swap_used: swap_total.saturating_sub(swap_free),
         swap_free,
     })
+}
+
+/// 详细明细中展示的 /proc/meminfo 字段（按分组顺序）。
+const DETAIL_FIELDS: &[&str] = &[
+    // 总量/空闲/共享
+    "MemTotal",
+    "MemFree",
+    "MemAvailable",
+    "Shmem",
+    // 缓存与回写
+    "Buffers",
+    "Cached",
+    "SwapCached",
+    "SReclaimable",
+    "SUnreclaim",
+    "Dirty",
+    "Writeback",
+    "WritebackTmp",
+    "AnonPages",
+    "Mapped",
+    "PageTables",
+    "KernelStack",
+    "Bounce",
+    // 活跃/不活跃
+    "Active",
+    "Inactive",
+    "Active(anon)",
+    "Inactive(anon)",
+    "Active(file)",
+    "Inactive(file)",
+    "Unevictable",
+    "Mlocked",
+    "Slab",
+    // 交换与内核虚拟内存
+    "SwapTotal",
+    "SwapFree",
+    "Committed_AS",
+    "VmallocTotal",
+    "VmallocUsed",
+    "VmallocChunk",
+];
+
+/// 生成详细内存明细行（字段缺失自动跳过）。
+fn format_detail(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("Memory detail ({}):", unit.label()));
+    for name in DETAIL_FIELDS {
+        if let Some(v) = fields.get(*name) {
+            lines.push(format!("  {:<20}{:>12}", name, unit.convert(*v)));
+        }
+    }
+    lines
 }
 
 /// 以 free 风格输出统计。
@@ -297,6 +361,7 @@ SwapCached:            0 kB
 Active:          763104 kB
 Inactive:        445292 kB
 Active(anon):    663168 kB
+AnonPages:       663168 kB
 Inactive(anon):   84220 kB
 Active(file):     99936 kB
 Inactive(file):  361072 kB
@@ -433,5 +498,33 @@ Shmem:              4104 kB
         let lines_m = format_processes(&procs, Unit::Mb);
         assert!(lines_m[0].contains("RSS(MB)"), "out: {}", lines_m[0]);
         assert!(lines_m[1].contains("11"), "out: {}", lines_m[1]);
+    }
+
+    #[test]
+    fn format_detail_lists_fields() {
+        let fields = parse_meminfo(SAMPLE_MEMINFO);
+        let lines = format_detail(&fields, Unit::Kb);
+        assert!(lines[0].contains("Memory detail (kB)"), "out: {}", lines[0]);
+        let out = lines.join("\n");
+        assert!(out.contains("MemTotal"), "out: {}", out);
+        assert!(out.contains("AnonPages"), "out: {}", out);
+        assert!(out.contains("SwapTotal"), "out: {}", out);
+        // 值跟随单位换算：MemTotal 1928844 / 1024 = 1883 (MB)
+        let lines_m = format_detail(&fields, Unit::Mb);
+        let memtotal_line = lines_m
+            .iter()
+            .find(|l| l.contains("MemTotal"))
+            .unwrap()
+            .to_string();
+        assert!(memtotal_line.contains("1883"), "out: {}", memtotal_line);
+    }
+
+    #[test]
+    fn format_detail_skips_missing_fields() {
+        let fields = parse_meminfo("MemTotal: 100 kB\nMemFree: 50 kB\n");
+        let lines = format_detail(&fields, Unit::Kb);
+        let out = lines.join("\n");
+        assert!(out.contains("MemTotal"), "out: {}", out);
+        assert!(!out.contains("AnonPages"), "out: {}", out);
     }
 }
