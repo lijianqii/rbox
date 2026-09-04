@@ -43,7 +43,7 @@ BusyBox 风格 multi-call 二进制（Rust, edition 2024），交叉编译为 aa
 - applet 以 `ExitCode` 返回退出码；解析 `&[String]` 参数
 - 宿主机单元测试（`#[cfg(test)]` 或 tests/）须在 x86_64 上跑，勿依赖 ARM64 交叉环境
 - 新增 applet/功能时：同时补 `#[cfg(test)]` 单元测试与 `tests/run_tests.sh` 断言
-  （集成测试当前 125 断言，覆盖 33/33 applet，汇总行必须 0 失败；文档中测试数字
+  （集成测试当前 127 断言，覆盖 33/33 applet，汇总行必须 0 失败；文档中测试数字
   见 README 与 DESIGN.md「测试」章节，改动后同步更新）
 - 集成测试通过 QEMU 驱动（tests/run_tests.sh），改动 shell/init 行为后须跑 `make test`
 - init 单元文件是 TOML：`[Unit]` / `[Service]` / `[Install]`（见 tests/units/*.toml 范例）

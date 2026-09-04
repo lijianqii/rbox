@@ -117,6 +117,12 @@ impl Applet for Meminfo {
             println!("{}", line);
         }
 
+        // 内存分类核算（各分类之和与 MemTotal 对账）
+        println!();
+        for line in format_accounting(&fields, unit) {
+            println!("{}", line);
+        }
+
         // 物理内存映射（/proc/iomem；文件不可读时静默输出空表）
         println!();
         for line in read_iomem() {
@@ -242,6 +248,151 @@ fn format_detail(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
             .unwrap_or_default();
         lines.push(format!("{}{}", left, right));
     }
+    lines
+}
+
+/// 一条内存分类核算项。
+pub(crate) struct AccountingItem {
+    label: &'static str,
+    desc: &'static str,
+    kb: u64,
+}
+
+/// 内存分类核算结果：明细项 + 用户态/内核态汇总 + 总内存。
+pub(crate) struct Accounting {
+    pub(crate) items: Vec<AccountingItem>,
+    pub(crate) user_kb: u64,
+    pub(crate) kernel_kb: u64,
+    pub(crate) total_kb: u64,
+}
+
+/// 把 MemTotal 拆解为互不重叠的分类（页缓存已扣除 Shmem，避免重复计数），
+/// 各项之和恒等于 MemTotal（"其他/未分类"兜底），用于对账。
+pub(crate) fn compute_accounting(fields: &HashMap<String, u64>) -> Accounting {
+    let total = *fields.get("MemTotal").unwrap_or(&0);
+    let free = *fields.get("MemFree").unwrap_or(&0);
+    let anon = *fields.get("AnonPages").unwrap_or(&0);
+    let shmem = *fields.get("Shmem").unwrap_or(&0);
+    let buffers = *fields.get("Buffers").unwrap_or(&0);
+    let reclaimable = *fields.get("SReclaimable").unwrap_or(&0);
+    let kernel = *fields.get("SUnreclaim").unwrap_or(&0)
+        + *fields.get("PageTables").unwrap_or(&0)
+        + *fields.get("KernelStack").unwrap_or(&0)
+        + *fields.get("VmallocUsed").unwrap_or(&0)
+        + *fields.get("Bounce").unwrap_or(&0);
+    // Cached 包含 tmpfs/共享页（Shmem），扣减后作为纯页缓存，避免与 Shmem 重复
+    let cache = fields
+        .get("Cached")
+        .copied()
+        .unwrap_or(0)
+        .saturating_sub(shmem);
+    let accounted = free + anon + shmem + cache + buffers + reclaimable + kernel;
+    let other = total.saturating_sub(accounted);
+    Accounting {
+        items: vec![
+            AccountingItem {
+                label: "MemFree",
+                desc: "空闲",
+                kb: free,
+            },
+            AccountingItem {
+                label: "AnonPages",
+                desc: "用户态匿名",
+                kb: anon,
+            },
+            AccountingItem {
+                label: "Shmem",
+                desc: "用户态共享",
+                kb: shmem,
+            },
+            AccountingItem {
+                label: "Cached",
+                desc: "页缓存",
+                kb: cache,
+            },
+            AccountingItem {
+                label: "Buffers",
+                desc: "缓冲区",
+                kb: buffers,
+            },
+            AccountingItem {
+                label: "SReclaimable",
+                desc: "内核可回收缓存",
+                kb: reclaimable,
+            },
+            AccountingItem {
+                label: "Kernel",
+                desc: "内核态固定",
+                kb: kernel,
+            },
+            AccountingItem {
+                label: "Other",
+                desc: "其他/未分类",
+                kb: other,
+            },
+        ],
+        user_kb: anon + shmem,
+        kernel_kb: reclaimable + kernel,
+        total_kb: total,
+    }
+}
+
+/// 生成内存分类核算输出（各项 + 用户态/内核态汇总 + Total 对账）。
+fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
+    let acc = compute_accounting(fields);
+    let total = acc.total_kb;
+    let pct = |kb: u64| {
+        if total > 0 {
+            kb as f64 * 100.0 / total as f64
+        } else {
+            0.0
+        }
+    };
+    let mut lines = Vec::new();
+    lines.push(format!("Memory accounting ({}):", unit.label()));
+    for it in &acc.items {
+        lines.push(format!(
+            "  {:<12} {:<10} {:>10} {:>6.1}%",
+            it.label,
+            it.desc,
+            unit.convert(it.kb),
+            pct(it.kb)
+        ));
+    }
+    lines.push(format!("  {}", "-".repeat(40)));
+    lines.push(format!(
+        "  {:<12} {:<10} {:>10} {:>6.1}%",
+        "User",
+        "用户态合计",
+        unit.convert(acc.user_kb),
+        pct(acc.user_kb)
+    ));
+    lines.push(format!(
+        "  {:<12} {:<10} {:>10} {:>6.1}%",
+        "Kernel",
+        "内核态合计",
+        unit.convert(acc.kernel_kb),
+        pct(acc.kernel_kb)
+    ));
+    // 明细各项之和（含 Other）应等于 MemTotal
+    let sum: u64 = acc.items.iter().map(|i| i.kb).sum();
+    let check = if sum == total {
+        "(== MemTotal)".to_string()
+    } else {
+        format!(
+            "(MemTotal {} ≠ 合计 {})",
+            unit.convert(total),
+            unit.convert(sum)
+        )
+    };
+    lines.push(format!(
+        "  {:<12} {:<10} {:>10} {:>6.1}%  {}",
+        "Total",
+        "合计",
+        unit.convert(sum),
+        if total > 0 { 100.0 } else { 0.0 },
+        check
+    ));
     lines
 }
 
@@ -559,6 +710,42 @@ Shmem:              4104 kB
         let out = lines.join("\n");
         assert!(out.contains("MemTotal"), "out: {}", out);
         assert!(!out.contains("AnonPages"), "out: {}", out);
+    }
+
+    #[test]
+    fn compute_accounting_sums_to_total() {
+        // 各项之和（含 Other 兜底）必须等于 MemTotal（对账恒等）
+        let fields = parse_meminfo(SAMPLE_MEMINFO);
+        let acc = compute_accounting(&fields);
+        let sum: u64 = acc.items.iter().map(|i| i.kb).sum();
+        assert_eq!(sum, acc.total_kb);
+        // 分类校验：cache 已扣 Shmem，kernel 为固定内核字段之和
+        assert_eq!(acc.user_kb, 663168 + 4104);
+        assert_eq!(acc.kernel_kb, 0 + 0 + 0 + 0 + 0); // 样例无 SReclaimable/SUnreclaim 等
+        // MemTotal = 1928844
+        assert_eq!(acc.total_kb, 1928844);
+    }
+
+    #[test]
+    fn format_accounting_output() {
+        let fields = parse_meminfo(SAMPLE_MEMINFO);
+        let lines = format_accounting(&fields, Unit::Kb);
+        assert!(lines[0].contains("Memory accounting (kB)"), "{}", lines[0]);
+        let out = lines.join("\n");
+        assert!(out.contains("MemFree"), "{}", out);
+        assert!(out.contains("User"), "{}", out);
+        assert!(out.contains("Kernel"), "{}", out);
+        assert!(out.contains("== MemTotal"), "{}", out);
+        assert!(out.contains("1928844"), "{}", out);
+    }
+
+    #[test]
+    fn format_accounting_mismatch_shown() {
+        // 异常数据（明细之和 > MemTotal）时显示差额提示而非恒等标记
+        let fields = parse_meminfo("MemTotal: 100 kB\nMemFree: 200 kB\n");
+        let lines = format_accounting(&fields, Unit::Kb);
+        let out = lines.join("\n");
+        assert!(out.contains("≠"), "{}", out);
     }
 
     #[test]
