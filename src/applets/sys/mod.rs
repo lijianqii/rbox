@@ -2,6 +2,7 @@
 pub mod date;
 pub mod env;
 pub mod false_;
+pub mod meminfo;
 pub mod pwd;
 pub mod sleep;
 pub mod true_;

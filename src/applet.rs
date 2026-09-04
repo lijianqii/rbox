@@ -57,6 +57,7 @@ declare_applets! {
     crate::applets::file::ln::LN,
     crate::applets::sys::date::DATE,
     crate::applets::sys::sleep::SLEEP,
+    crate::applets::sys::meminfo::MEMINFO,
     crate::applets::sys::env::ENV,
     crate::applets::text::printf::PRINTF,
     crate::applets::text::basename::BASENAME,

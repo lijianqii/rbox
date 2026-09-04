@@ -2,11 +2,11 @@
 
 一个用 Rust 编写的 BusyBox 风格多合一（multi-call）二进制，交叉编译为 ARM64 (aarch64)，
 运行在 QEMU 全系统模拟中。包含一个 systemd 风格的 init（PID 1，TOML 配置）、
-一个支持管道/重定向/历史/Tab 补全的交互式 shell，以及 31 个常用命令。
+一个支持管道/重定向/历史/Tab 补全的交互式 shell，以及 32 个常用命令。
 
 ## 特性
 
-- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 31 个命令
+- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 32 个命令
 - **systemd 风格 init**：TOML 单元文件、依赖拓扑排序、`Type=simple/forking`、
   `Restart=on-failure/always`（退避 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
@@ -23,7 +23,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、407 个单元测试、112 个集成断言、rustfmt、make strip
+- **工程化**：Clippy 零警告、414 个单元测试、115 个集成断言、rustfmt、make strip
 
 ## 快速开始
 

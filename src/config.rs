@@ -48,6 +48,8 @@ pub(crate) struct PathsConfig {
     pub(crate) hostname: String,
     /// sysctl 配置文件
     pub(crate) sysctl_conf: String,
+    /// 内存信息文件（meminfo 命令读取）
+    pub(crate) meminfo: String,
 }
 
 impl Default for PathsConfig {
@@ -64,6 +66,7 @@ impl Default for PathsConfig {
             fstab: "/etc/fstab".to_string(),
             hostname: "/etc/hostname".to_string(),
             sysctl_conf: "/etc/sysctl.conf".to_string(),
+            meminfo: "/proc/meminfo".to_string(),
         }
     }
 }
@@ -179,6 +182,7 @@ mod tests {
         assert_eq!(cfg.login.shell, "/bin/sh");
         assert_eq!(cfg.login.password_prompt, "Password: ");
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
+        assert_eq!(cfg.paths.meminfo, "/proc/meminfo");
         assert_eq!(cfg.shell.default_ps1, "> ");
     }
 

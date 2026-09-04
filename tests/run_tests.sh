@@ -178,6 +178,9 @@ OUT=$(timeout 400 bash -c '
   printf "sleep 3 &\n"; sleep 0.5
   printf "true\n"; sleep 0.5
   printf "echo bg_true_rc=\$?\n"; sleep 0.5
+  # 10.7 内存信息
+  printf "meminfo\n"; sleep 0.5
+  printf "meminfo -m\n"; sleep 0.5
   # 11. 文本处理 applets
   printf "echo -e \x27line1\\nline2\\nline3\x27 | head -n 2\n"; sleep 0.5
   printf "printf name=%%s-num=%%d rbox 42\n"; sleep 1
@@ -373,6 +376,12 @@ assert_contains "UTF-8 中文输入" "你好世界"
 echo ""
 echo "[Shell: 后台/前台退出码]"
 assert_contains "后台+前台并发退出码" "bg_true_rc=0"
+
+echo ""
+echo "[内存信息]"
+assert_contains "meminfo 显示 Mem 行" "Mem:"
+assert_contains "meminfo 显示 Swap 行" "Swap:"
+assert_contains "meminfo 数值非零" "Mem: "
 
 echo ""
 echo "[文本处理 applets]"
