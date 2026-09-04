@@ -8,7 +8,7 @@
 
 - **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 31 个命令
 - **systemd 风格 init**：TOML 单元文件、依赖拓扑排序、`Type=simple/forking`、
-  `Restart=on-failure`（退避 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
+  `Restart=on-failure/always`（退避 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
 - **有序关机/重启**：ExecStop 逆序执行、进程组清理、孤儿进程收割、kmsg 日志
 - **系统初始化**：`/etc/fstab` 挂载、hostname、sysctl、PATH
@@ -22,7 +22,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、395 个单元测试、111 个集成断言、rustfmt、make strip
+- **工程化**：Clippy 零警告、398 个单元测试、111 个集成断言、rustfmt、make strip
 
 ## 快速开始
 

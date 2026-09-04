@@ -58,7 +58,7 @@ pub(crate) struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "ExecReload")]
     pub(crate) exec_reload: Option<String>,
-    /// 重启策略："" / "no"（默认）或 "on-failure"
+    /// 重启策略："" / "no"（默认）、"on-failure"（非零退出重启）或 "always"（退出即重启）
     #[serde(default)]
     #[serde(rename = "Restart")]
     pub(crate) restart: String,
@@ -98,10 +98,6 @@ pub(crate) struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "Group")]
     pub(crate) group: Option<String>,
-    /// 前台 console 服务（如交互 shell），退出后自动 respawn
-    #[serde(default)]
-    #[serde(rename = "Console")]
-    pub(crate) console: bool,
 }
 
 fn default_restart_sec() -> u64 {
@@ -328,7 +324,6 @@ mod tests {
                 logfile: None,
                 user: None,
                 group: None,
-                console: false,
             },
             install: InstallSection {
                 wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),

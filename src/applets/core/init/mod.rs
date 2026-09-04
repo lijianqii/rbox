@@ -21,9 +21,8 @@ use crate::applets::core::init::mount::{
 };
 use crate::applets::core::init::server::{create_status_listener, handle_control_connection};
 use crate::applets::core::init::services::{
-    ServiceInstance, SpawnConfig, finish_daemonize, parse_environment, respawn_service,
-    schedule_restart, spawn_fresh_shell, spawn_unit_command, start_forking_service, start_service,
-    stop_service_instance,
+    ServiceInstance, finish_daemonize, parse_environment, respawn_service, schedule_restart,
+    spawn_fresh_shell, start_forking_service, start_service, stop_service_instance,
 };
 use crate::applets::core::init::syscall::{kill_all, reboot_syscall, sync_fs};
 use crate::applets::core::init::units::{
@@ -123,10 +122,6 @@ impl Applet for Init {
 
         // 4. 依次启动服务，记录已启动的实例
         let mut services: Vec<ServiceInstance> = Vec::new();
-        let mut console_child: Option<std::process::Child> = None;
-        let mut console_name = String::from("console-shell.service");
-        let mut console_reload: Option<String> = None;
-        let mut console_cfg: Option<ConsoleConfig> = None;
         // 记录每个单元的启动结果（Requires 失败传播用）；target 恒为成功
         let mut started_ok: HashMap<String, bool> = HashMap::new();
         for unit_name in &order {
@@ -162,7 +157,10 @@ impl Applet for Init {
                             ),
                         );
                     }
-                    if !unit.service.restart.is_empty() && unit.service.restart != "on-failure" {
+                    if !unit.service.restart.is_empty()
+                        && unit.service.restart != "on-failure"
+                        && unit.service.restart != "always"
+                    {
                         log_at(
                             LogLevel::Warn,
                             &format!(
@@ -182,24 +180,7 @@ impl Applet for Init {
                     let env = parse_environment(&unit.service.environment);
                     // spawn 成功与否决定 Requires 失败传播；forking 服务以父进程
                     // spawn 成功为"成功"（daemon 化结果异步，见主循环）
-                    let spawned_ok = if unit.service.console {
-                        console_name = unit.name.clone();
-                        console_reload = unit.service.exec_reload.clone();
-                        // ExecStart 是完整命令（如 /bin/rgetty -L -t 60 ttyAMA0），
-                        // getty 参数直接写在配置里，init 不做额外拼接。
-                        let cfg = SpawnConfig::from_unit(unit);
-                        console_child = spawn_unit_command(&unit.name, cmd, &env, &cfg);
-                        // 保存 respawn 配置，避免 shell 重启后丢失 Environment/LogFile/User/Group
-                        console_cfg = Some(ConsoleConfig {
-                            name: unit.name.clone(),
-                            cmd: cmd.clone(),
-                            env: env.clone(),
-                            logfile: unit.service.logfile.clone(),
-                            user: unit.service.user.clone(),
-                            group: unit.service.group.clone(),
-                        });
-                        console_child.is_some()
-                    } else if unit.service.typ == "forking" {
+                    let spawned_ok = if unit.service.typ == "forking" {
                         match start_forking_service(unit, cmd, &env) {
                             Some(inst) => {
                                 services.push(inst);
@@ -228,15 +209,7 @@ impl Applet for Init {
 
         // 5. 主循环：回收子进程、响应控制请求，等待关机标志
         let status_listener = create_status_listener();
-        reap_with_shutdown(
-            console_child,
-            &console_name,
-            &console_reload,
-            &console_cfg,
-            &mut services,
-            &units,
-            status_listener,
-        )
+        reap_with_shutdown(&mut services, &units, status_listener)
     }
 }
 
@@ -252,44 +225,23 @@ fn failed_required_dep<'a>(
         .find(|dep| matches!(started_ok.get(*dep), Some(false)))
 }
 
-/// console 服务的 respawn 配置（跨 respawn 保留 Environment/LogFile/User/Group）。
-struct ConsoleConfig {
-    name: String,
-    cmd: String,
-    env: Vec<(String, String)>,
-    logfile: Option<String>,
-    user: Option<String>,
-    group: Option<String>,
-}
-
-/// console 服务 respawn：复用单元配置（Environment/LogFile/User/Group）；
-/// 无配置（run_without_units 降级路径）时回退到 spawn_fresh_shell。
-fn spawn_console(cfg: &Option<ConsoleConfig>) -> Option<std::process::Child> {
-    match cfg {
-        Some(c) => {
-            let spawn_cfg = SpawnConfig {
-                logfile: c.logfile.as_deref(),
-                user: c.user.as_deref(),
-                group: c.group.as_deref(),
-            };
-            spawn_unit_command(&c.name, &c.cmd, &c.env, &spawn_cfg)
-        }
-        None => spawn_fresh_shell(),
-    }
-}
-
-/// 单元加载/依赖解析失败时的降级路径：无服务，仅拉起 console shell 并进入主循环。
+/// 单元加载/依赖解析失败时的降级路径：循环拉起一个 emergency shell。
 fn run_without_units() -> ExitCode {
-    let empty: HashMap<String, Unit> = HashMap::new();
-    reap_with_shutdown(
-        None,
-        "console-shell.service",
-        &None,
-        &None,
-        &mut Vec::new(),
-        &empty,
-        None,
-    )
+    log_at(LogLevel::Error, "rbox init: emergency shell (no units)");
+    loop {
+        if shutdown_requested() {
+            return do_shutdown(&mut []);
+        }
+        let mut child = match spawn_fresh_shell() {
+            Some(c) => c,
+            None => {
+                log("rbox init: cannot spawn emergency shell, waiting");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        let _ = child.wait();
+    }
 }
 
 /// 安装 SIGTERM/SIGINT/SIGCHLD 信号处理器（sigaction + SA_RESTART）。
@@ -368,13 +320,9 @@ fn compute_next_timeout(services: &[ServiceInstance]) -> i32 {
     }
 }
 
-/// 主循环：管理 console shell（退出则 respawn）、回收/重启服务、
-/// 响应 rservice/rbox status 控制请求，检测关机标志。
+/// 主循环：回收/重启服务、响应 rservice/rbox status 控制请求，检测关机标志。
+/// 所有服务统一由 Restart 策略管理（console/getty 用 Restart=always）。
 fn reap_with_shutdown(
-    mut console: Option<std::process::Child>,
-    console_name: &str,
-    console_reload: &Option<String>,
-    console_cfg: &Option<ConsoleConfig>,
     services: &mut Vec<ServiceInstance>,
     units: &HashMap<String, Unit>,
     status_listener: Option<UnixListener>,
@@ -384,38 +332,10 @@ fn reap_with_shutdown(
     SIGNAL_PIPE_WRITE.store(signal_pipe_write, Ordering::SeqCst);
 
     loop {
-        // 1. console shell：运行中则检查退出，退出后标记待 respawn
-        if let Some(child) = console.as_mut() {
-            let exited = match child.try_wait() {
-                Ok(Some(_)) => true,
-                // 竞态：恰在孤儿收割（waitpid -1）之后退出，状态已被取走
-                Err(_) => true,
-                Ok(None) => false,
-            };
-            if exited {
-                if shutdown_requested() {
-                    return do_shutdown(services);
-                }
-                log("rbox init: shell exited, respawning");
-                console = None;
-            }
-        }
-        // 未运行（未启动或已退出）则拉起；失败则稍后重试
-        if console.is_none() && !shutdown_requested() {
-            match spawn_console(console_cfg) {
-                Some(c) => console = Some(c),
-                None => {
-                    log("rbox init: cannot spawn shell, waiting");
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    continue;
-                }
-            }
-        }
-
-        // 2. 回收已退出的服务进程 + forking daemon 化等待；
-        //    Restart=on-failure 且非零退出时安排重启（退避 + 上限）
+        // 1. 回收已退出的服务进程 + forking daemon 化等待；
+        //    Restart=on-failure/always 时安排重启（退避 + 上限）
         for svc in services.iter_mut() {
-            // 2a. forking 服务等待父进程 daemon 化（异步状态机，不阻塞主循环）
+            // 1a. forking 服务等待父进程 daemon 化（异步状态机，不阻塞主循环）
             if svc.waiting_daemonize {
                 let result = svc.child.as_mut().map(|child| child.try_wait());
                 match result {
@@ -473,7 +393,7 @@ fn reap_with_shutdown(
                     schedule_restart(svc, failed);
                 }
             }
-            // 2b. 到达 RestartSec 退避时间点则重新拉起
+            // 1b. 到达 RestartSec 退避时间点则重新拉起
             if let Some(at) = svc.next_restart_at
                 && std::time::Instant::now() >= at
                 && !shutdown_requested()
@@ -492,16 +412,11 @@ fn reap_with_shutdown(
             }
         }
 
-        // 2.1 收割收养的孤儿进程（waitpid -1），防止僵尸累积
-        reap_orphans(services, &mut console);
+        // 2. 收割收养的孤儿进程（waitpid -1），防止僵尸累积
+        reap_orphans(services);
 
         // 3. 关机/重启标志
         if shutdown_requested() {
-            log("rbox init: shutdown requested, terminating shell");
-            if let Some(mut child) = console.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
             return do_shutdown(services);
         }
 
@@ -532,14 +447,7 @@ fn reap_with_shutdown(
                 && let Some(listener) = &status_listener
                 && let Ok((stream, _)) = listener.accept()
             {
-                handle_control_connection(
-                    stream,
-                    console_name,
-                    console_reload,
-                    console.as_ref(),
-                    services,
-                    units,
-                );
+                handle_control_connection(stream, services, units);
             }
         } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
@@ -550,9 +458,9 @@ fn reap_with_shutdown(
 }
 
 /// 收割收养的孤儿进程（waitpid -1, WNOHANG），防止僵尸累积。
-/// 已知服务/console 的子进程由 try_wait 先行处理；
+/// 已知服务的子进程由 try_wait 先行处理；
 /// 若恰在 try_wait 之后退出被这里收割（竞态），同步其状态。
-fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::process::Child>) {
+fn reap_orphans(services: &mut [ServiceInstance]) {
     loop {
         let mut status: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
@@ -560,13 +468,6 @@ fn reap_orphans(services: &mut [ServiceInstance], console: &mut Option<std::proc
             break; // 0 = 无已退出子进程，-1 = 无子进程
         }
         let pid = pid as u32;
-        if let Some(c) = console.as_mut()
-            && c.id() == pid
-        {
-            log("rbox init: console shell reaped");
-            *console = None;
-            continue;
-        }
         for svc in services.iter_mut() {
             // forking daemon 退出（被收养的 daemon 由这里匹配并触发重启调度）
             if svc.tracked_pid == Some(pid) {

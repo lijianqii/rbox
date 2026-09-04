@@ -34,7 +34,10 @@ pub(crate) struct ServiceInstance {
     pub(crate) waiting_daemonize: bool,
     /// forking 服务 daemon 化超时时间点
     pub(crate) daemonize_deadline: Option<std::time::Instant>,
+    /// Restart=on-failure：非零退出时自动重启
     pub(crate) restart_on_failure: bool,
+    /// Restart=always：无论退出码如何都自动重启（console/getty 等服务用）
+    pub(crate) restart_always: bool,
     /// 自动重启间隔与连续失败上限
     pub(crate) restart_sec: u64,
     pub(crate) start_limit_burst: u32,
@@ -53,7 +56,9 @@ pub(crate) struct ServiceInstance {
 impl ServiceInstance {
     /// status 输出的一行状态。
     pub(crate) fn status_line(&self) -> String {
-        let restart = if self.restart_on_failure {
+        let restart = if self.restart_always {
+            " restart=always"
+        } else if self.restart_on_failure {
             " restart=on-failure"
         } else {
             ""
@@ -302,6 +307,7 @@ fn new_service_instance(
         exec_start: cmd.to_string(),
         env: env.to_vec(),
         restart_on_failure: unit.service.restart == "on-failure",
+        restart_always: unit.service.restart == "always",
         restart_sec: unit.service.restart_sec,
         start_limit_burst: unit.service.start_limit_burst,
         start_limit_interval_sec: unit.service.start_limit_interval_sec,
@@ -324,6 +330,7 @@ fn new_service_instance(
 /// 服务退出后调度重启：失败计数 +1（成功退出清零），
 /// 窗口内失败次数超过 StartLimitBurst 后放弃；距首次失败超过
 /// StartLimitIntervalSec 则计数重置（时间窗）。失败时按 RestartSec 退避。
+/// 策略：Restart=always 无论成败都重启；Restart=on-failure 仅失败重启。
 pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
     let now = std::time::Instant::now();
     // 时间窗重置：距首次失败超过 interval 则清零计数
@@ -342,7 +349,14 @@ pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
         svc.fail_count = 0;
         svc.first_failure_at = None;
     }
-    if !svc.restart_on_failure || !failed || svc.stopped || shutdown_requested() {
+    let want_restart = if svc.restart_always {
+        true
+    } else if svc.restart_on_failure {
+        failed
+    } else {
+        false
+    };
+    if !want_restart || svc.stopped || shutdown_requested() {
         return;
     }
     if svc.fail_count > svc.start_limit_burst {
@@ -526,6 +540,7 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         waiting_daemonize: false,
         daemonize_deadline: None,
         restart_on_failure,
+        restart_always: false,
         restart_sec: 1,
         start_limit_burst: 5,
         start_limit_interval_sec: 10,
@@ -627,6 +642,31 @@ mod tests {
         schedule_restart(&mut svc, false);
         assert_eq!(svc.fail_count, 0);
         assert!(svc.first_failure_at.is_none());
+    }
+
+    #[test]
+    fn restart_always_restarts_on_success() {
+        let mut svc = test_svc("t.service", false);
+        svc.restart_always = true;
+        schedule_restart(&mut svc, false); // 成功退出也重启
+        assert!(svc.next_restart_at.is_some());
+        assert_eq!(svc.fail_count, 0);
+    }
+
+    #[test]
+    fn restart_always_respects_stopped() {
+        let mut svc = test_svc("t.service", false);
+        svc.restart_always = true;
+        svc.stopped = true;
+        schedule_restart(&mut svc, false);
+        assert!(svc.next_restart_at.is_none());
+    }
+
+    #[test]
+    fn restart_no_policy_never_restarts() {
+        let mut svc = test_svc("t.service", false);
+        schedule_restart(&mut svc, true); // 失败也不重启
+        assert!(svc.next_restart_at.is_none());
     }
 
     #[test]

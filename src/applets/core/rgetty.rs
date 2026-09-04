@@ -1,9 +1,9 @@
 //! `rgetty` - 终端登录提示程序。
 //!
 //! 在终端上循环打印 `rbox login: ` 提示，读取用户名后 exec `rlogin`。
-//! 登录失败时 rlogin 退出，init 的 `Console = true` 服务会自动重新拉起
+//! 登录失败时 rlogin 退出，init 的 `Restart = "always"` 机制会自动重新拉起
 //! rgetty，形成登录循环；登录成功时 rlogin 会继续 exec 用户 shell，
-//! shell 退出后同样由 init respawn，回到登录提示。
+//! shell 退出后同样由 init 重启，回到登录提示。
 //!
 //! 用法：`rgetty [-L] [-t SEC] [TTY]`
 //! - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；

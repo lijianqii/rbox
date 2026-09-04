@@ -211,7 +211,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 27 | dirname | dirname PATH | 取目录部分 |
 | 28 | status | status [unit] | 通过 unix socket 查询 init 服务状态 |
 | 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
-| 30 | rgetty | rgetty [TTY] | 终端登录提示，读取用户名后 exec rlogin（由 init Console 服务拉起） |
+| 30 | rgetty | rgetty [-L] [-t SEC] [TTY] | 终端登录提示，读取用户名后 exec rlogin（由 init 的 Restart=always 服务拉起） |
 | 31 | rlogin | rlogin [username] | 校验密码（/etc/passwd + /etc/shadow），成功后降权并 exec 用户 shell |
 ## Shell
 
@@ -457,18 +457,18 @@ shell 支持 `$PS1` 环境变量自定义提示符，支持的转义序列：`\u
 生产 rootfs 的 console 服务由原来的直接 shell 改为 `rgetty`，登录流程如下：
 
 ```
-init ──Console=true 服务──► rgetty ──读取用户名──► exec rlogin ──校验通过──► exec 用户 shell
-                ▲                                                             │
-                └─────────────── 进程退出后由 init respawn ─────────────────────┘
+init ──Restart=always 服务──► rgetty ──读取用户名──► exec rlogin ──校验通过──► exec 用户 shell
+                ▲                                                            │
+                └──────────── 进程退出后由 init 按 Restart=always 重启 ────────┘
 ```
 
 - **rgetty**：用法 `rgetty [-L] [-t SEC] [TTY]`。
   - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
   - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
   - 打印 `rbox login: ` 提示，读取用户名后 exec `/bin/rlogin <user>`。
-  登录失败/shell 退出时进程结束，init 的 `Console = true` 机制自动重新拉起，回到登录提示。
+  登录失败/shell 退出时进程结束，init 的 `Restart = "always"` 机制自动重新拉起，回到登录提示。
   **终端选择**：仅使用命令行显式 TTY 参数（由 `ExecStart` 完整命令直接传给 rgetty）；
-  未指定时使用继承的 stdin/stdout/stderr（init console 服务的 stdio 即登录终端）。
+  未指定时使用继承的 stdin/stdout/stderr（init 启动服务时继承的 stdio 即登录终端）。
   TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
 - **rlogin**：无参数时先提示用户名；随后关闭回显读取密码。密码校验规则：
   - `/etc/passwd` 密码字段为 `x` 时读取 `/etc/shadow`；空字段 = 免密登录，
@@ -483,13 +483,15 @@ init ──Console=true 服务──► rgetty ──读取用户名──► ex
 `/etc/shadow`（root 密码为 SHA-256 crypt 哈希，明文是 `root`；nobody 锁定 `!`）。
 rootfs 携带 `libcrypt.so.1`（由 Makefile 从交叉工具链拷贝，rlogin 的 crypt 校验依赖）。
 
-生产 console 单元示例（getty 参数直接写在 ExecStart 完整命令中）：
+生产 console 单元示例（getty 参数直接写在 ExecStart 完整命令中，登录进程退出后由
+`Restart = "always"` 无条件重启）：
 
 ```toml
 [Service]
 Type = "simple"
 ExecStart = "/bin/rgetty -L -t 60 ttyAMA0"   # -L + 超时 + 登录终端
-Console = true
+Restart = "always"
+RestartSec = 1
 ```
 
 一个 systemd 风格的 PID 1 初始化进程，使用 TOML 格式的单元文件配置。
@@ -521,7 +523,7 @@ PIDFile = "/var/run/x.pid"         # 可选：forking 的 daemon PID 文件
 LogFile = "/var/log/x.log"         # 可选：stdout/stderr 重定向文件
 User = "nobody"                    # 可选：降权用户（getpwnam）
 Group = "nogroup"                  # 可选：降权组（getgrnam）
-Console = true                     # 可选：前台 console 服务（如交互 shell，退出自动 respawn）
+Restart = "always"                 # 可选：退出即重启（console/getty 用；另有 on-failure）
 
 [Install]
 WantedBy = ["default.target"]      # 被哪个 target 拉入
@@ -537,11 +539,11 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）；读取 /etc/hostname 设置主机名（sethostname）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
-5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop；`Console = true` 的服务作为前台 console 等待
-6. **常驻**：主循环回收 console shell（退出则 respawn）与服务进程（try_wait，避免僵尸）；`Restart=on-failure` 的服务非零退出后自动重新拉起；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`，供 rbox status / rservice 使用）；检测关机标志
+5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop
+6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（退避 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用）；检测关机标志
 
 `Type=` 目前支持 `simple` 与 `forking`；其他值会打印警告并按 simple 处理。
-`Restart=` 目前支持 `no`（默认）与 `on-failure`，其他值打印警告并按 no 处理。
+`Restart=` 目前支持 `no`（默认）、`on-failure` 与 `always`，其他值打印警告并按 no 处理。
 
 关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。
 
@@ -551,14 +553,14 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 
 | 请求 | 说明 |
 |------|------|
-| `status` / 空 | 列出全部服务状态（init、console、各服务） |
+| `status` / 空 | 列出全部服务状态（init、各服务） |
 | `status <unit>` | 查询单个单元 |
 | `start <unit>` | 启动服务（已停止的重新拉起；未启动过的从单元文件新建） |
 | `stop <unit>` | 停止服务（执行 ExecStop + SIGTERM 进程组，超时 SIGKILL；标记 stopped 禁止自动重启） |
 | `restart <unit>` | 停止后重新启动 |
 | `reload <unit>` | 执行 ExecReload 命令（不重启进程） |
 
-客户端：`rbox status` / `rservice`（list/status/start/stop/restart/reload）。console 服务由 init 独占管理，不接受 stop/restart。
+客户端：`rbox status` / `rservice`（list/status/start/stop/restart/reload）。所有服务（含 console/getty）统一管理，无特殊保护。
 
 ### 关机/重启流程
 
@@ -567,7 +569,6 @@ shutdown 命令 / SIGTERM ──► 关机（设置 SHUTDOWN_REQUESTED 标志）
 reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
   |
   +-- 设置对应全局标志
-  +-- 主循环检测到标志 -> kill console shell
   +-- do_shutdown():
   |     +-- 逆序遍历已启动的服务，执行 ExecStop + SIGTERM 等服务退出
   |     |    （1 秒超时后 SIGKILL 强杀，避免挂起）
@@ -607,7 +608,7 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 | 文件 | 类型 | Name | 说明 |
 |------|------|------|------|
 | default.target.toml | target | default.target | 启动根节点（无 Name 字段，回退文件名） |
-| console-shell.service.toml | service | console-shell | ExecStart=/bin/rgetty，Console=true 登录提示（登录成功后 exec shell） |
+| console-shell.service.toml | service | console-shell | ExecStart=/bin/rgetty -L -t 60 ttyAMA0，Restart=always 登录提示（登录成功后 exec shell） |
 
 测试专用服务（hello、restart-test、longrun、forktest、forktimeout、usertest、console-shell 覆盖单元）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理并恢复被覆盖的生产单元，不进入生产镜像。
 
@@ -722,14 +723,14 @@ make unittest
 | shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation、source 历史隔离 | 12 |
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request | 15 |
 | init/server | 控制协议处理 | 8 |
-| init/services | 服务生命周期、schedule_restart、finish_daemonize | 10 |
+| init/services | 服务生命周期、schedule_restart（on-failure/always）、finish_daemonize | 13 |
 | init/mount | fstab 挂载 | 5 |
 | init/mod | failed_required_dep、compute_next_timeout | 6 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 8、rlogin 11 | 27 |
-| **合计** | | **395** |
+| **合计** | | **398** |
 
 测试结果示例：
 
@@ -890,7 +891,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | sysctl 支持 | 启动时应用 /etc/sysctl.conf（写 /proc/sys/*） | ✅ 已实现 |
 | 日志写 /dev/kmsg | init 日志进入内核环形缓冲（dmesg/console 回显可见） | ✅ 已实现 |
 | Environment= | 服务环境变量 | ✅ 已实现 |
-| 前台/后台服务区分 | Console=true 显式标记 | ✅ 已实现 |
+| 前台/后台服务区分 | 退出即重启用 Restart=always（console/getty）；按需重启用 Restart=on-failure | ✅ 已实现 |
 | 服务状态查询 | rbox status / status <unit>（unix socket） | ✅ 已实现 |
 | 服务管理命令 | rservice start/stop/restart/reload（unix socket 控制协议） | ✅ 已实现 |
 | 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
@@ -911,7 +912,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（395 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（398 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
