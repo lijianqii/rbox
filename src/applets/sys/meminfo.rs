@@ -267,7 +267,7 @@ pub(crate) struct Accounting {
 }
 
 /// 把 MemTotal 拆解为互不重叠的分类（页缓存已扣除 Shmem，避免重复计数），
-/// 各项之和恒等于 MemTotal（"其他/未分类"兜底），用于对账。
+/// 各项之和恒等于 MemTotal（"other/unclassified"兜底），用于对账。
 pub(crate) fn compute_accounting(fields: &HashMap<String, u64>) -> Accounting {
     let total = *fields.get("MemTotal").unwrap_or(&0);
     let free = *fields.get("MemFree").unwrap_or(&0);
@@ -292,42 +292,42 @@ pub(crate) fn compute_accounting(fields: &HashMap<String, u64>) -> Accounting {
         items: vec![
             AccountingItem {
                 label: "MemFree",
-                desc: "空闲",
+                desc: "free",
                 kb: free,
             },
             AccountingItem {
                 label: "AnonPages",
-                desc: "用户态匿名",
+                desc: "anon pages",
                 kb: anon,
             },
             AccountingItem {
                 label: "Shmem",
-                desc: "用户态共享",
+                desc: "shared",
                 kb: shmem,
             },
             AccountingItem {
                 label: "Cached",
-                desc: "页缓存",
+                desc: "page cache",
                 kb: cache,
             },
             AccountingItem {
                 label: "Buffers",
-                desc: "缓冲区",
+                desc: "buffers",
                 kb: buffers,
             },
             AccountingItem {
                 label: "SReclaimable",
-                desc: "内核可回收缓存",
+                desc: "reclaimable slab",
                 kb: reclaimable,
             },
             AccountingItem {
                 label: "Kernel",
-                desc: "内核态固定",
+                desc: "kernel fixed",
                 kb: kernel,
             },
             AccountingItem {
                 label: "Other",
-                desc: "其他/未分类",
+                desc: "other/unclassified",
                 kb: other,
             },
         ],
@@ -363,14 +363,14 @@ fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
     lines.push(format!(
         "  {:<12} {:<10} {:>10} {:>6.1}%",
         "User",
-        "用户态合计",
+        "user total",
         unit.convert(acc.user_kb),
         pct(acc.user_kb)
     ));
     lines.push(format!(
         "  {:<12} {:<10} {:>10} {:>6.1}%",
         "Kernel",
-        "内核态合计",
+        "kernel total",
         unit.convert(acc.kernel_kb),
         pct(acc.kernel_kb)
     ));
@@ -380,7 +380,7 @@ fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
         "(== MemTotal)".to_string()
     } else {
         format!(
-            "(MemTotal {} ≠ 合计 {})",
+            "(MemTotal {} != sum {})",
             unit.convert(total),
             unit.convert(sum)
         )
@@ -388,7 +388,7 @@ fn format_accounting(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
     lines.push(format!(
         "  {:<12} {:<10} {:>10} {:>6.1}%  {}",
         "Total",
-        "合计",
+        "total",
         unit.convert(sum),
         if total > 0 { 100.0 } else { 0.0 },
         check
@@ -745,7 +745,7 @@ Shmem:              4104 kB
         let fields = parse_meminfo("MemTotal: 100 kB\nMemFree: 200 kB\n");
         let lines = format_accounting(&fields, Unit::Kb);
         let out = lines.join("\n");
-        assert!(out.contains("≠"), "{}", out);
+        assert!(out.contains("!="), "{}", out);
     }
 
     #[test]
