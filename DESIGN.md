@@ -519,12 +519,12 @@ RestartSec = 1
 | [paths] | history_file | 空 = $HOME/.rbox_history | shell 历史（支持 ~ 前缀） |
 | [paths] | fstab / hostname / sysctl_conf | /etc/fstab 等 | init 系统初始化 |
 | [getty] | login_program | /bin/rlogin | rgetty fork 的登录程序 |
-| [getty] | prompt | "rbox login: " | 登录提示 |
+| [getty] | prompt | "rbox login: " | 登录提示（生产示例为极简 "user: "） |
 | [getty] | default_timeout | 无 | 未给 -t 时的默认登录会话超时 |
 | [getty] | issue_file | /etc/issue | 登录前横幅 |
 | [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
-| [login] | password_prompt | "Password: " | 密码提示 |
+| [login] | password_prompt | "Password: " | 密码提示（生产示例为极简 "passwd: "） |
 | [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
 | [shell] | default_ps1 | "> " | 未设置 $PS1 时的默认提示符 |
 

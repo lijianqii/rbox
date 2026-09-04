@@ -12,6 +12,3 @@ export HOME=/
 # Set prompt (minimal)
 # 简约提示符
 export PS1='> '
-
-# Set default editor
-export EDITOR=vi
