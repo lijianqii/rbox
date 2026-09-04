@@ -310,21 +310,71 @@ fn format_detail(fields: &HashMap<String, u64>, unit: Unit) -> Vec<String> {
     lines
 }
 
-/// 读取 /proc/iomem 并生成物理内存映射输出（保留原有层级缩进）。
+/// 读取 /proc/iomem 并生成树状内存映射输出。
 fn read_iomem() -> Vec<String> {
     let path = &crate::config::load().paths.iomem;
     let content = std::fs::read_to_string(path).unwrap_or_default();
     format_iomem(&content)
 }
 
+/// 一条 iomem 映射（depth 为内核缩进层级，2 空格/级）。
+pub(crate) struct IomemEntry {
+    pub(crate) depth: usize,
+    pub(crate) text: String,
+}
+
+/// 解析 /proc/iomem 内容为带深度的条目。
+pub(crate) fn parse_iomem(content: &str) -> Vec<IomemEntry> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let text = line.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let leading = line.len() - line.trim_start().len();
+            Some(IomemEntry {
+                depth: leading / 2,
+                text: text.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// 渲染树状映射：父区域直显；子区域用分支线连接，
+/// 非最后子用 `|--->`、最后子用 `\--->`，多级时祖先层级用 `|` 延续。
+pub(crate) fn render_iomem(entries: &[IomemEntry]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.depth == 0 {
+            out.push(format!("  {}", e.text));
+            continue;
+        }
+        // 本节点之后是否还有同级（中间没有更浅层）→ 决定 |---> / \--->
+        let has_sibling = entries[i + 1..]
+            .iter()
+            .find(|n| n.depth <= e.depth)
+            .map(|n| n.depth == e.depth)
+            .unwrap_or(false);
+        // 每层前缀：该层在 i 之后还有条目则画 `|` 延续，否则留空
+        let mut prefix = String::new();
+        for d in 0..e.depth {
+            prefix.push_str(if entries[i + 1..].iter().any(|n| n.depth == d) {
+                "| "
+            } else {
+                "  "
+            });
+        }
+        let conn = if has_sibling { "|--->" } else { "\\--->" };
+        out.push(format!("  {}{} {}", prefix, conn, e.text));
+    }
+    out
+}
+
 /// 生成内存映射输出（纯函数，便于测试）。
 pub(crate) fn format_iomem(content: &str) -> Vec<String> {
     let mut lines = vec!["Memory map (/proc/iomem):".to_string()];
-    for line in content.lines() {
-        if !line.trim().is_empty() {
-            lines.push(format!("  {}", line));
-        }
-    }
+    lines.extend(render_iomem(&parse_iomem(content)));
     lines
 }
 
@@ -565,19 +615,40 @@ Shmem:              4104 kB
     }
 
     #[test]
-    fn format_iomem_preserves_hierarchy() {
-        let content = "00000000-3effffff : System RAM\n  3eff0000-3effffff : PCI ECAM\n\n40000000-47ffffff : System RAM\n";
+    fn format_iomem_tree_shape() {
+        // 两级：每个顶层区域一个子区域 → 子区域用 \--->
+        let content = "00000000-03ffffff : 0.flash flash@0\n09000000-09000fff : pl011@9000000\n  09000000-09000fff : 9000000.pl011 pl011@9000000\n09010000-09010fff : pl031@9010000\n  09010000-09010fff : rtc-pl031\n";
         let lines = format_iomem(content);
         assert_eq!(lines[0], "Memory map (/proc/iomem):");
-        assert!(
-            lines[1].contains("00000000-3effffff : System RAM"),
-            "{}",
-            lines[1]
+        assert_eq!(lines[1], "  00000000-03ffffff : 0.flash flash@0");
+        assert_eq!(
+            lines[3],
+            "  | \\---> 09000000-09000fff : 9000000.pl011 pl011@9000000"
         );
-        // 子区域保留缩进，空行被跳过
-        assert!(lines[2].contains("PCI ECAM"), "{}", lines[2]);
-        assert!(lines[3].contains("40000000-47ffffff"), "{}", lines[3]);
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[5], "    \\---> 09010000-09010fff : rtc-pl031");
+    }
+
+    #[test]
+    fn render_iomem_siblings() {
+        // 多子：非最后子用 |--->，最后子用 \--->
+        let entries = parse_iomem("parent\n  child1\n  child2\n");
+        let lines = render_iomem(&entries);
+        assert_eq!(lines[0], "  parent");
+        assert_eq!(lines[1], "    |---> child1");
+        assert_eq!(lines[2], "    \\---> child2");
+    }
+
+    #[test]
+    fn render_iomem_deep_prefix() {
+        // 三级：a -> b -> c，b 非最后子（后面还有 d），c 是最后子
+        let entries = parse_iomem("a\n  b\n    c\n  d\n");
+        let lines = render_iomem(&entries);
+        assert_eq!(lines[0], "  a");
+        // b 是 a 的非最后子（后面还有 d）
+        assert_eq!(lines[1], "    |---> b");
+        // c 是 b 的唯一子：层 1 延续 |，用 \--->
+        assert_eq!(lines[2], "    | \\---> c");
+        assert_eq!(lines[3], "    \\---> d");
     }
 
     #[test]
