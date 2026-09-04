@@ -381,6 +381,8 @@ echo ""
 echo "[内存信息]"
 assert_contains "meminfo 显示 Mem 行" "Mem:"
 assert_contains "meminfo 显示 Swap 行" "Swap:"
+assert_contains "meminfo 进程列表标题" "PID"
+assert_contains "meminfo 列出 init 进程" "init"
 assert_contains "meminfo 数值非零" "Mem: "
 
 echo ""

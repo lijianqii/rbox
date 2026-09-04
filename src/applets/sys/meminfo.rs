@@ -32,6 +32,16 @@ impl Unit {
             Unit::Gb => kb / 1024 / 1024,
         }
     }
+
+    /// 单位标签（用于 RSS 列表标题）。
+    fn label(self) -> &'static str {
+        match self {
+            Unit::Bytes => "B",
+            Unit::Kb => "kB",
+            Unit::Mb => "MB",
+            Unit::Gb => "GB",
+        }
+    }
 }
 
 /// 解析后的内存统计（单位 kB）。
@@ -53,16 +63,18 @@ impl Applet for Meminfo {
         "meminfo"
     }
     fn help(&self) -> &'static str {
-        "meminfo [-bkmg] - show memory usage (from /proc/meminfo)"
+        "meminfo [-bkmg] [-a] - show memory usage and per-process RSS (from /proc)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
         let mut unit = Unit::Kb;
+        let mut show_all = false;
         for a in args {
             match a.as_str() {
                 "-b" => unit = Unit::Bytes,
                 "-k" => unit = Unit::Kb,
                 "-m" => unit = Unit::Mb,
                 "-g" => unit = Unit::Gb,
+                "-a" => show_all = true,
                 s if s.starts_with('-') && s.len() > 1 => {
                     eprintln!("meminfo: unknown option: {}", s);
                     return ExitCode::FAILURE;
@@ -86,9 +98,93 @@ impl Applet for Meminfo {
                 return ExitCode::FAILURE;
             }
         };
-        print_stats(&stats, unit);
+        for line in format_stats(&stats, unit) {
+            println!("{}", line);
+        }
+
+        // 进程内存占用（按 RSS 降序；默认过滤 RSS=0 的内核线程，-a 显示全部）
+        let mut procs = collect_processes();
+        procs.sort_by(|a, b| b.rss_kb.cmp(&a.rss_kb).then(a.pid.cmp(&b.pid)));
+        if !show_all {
+            procs.retain(|p| p.rss_kb > 0);
+        }
+        println!();
+        println!("Processes (by RSS):");
+        for line in format_processes(&procs, unit) {
+            println!("{}", line);
+        }
         ExitCode::SUCCESS
     }
+}
+
+/// 一个进程的内存信息（RSS 单位 kB）。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProcMem {
+    pub(crate) pid: u32,
+    pub(crate) ppid: u32,
+    pub(crate) rss_kb: u64,
+    pub(crate) name: String,
+}
+
+/// 遍历 /proc 收集所有进程的内存信息（RSS 来自 statm 的 resident 页数）。
+fn collect_processes() -> Vec<ProcMem> {
+    let page_kb = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64) / 1024;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let rss_pages = read_statm(pid);
+        let ppid = read_ppid(pid);
+        let comm = read_comm(pid);
+        out.push(ProcMem {
+            pid,
+            ppid,
+            rss_kb: rss_pages * page_kb,
+            name: comm,
+        });
+    }
+    out
+}
+
+fn read_statm(pid: u32) -> u64 {
+    let content = std::fs::read_to_string(format!("/proc/{}/statm", pid)).unwrap_or_default();
+    parse_statm(&content)
+}
+
+/// 解析 statm 文本，返回 resident 页数（第 2 个字段）。
+pub(crate) fn parse_statm(content: &str) -> u64 {
+    content
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn read_ppid(pid: u32) -> u32 {
+    let content = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+    parse_stat_ppid(&content)
+}
+
+/// 解析 stat 文本，返回 ppid（第 4 字段；comm 可能含空格/括号，从 ")" 后取）。
+pub(crate) fn parse_stat_ppid(content: &str) -> u32 {
+    let Some(rest) = content.split(')').nth(1) else {
+        return 0;
+    };
+    rest.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn read_comm(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{}/comm", pid))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 解析 /proc/meminfo 内容为字段 map（单位 kB，忽略非数字字段）。
@@ -135,33 +231,56 @@ pub(crate) fn compute_stats(content: &str) -> Option<MemStats> {
 }
 
 /// 以 free 风格输出统计。
-fn print_stats(stats: &MemStats, unit: Unit) {
-    for line in format_stats(stats, unit) {
-        println!("{}", line);
-    }
-}
-
 /// 生成统计输出行（纯函数，便于测试）。
+/// 对齐规则：标签列固定 14 宽（左对齐），数字列 13 宽右对齐，
+/// 标题行与数据行使用相同的列宽，保证各列右缘一致。
 fn format_stats(stats: &MemStats, unit: Unit) -> Vec<String> {
+    let c = |v: u64| format!("{:>13}", unit.convert(v));
     vec![
-        "              total        used        free      shared  buff/cache   available"
-            .to_string(),
         format!(
-            "Mem:{:>12}{:>12}{:>12}{:>12}{:>12}{:>12}",
-            unit.convert(stats.total),
-            unit.convert(stats.used),
-            unit.convert(stats.free),
-            unit.convert(stats.shared),
-            unit.convert(stats.buff_cache),
-            unit.convert(stats.available),
+            "{:<14}{:>13}{:>13}{:>13}{:>13}{:>13}{:>13}",
+            "", "total", "used", "free", "shared", "buff/cache", "available"
         ),
         format!(
-            "Swap:{:>12}{:>12}{:>12}",
-            unit.convert(stats.swap_total),
-            unit.convert(stats.swap_used),
-            unit.convert(stats.swap_free),
+            "{:<14}{}{}{}{}{}{}",
+            "Mem:",
+            c(stats.total),
+            c(stats.used),
+            c(stats.free),
+            c(stats.shared),
+            c(stats.buff_cache),
+            c(stats.available),
+        ),
+        format!(
+            "{:<14}{}{}{}",
+            "Swap:",
+            c(stats.swap_total),
+            c(stats.swap_used),
+            c(stats.swap_free),
         ),
     ]
+}
+
+/// 生成进程内存列表行（按 RSS 降序，单位随 unit）。
+fn format_processes(procs: &[ProcMem], unit: Unit) -> Vec<String> {
+    let mut lines = Vec::with_capacity(procs.len() + 1);
+    lines.push(format!(
+        "{:>7}{:>7}{:>12}  {}",
+        "PID",
+        "PPID",
+        format!("RSS({})", unit.label()),
+        "COMMAND"
+    ));
+    for p in procs {
+        lines.push(format!(
+            "{:>7}{:>7}{:>12}  {}",
+            p.pid,
+            p.ppid,
+            unit.convert(p.rss_kb),
+            p.name
+        ));
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -254,5 +373,65 @@ Shmem:              4104 kB
         // MB 换算：1928844 / 1024 = 1883
         let lines_m = format_stats(&s, Unit::Mb);
         assert!(lines_m[1].contains("1883"), "out: {}", lines_m[1]);
+    }
+
+    #[test]
+    fn stats_columns_aligned() {
+        // 标题行与数据行使用相同的标签列(14) + 数字列(13)宽度，
+        // 各列右缘位置一致："total" 右缘 == Mem 行第一列数字右缘
+        let s = compute_stats(SAMPLE_MEMINFO).unwrap();
+        let lines = format_stats(&s, Unit::Kb);
+        let title = &lines[0];
+        let mem = &lines[1];
+        let title_total_end = title.find("total").unwrap() + "total".len();
+        let mem_first_end = mem.find("1928844").unwrap() + "1928844".len();
+        assert_eq!(
+            title_total_end, mem_first_end,
+            "\ntitle: {}\nmem:   {}",
+            title, mem
+        );
+    }
+
+    #[test]
+    fn parse_statm_returns_resident_pages() {
+        assert_eq!(parse_statm("100 45 2 1 0 0 0\n"), 45);
+        assert_eq!(parse_statm("100 0 0 0 0 0 0\n"), 0);
+        assert_eq!(parse_statm(""), 0);
+        assert_eq!(parse_statm("not a statm"), 0);
+    }
+
+    #[test]
+    fn parse_stat_ppid_handles_spaces_in_comm() {
+        // comm 含空格/括号：pid (my proc) S 1 2 3 ...，ppid 是 ") " 后的第 2 个字段
+        assert_eq!(parse_stat_ppid("123 (my proc) S 1 2 3 4\n"), 1);
+        assert_eq!(parse_stat_ppid("1 (rbox) S 0 1 1\n"), 0);
+        assert_eq!(parse_stat_ppid("no parens\n"), 0);
+    }
+
+    #[test]
+    fn format_processes_output() {
+        let procs = vec![
+            ProcMem {
+                pid: 49,
+                ppid: 1,
+                rss_kb: 11264,
+                name: "rgetty".to_string(),
+            },
+            ProcMem {
+                pid: 1,
+                ppid: 0,
+                rss_kb: 4096,
+                name: "init".to_string(),
+            },
+        ];
+        let lines = format_processes(&procs, Unit::Kb);
+        assert!(lines[0].contains("PID"), "out: {}", lines[0]);
+        assert!(lines[0].contains("RSS(kB)"), "out: {}", lines[0]);
+        assert!(lines[1].contains("49"), "out: {}", lines[1]);
+        assert!(lines[1].contains("rgetty"), "out: {}", lines[1]);
+        // MB 单位：标题 RSS(MB)，值 11264/1024 = 11
+        let lines_m = format_processes(&procs, Unit::Mb);
+        assert!(lines_m[0].contains("RSS(MB)"), "out: {}", lines_m[0]);
+        assert!(lines_m[1].contains("11"), "out: {}", lines_m[1]);
     }
 }
