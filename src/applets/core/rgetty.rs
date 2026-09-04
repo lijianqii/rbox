@@ -1,20 +1,20 @@
 //! `rgetty` - 终端登录提示程序。
 //!
-//! 在终端上循环打印 `rbox login: ` 提示，读取用户名后 exec `rlogin`。
-//! 登录失败时 rlogin 退出，init 的 `Restart = "always"` 机制会自动重新拉起
-//! rgetty，形成登录循环；登录成功时 rlogin 会继续 exec 用户 shell，
-//! shell 退出后同样由 init 重启，回到登录提示。
+//! 在终端上循环打印登录提示（如 `rbox login: `），读取用户名后 fork 子进程
+//! 执行 `rlogin`；rgetty 常驻，登录失败/会话超时/shell 退出后原地重新提示。
+//! init 的 `Restart = "always"` 仅兜底 rgetty 本身崩溃/被杀。
 //!
 //! 用法：`rgetty [-L] [-t SEC] [TTY]`
 //! - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
-//! - `-t SEC`：超过 SEC 秒未输入用户名则退出（由 init respawn），防僵尸占终端；
+//! - `-t SEC`：**登录会话超时**（从 fork 登录程序进入会话开始计时，登录提示阶段
+//!   不超时），超时后自动终止会话回到登录提示；
 //! - `TTY`：可写裸设备名（`ttyAMA0`）或完整路径（`/dev/ttyAMA0`）。
 //!
 //! 终端选择：仅使用命令行显式 TTY 参数（由 `ExecStart` 完整命令传入）；
 //! 未指定 TTY 时使用继承的 stdin/stdout/stderr（init console 服务的 stdio 即登录终端）。
 
 use crate::applet::Applet;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 
@@ -24,7 +24,7 @@ pub static GETTY: &Getty = &Getty;
 /// rgetty 命令行选项。
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct GettyOpts {
-    /// `-t SEC`：读取用户名的超时秒数；None 表示不超时。
+    /// `-t SEC`：登录会话超时秒数（登录提示阶段不超时）；None 表示不超时。
     pub(crate) timeout_secs: Option<u64>,
     /// `-L`：设置 CLOCAL（忽略载波检测）。
     pub(crate) clocal: bool,
@@ -37,7 +37,7 @@ impl Applet for Getty {
         "rgetty"
     }
     fn help(&self) -> &'static str {
-        "rgetty [-L] [-t SEC] [TTY] - login prompt on TTY (default: inherited stdio)"
+        "rgetty [-L] [-t SEC] [TTY] - login prompt on TTY (session timeout via -t)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
         let opts = match parse_args(args) {
@@ -152,9 +152,10 @@ fn print_issue(issue_file: &str) {
     }
 }
 
-/// 主循环：打印提示、读取用户名（带超时）、fork 子进程执行 rlogin。
-/// rgetty 常驻：登录失败/超时/shell 退出后原地重新提示，
+/// 主循环：打印提示、读取用户名（登录提示阶段不超时）、fork 子进程执行 rlogin。
+/// rgetty 常驻：登录失败/会话超时/shell 退出后原地重新提示，
 /// 不经过 init 重启（init 的 Restart=always 仅兜底 rgetty 本身崩溃）。
+/// `-t` 超时从 fork 登录程序（进入登录会话）开始计时，超时自动登出。
 fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> ExitCode {
     print_issue(&cfg.issue_file);
     loop {
@@ -162,9 +163,9 @@ fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> Exi
         let _ = write!(io::stdout(), "\r\n{}", cfg.prompt);
         let _ = io::stdout().flush();
 
-        let Some(user) = read_username(timeout_secs) else {
-            // 超时/EOF：原地重新提示（-t 语义：防占终端，但不退出）
-            let _ = writeln!(io::stdout(), "timed out, retrying");
+        let Some(user) = read_username() else {
+            // EOF（如串口断开）：稍等后原地重新提示，避免忙循环
+            std::thread::sleep(std::time::Duration::from_secs(1));
             continue;
         };
         let Some(user) = normalize_username(&user) else {
@@ -173,13 +174,13 @@ fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> Exi
 
         // fork 子进程执行 rlogin（子进程内 exec shell），父进程等待；
         // 登录失败（非零退出）延迟后再提示，防暴力刷屏。
-        run_login(&user, &cfg.login_program, cfg.failure_delay);
+        run_login(&user, cfg, timeout_secs);
     }
 }
 
-/// fork 子进程执行登录程序；父进程 waitpid 后按退出码决定是否延迟。
-fn run_login(user: &str, login_program: &str, failure_delay: u64) {
-    unsafe {
+/// fork 子进程执行登录程序；父进程带超时等待，按结果决定下一步。
+fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) {
+    let pid = unsafe {
         let pid = libc::fork();
         if pid < 0 {
             eprintln!("rgetty: fork failed");
@@ -188,70 +189,82 @@ fn run_login(user: &str, login_program: &str, failure_delay: u64) {
         }
         if pid == 0 {
             // 子进程：exec 登录程序（成功则被替换，不会返回）
-            let err = std::process::Command::new(login_program).arg(user).exec();
+            let err = std::process::Command::new(&cfg.login_program)
+                .arg(user)
+                .exec();
             let _ = writeln!(
                 io::stderr(),
                 "rgetty: cannot exec {}: {}",
-                login_program,
+                cfg.login_program,
                 err
             );
             libc::_exit(127);
         }
-        // 父进程：等待登录/用户 shell 退出
-        let mut status: libc::c_int = 0;
-        loop {
-            let r = libc::waitpid(pid, &mut status, 0);
-            if r < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue; // 被信号打断，继续等待
+        pid
+    };
+    match wait_child_with_timeout(pid, timeout_secs) {
+        Some(0) => {} // shell 正常退出：立即重新提示
+        Some(_) => {
+            // 登录失败（非零退出）：延迟再提示，避免失败刷屏
+            if cfg.failure_delay > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(cfg.failure_delay));
             }
-            break;
         }
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            1
-        };
-        // 登录失败（非零退出）后延迟再提示，避免失败刷屏
-        if code != 0 && failure_delay > 0 {
-            std::thread::sleep(std::time::Duration::from_secs(failure_delay));
+        None => {
+            // 会话超时：子进程已被终止，自动登出回到登录提示
+            let _ = writeln!(io::stdout(), "session timed out, logging out");
         }
     }
 }
 
-/// 读取一行用户名；超过 timeout_secs 未输入或 EOF 时返回 None。
-/// 用 poll 实现超时，避免设置终端 VTIME 影响其他行为。
-fn read_username(timeout_secs: Option<u64>) -> Option<String> {
-    let fd = libc::STDIN_FILENO;
+/// 等待子进程退出（轮询 WNOHANG）；`timeout_secs` 内未退出则终止子进程并返回 None。
+/// 返回 Some(退出码) 表示子进程已退出（信号杀死按失败码 1 处理）。
+fn wait_child_with_timeout(pid: libc::pid_t, timeout_secs: Option<u64>) -> Option<i32> {
     let deadline =
         timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
-    let mut line: Vec<u8> = Vec::new();
     loop {
-        if let Some(d) = deadline {
-            let now = std::time::Instant::now();
-            if now >= d {
-                return None;
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r == pid {
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                1
+            };
+            return Some(code);
+        }
+        if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Some(1); // waitpid 出错，按失败处理
+        }
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
+            // 会话超时：SIGTERM，1 秒宽限后 SIGKILL
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                let r2 = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                if r2 == pid {
+                    break;
+                }
+                if std::time::Instant::now() >= kill_deadline {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            let mut fds = [libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            }];
-            let ms = (d - now).as_millis().min(i32::MAX as u128) as i32;
-            if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
-                return None; // 超时或 poll 错误
-            }
+            return None;
         }
-        let mut b = [0u8; 1];
-        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
-        if n <= 0 {
-            return None; // EOF / 读错误
-        }
-        if b[0] == b'\n' || b[0] == b'\r' {
-            break;
-        }
-        line.push(b[0]);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Some(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// 读取一行用户名（登录提示阶段不超时）；EOF 返回 None。
+fn read_username() -> Option<String> {
+    let mut line = String::new();
+    let n = io::stdin().lock().read_line(&mut line).unwrap_or(0);
+    if n == 0 { None } else { Some(line) }
 }
 
 /// 规范化用户名：去掉首尾空白，空输入返回 None。
@@ -313,6 +326,28 @@ mod tests {
         // -t 0 表示不超时，避免 0 秒超时导致无限重试刷屏
         let opts = parse_args(&["-t".to_string(), "0".to_string()]).unwrap();
         assert_eq!(opts.timeout_secs, None);
+    }
+
+    #[test]
+    fn wait_child_returns_exit_code() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            unsafe { libc::_exit(42) };
+        }
+        assert_eq!(wait_child_with_timeout(pid, None), Some(42));
+    }
+
+    #[test]
+    fn wait_child_timeout_terminates() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            unsafe { libc::_exit(0) };
+        }
+        // 1 秒超时：子进程被终止，返回 None
+        assert_eq!(wait_child_with_timeout(pid, Some(1)), None);
     }
 
     #[test]

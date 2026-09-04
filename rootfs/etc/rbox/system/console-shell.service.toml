@@ -4,7 +4,7 @@ Name = "console-shell"
 
 [Service]
 Type = "simple"
-# 完整命令直接传 getty 参数：-L（CLOCAL）、-t 60（超时）、ttyAMA0（登录终端）
+# 完整命令直接传 getty 参数：-L（CLOCAL）、-t 60（登录会话超时，登录提示不超时）、ttyAMA0
 ExecStart = "/bin/rgetty -L -t 60 ttyAMA0"
 # 登录进程退出（失败/超时/shell 退出）后无条件重启
 Restart = "always"

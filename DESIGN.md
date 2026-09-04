@@ -212,7 +212,7 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 27 | dirname | dirname PATH | 取目录部分 |
 | 28 | status | status [unit] | 通过 unix socket 查询 init 服务状态 |
 | 29 | rservice | rservice [list\|status\|start\|stop\|restart <unit>] | 服务管理：列出/启动/停止/重启服务 |
-| 30 | rgetty | rgetty [-L] [-t SEC] [TTY] | 终端登录提示，读取用户名后 exec rlogin（由 init 的 Restart=always 服务拉起） |
+| 30 | rgetty | rgetty [-L] [-t SEC] [TTY] | 终端登录提示，fork rlogin 常驻重试（由 init 的 Restart=always 服务拉起） |
 | 31 | rlogin | rlogin [username] | 校验密码（/etc/passwd + /etc/shadow），成功后降权并 exec 用户 shell |
 ## Shell
 
@@ -467,7 +467,8 @@ init ──Restart=always 服务──► rgetty（常驻）──fork──► 
 
 - **rgetty**：用法 `rgetty [-L] [-t SEC] [TTY]`。
   - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
-  - `-t SEC`：超过 SEC 秒未输入用户名则**原地重新提示**（rgetty 常驻不退出，防占终端）；
+  - `-t SEC`：**登录会话超时**（从 fork 登录程序进入会话开始计时，登录提示阶段
+    不超时）；超时后自动终止会话回到登录提示；
   - 启动时打印 `/etc/issue` 横幅（路径可配置，不存在则跳过）；
   - 打印提示（`/etc/rbox.conf [getty] prompt`）后读取用户名，**fork 子进程**执行
     `/bin/rlogin <user>`（路径可配置）；父进程 wait：登录失败（非零退出）按
@@ -519,7 +520,7 @@ RestartSec = 1
 | [paths] | fstab / hostname / sysctl_conf | /etc/fstab 等 | init 系统初始化 |
 | [getty] | login_program | /bin/rlogin | rgetty fork 的登录程序 |
 | [getty] | prompt | "rbox login: " | 登录提示 |
-| [getty] | default_timeout | 无 | 未给 -t 时的默认超时 |
+| [getty] | default_timeout | 无 | 未给 -t 时的默认登录会话超时 |
 | [getty] | issue_file | /etc/issue | 登录前横幅 |
 | [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
@@ -765,8 +766,8 @@ make unittest
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1 | 20 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 9、rlogin 11 | 28 |
-| **合计** | | **405** |
+| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 11、rlogin 11 | 30 |
+| **合计** | | **407** |
 
 测试结果示例：
 
@@ -950,7 +951,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（405 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（407 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
