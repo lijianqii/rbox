@@ -346,7 +346,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 30 个测试组、121 个断言（涵盖 32 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 30 个测试组、122 个断言（涵盖 32 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -379,8 +379,8 @@ enum Token {
 | rgetty/rlogin 登录 | 登录提示、issue 横幅、错误密码拒绝、登录后 shell 可用、串口指定、退出后重新登录 | 6 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
-| 内存信息 | meminfo 输出 Mem/Swap 行、详细明细、iomem 映射、进程 RSS 列表 | 9 |
-| **合计** | | **121** |
+| 内存信息 | meminfo 输出 Mem/Swap 行、详细明细、iomem 树、进程 VSZ/RSS/%MEM 列表 | 10 |
+| **合计** | | **122** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -728,7 +728,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 30 个测试组、121 个断言，覆盖全部 32 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 30 个测试组、122 个断言，覆盖全部 32 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -767,9 +767,9 @@ make unittest
 | config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
-| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 17 | 37 |
+| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19 | 39 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 10、rlogin 11 | 31 |
-| **合计** | | **424** |
+| **合计** | | **426** |
 
 测试结果示例：
 
@@ -796,7 +796,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 121 通过, 0 失败
+结果: 122 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -953,7 +953,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（424 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（426 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

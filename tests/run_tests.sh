@@ -387,6 +387,7 @@ assert_contains "meminfo 详细明细" "Memory detail"
 assert_contains "meminfo 详细字段" "AnonPages"
 assert_contains "meminfo 内存映射" "Memory map"
 assert_contains "meminfo System RAM" "System RAM"
+assert_contains "meminfo 进程 %MEM" "%MEM"
 assert_contains "meminfo 数值非零" "Mem: "
 
 echo ""

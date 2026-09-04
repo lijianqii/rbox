@@ -123,7 +123,7 @@ impl Applet for Meminfo {
         }
         println!();
         println!("Processes (by RSS):");
-        for line in format_processes(&procs, unit) {
+        for line in format_processes(&procs, unit, stats.total) {
             println!("{}", line);
         }
         ExitCode::SUCCESS
@@ -135,7 +135,12 @@ impl Applet for Meminfo {
 pub(crate) struct ProcMem {
     pub(crate) pid: u32,
     pub(crate) ppid: u32,
+    /// 虚拟内存大小（kB，statm size 字段）
+    pub(crate) vsz_kb: u64,
+    /// 常驻内存（kB，statm resident 字段）
     pub(crate) rss_kb: u64,
+    /// 进程状态（stat 第 3 字段，如 S/R/Z）
+    pub(crate) state: String,
     pub(crate) name: String,
 }
 
@@ -151,31 +156,33 @@ fn collect_processes() -> Vec<ProcMem> {
         let Ok(pid) = name.to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let rss_pages = read_statm(pid);
+        let (size_pages, rss_pages) = read_statm(pid);
         let ppid = read_ppid(pid);
+        let state = read_state(pid);
         let comm = read_comm(pid);
         out.push(ProcMem {
             pid,
             ppid,
+            vsz_kb: size_pages * page_kb,
             rss_kb: rss_pages * page_kb,
+            state,
             name: comm,
         });
     }
     out
 }
 
-fn read_statm(pid: u32) -> u64 {
+fn read_statm(pid: u32) -> (u64, u64) {
     let content = std::fs::read_to_string(format!("/proc/{}/statm", pid)).unwrap_or_default();
     parse_statm(&content)
 }
 
-/// 解析 statm 文本，返回 resident 页数（第 2 个字段）。
-pub(crate) fn parse_statm(content: &str) -> u64 {
-    content
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// 解析 statm 文本，返回 (size 页数, resident 页数)（第 1、2 个字段）。
+pub(crate) fn parse_statm(content: &str) -> (u64, u64) {
+    let mut it = content.split_whitespace();
+    let size = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let resident = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (size, resident)
 }
 
 fn read_ppid(pid: u32) -> u32 {
@@ -192,6 +199,19 @@ pub(crate) fn parse_stat_ppid(content: &str) -> u32 {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+fn read_state(pid: u32) -> String {
+    let content = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+    parse_stat_state(&content)
+}
+
+/// 解析 stat 文本，返回进程状态（")" 后第 1 个字段，如 S/R/Z）。
+pub(crate) fn parse_stat_state(content: &str) -> String {
+    let Some(rest) = content.split(')').nth(1) else {
+        return String::new();
+    };
+    rest.split_whitespace().next().unwrap_or("").to_string()
 }
 
 fn read_comm(pid: u32) -> String {
@@ -341,8 +361,8 @@ pub(crate) fn parse_iomem(content: &str) -> Vec<IomemEntry> {
         .collect()
 }
 
-/// 渲染树状映射：父区域直显；子区域用分支线连接，
-/// 非最后子用 `|--->`、最后子用 `\--->`，多级时祖先层级用 `|` 延续。
+/// 渲染树状映射（tree 风格）：父区域直显；子区域用 `├──`/`└──` 连接，
+/// 祖先层级用 `│` 延续（多根之间不连线，与 tree 命令一致）。
 pub(crate) fn render_iomem(entries: &[IomemEntry]) -> Vec<String> {
     let mut out = Vec::new();
     for (i, e) in entries.iter().enumerate() {
@@ -350,23 +370,28 @@ pub(crate) fn render_iomem(entries: &[IomemEntry]) -> Vec<String> {
             out.push(format!("  {}", e.text));
             continue;
         }
-        // 本节点之后是否还有同级（中间没有更浅层）→ 决定 |---> / \--->
+        // 前缀：depth-1 段，第 level 段表示第 level 层祖先是否还有后续兄弟
+        let mut prefix = String::new();
+        for level in 1..e.depth {
+            let cont = entries[i + 1..]
+                .iter()
+                .find(|n| n.depth <= level)
+                .map(|n| n.depth == level)
+                .unwrap_or(false);
+            prefix.push_str(if cont { "│   " } else { "    " });
+        }
+        // 连接符：本节点之后是否还有同级（中间没有更浅层）
         let has_sibling = entries[i + 1..]
             .iter()
             .find(|n| n.depth <= e.depth)
             .map(|n| n.depth == e.depth)
             .unwrap_or(false);
-        // 每层前缀：该层在 i 之后还有条目则画 `|` 延续，否则留空
-        let mut prefix = String::new();
-        for d in 0..e.depth {
-            prefix.push_str(if entries[i + 1..].iter().any(|n| n.depth == d) {
-                "| "
-            } else {
-                "  "
-            });
-        }
-        let conn = if has_sibling { "|--->" } else { "\\--->" };
-        out.push(format!("  {}{} {}", prefix, conn, e.text));
+        let conn = if has_sibling {
+            "├── "
+        } else {
+            "└── "
+        };
+        out.push(format!("  {}{}{}", prefix, conn, e.text));
     }
     out
 }
@@ -410,21 +435,33 @@ fn format_stats(stats: &MemStats, unit: Unit) -> Vec<String> {
 }
 
 /// 生成进程内存列表行（按 RSS 降序，单位随 unit）。
-fn format_processes(procs: &[ProcMem], unit: Unit) -> Vec<String> {
+/// 生成进程内存列表行（按 RSS 降序；VSZ/RSS 单位随 unit，%MEM 为 RSS 占总内存百分比）。
+fn format_processes(procs: &[ProcMem], unit: Unit, mem_total_kb: u64) -> Vec<String> {
     let mut lines = Vec::with_capacity(procs.len() + 1);
     lines.push(format!(
-        "{:>7}{:>7}{:>12}  {}",
+        "{:>7}{:>7}{:>13}{:>13}{:>8} {:<5} {}",
         "PID",
         "PPID",
+        format!("VSZ({})", unit.label()),
         format!("RSS({})", unit.label()),
+        "%MEM",
+        "STATE",
         "COMMAND"
     ));
     for p in procs {
+        let pct = if mem_total_kb > 0 {
+            p.rss_kb as f64 * 100.0 / mem_total_kb as f64
+        } else {
+            0.0
+        };
         lines.push(format!(
-            "{:>7}{:>7}{:>12}  {}",
+            "{:>7}{:>7}{:>13}{:>13}{:>8.1} {:<5} {}",
             p.pid,
             p.ppid,
+            unit.convert(p.vsz_kb),
             unit.convert(p.rss_kb),
+            pct,
+            p.state,
             p.name
         ));
     }
@@ -542,11 +579,11 @@ Shmem:              4104 kB
     }
 
     #[test]
-    fn parse_statm_returns_resident_pages() {
-        assert_eq!(parse_statm("100 45 2 1 0 0 0\n"), 45);
-        assert_eq!(parse_statm("100 0 0 0 0 0 0\n"), 0);
-        assert_eq!(parse_statm(""), 0);
-        assert_eq!(parse_statm("not a statm"), 0);
+    fn parse_statm_returns_size_and_resident() {
+        assert_eq!(parse_statm("100 45 2 1 0 0 0\n"), (100, 45));
+        assert_eq!(parse_statm("100 0 0 0 0 0 0\n"), (100, 0));
+        assert_eq!(parse_statm(""), (0, 0));
+        assert_eq!(parse_statm("not a statm"), (0, 0));
     }
 
     #[test]
@@ -558,30 +595,48 @@ Shmem:              4104 kB
     }
 
     #[test]
+    fn parse_stat_state_field() {
+        assert_eq!(parse_stat_state("123 (my proc) S 1 2 3 4\n"), "S");
+        assert_eq!(parse_stat_state("1 (rbox) R 0 1 1\n"), "R");
+        assert_eq!(parse_stat_state("no parens\n"), "");
+    }
+
+    #[test]
     fn format_processes_output() {
         let procs = vec![
             ProcMem {
                 pid: 49,
                 ppid: 1,
+                vsz_kb: 22528,
                 rss_kb: 11264,
+                state: "S".to_string(),
                 name: "rgetty".to_string(),
             },
             ProcMem {
                 pid: 1,
                 ppid: 0,
+                vsz_kb: 8192,
                 rss_kb: 4096,
+                state: "S".to_string(),
                 name: "init".to_string(),
             },
         ];
-        let lines = format_processes(&procs, Unit::Kb);
+        let lines = format_processes(&procs, Unit::Kb, 91768);
         assert!(lines[0].contains("PID"), "out: {}", lines[0]);
+        assert!(lines[0].contains("VSZ(kB)"), "out: {}", lines[0]);
         assert!(lines[0].contains("RSS(kB)"), "out: {}", lines[0]);
-        assert!(lines[1].contains("49"), "out: {}", lines[1]);
+        assert!(lines[0].contains("%MEM"), "out: {}", lines[0]);
         assert!(lines[1].contains("rgetty"), "out: {}", lines[1]);
-        // MB 单位：标题 RSS(MB)，值 11264/1024 = 11
-        let lines_m = format_processes(&procs, Unit::Mb);
-        assert!(lines_m[0].contains("RSS(MB)"), "out: {}", lines_m[0]);
-        assert!(lines_m[1].contains("11"), "out: {}", lines_m[1]);
+        assert!(lines[1].contains("22528"), "out: {}", lines[1]);
+        // %MEM = 11264 / 91768 * 100 = 12.3
+        assert!(lines[1].contains("12.3"), "out: {}", lines[1]);
+        // MB 单位：标题 VSZ(MB)，值 22528/1024 = 22
+        let lines_m = format_processes(&procs, Unit::Mb, 91768);
+        assert!(lines_m[0].contains("VSZ(MB)"), "out: {}", lines_m[0]);
+        assert!(lines_m[1].contains("22"), "out: {}", lines_m[1]);
+        // mem_total 为 0 时 %MEM 显示 0.0
+        let lines_zero = format_processes(&procs, Unit::Kb, 0);
+        assert!(lines_zero[1].contains("0.0"), "out: {}", lines_zero[1]);
     }
 
     #[test]
@@ -616,26 +671,26 @@ Shmem:              4104 kB
 
     #[test]
     fn format_iomem_tree_shape() {
-        // 两级：每个顶层区域一个子区域 → 子区域用 \--->
+        // 两级：每个顶层区域一个子区域 → 子区域用 └──
         let content = "00000000-03ffffff : 0.flash flash@0\n09000000-09000fff : pl011@9000000\n  09000000-09000fff : 9000000.pl011 pl011@9000000\n09010000-09010fff : pl031@9010000\n  09010000-09010fff : rtc-pl031\n";
         let lines = format_iomem(content);
         assert_eq!(lines[0], "Memory map (/proc/iomem):");
         assert_eq!(lines[1], "  00000000-03ffffff : 0.flash flash@0");
         assert_eq!(
             lines[3],
-            "  | \\---> 09000000-09000fff : 9000000.pl011 pl011@9000000"
+            "  └── 09000000-09000fff : 9000000.pl011 pl011@9000000"
         );
-        assert_eq!(lines[5], "    \\---> 09010000-09010fff : rtc-pl031");
+        assert_eq!(lines[5], "  └── 09010000-09010fff : rtc-pl031");
     }
 
     #[test]
     fn render_iomem_siblings() {
-        // 多子：非最后子用 |--->，最后子用 \--->
+        // 多子：非最后子用 ├──，最后子用 └──
         let entries = parse_iomem("parent\n  child1\n  child2\n");
         let lines = render_iomem(&entries);
         assert_eq!(lines[0], "  parent");
-        assert_eq!(lines[1], "    |---> child1");
-        assert_eq!(lines[2], "    \\---> child2");
+        assert_eq!(lines[1], "  ├── child1");
+        assert_eq!(lines[2], "  └── child2");
     }
 
     #[test]
@@ -644,11 +699,21 @@ Shmem:              4104 kB
         let entries = parse_iomem("a\n  b\n    c\n  d\n");
         let lines = render_iomem(&entries);
         assert_eq!(lines[0], "  a");
-        // b 是 a 的非最后子（后面还有 d）
-        assert_eq!(lines[1], "    |---> b");
-        // c 是 b 的唯一子：层 1 延续 |，用 \--->
-        assert_eq!(lines[2], "    | \\---> c");
-        assert_eq!(lines[3], "    \\---> d");
+        // b 是 a 的非最后子
+        assert_eq!(lines[1], "  ├── b");
+        // c 是 b 的唯一子：层 1 祖先 b 还有后续 → 前缀 │，连接符 └──
+        assert_eq!(lines[2], "  │   └── c");
+        assert_eq!(lines[3], "  └── d");
+    }
+
+    #[test]
+    fn render_iomem_no_line_between_roots() {
+        // 多个顶层区域之间不画延续线（tree 多根语义）
+        let entries = parse_iomem("root1\n  child\nroot2\n");
+        let lines = render_iomem(&entries);
+        assert_eq!(lines[0], "  root1");
+        assert_eq!(lines[1], "  └── child");
+        assert_eq!(lines[2], "  root2");
     }
 
     #[test]
