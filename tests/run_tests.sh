@@ -181,6 +181,7 @@ OUT=$(timeout 400 bash -c '
   # 10.7 内存信息
   printf "meminfo\n"; sleep 0.5
   printf "meminfo -m\n"; sleep 0.5
+  printf "processes\n"; sleep 0.5
   # 11. 文本处理 applets
   printf "echo -e \x27line1\\nline2\\nline3\x27 | head -n 2\n"; sleep 0.5
   printf "printf name=%%s-num=%%d rbox 42\n"; sleep 1
@@ -388,6 +389,8 @@ assert_contains "meminfo 详细字段" "AnonPages"
 assert_contains "meminfo 内存映射" "Memory map"
 assert_contains "meminfo System RAM" "System RAM"
 assert_contains "meminfo 进程 %MEM" "%MEM"
+assert_contains "processes 显示 init" "init(1)"
+assert_contains "processes 树连接符" "├──"
 assert_contains "meminfo 数值非零" "Mem: "
 
 echo ""
