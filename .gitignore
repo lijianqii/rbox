@@ -16,3 +16,4 @@
 
 # 第三方 agent/任务缓存（非构建产物）
 /.reasonix/
+rootfs.ext4
