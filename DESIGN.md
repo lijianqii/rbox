@@ -470,8 +470,8 @@ init ──Restart=always 服务──► rgetty（常驻）──fork──► 
 
 - **rgetty**：用法 `rgetty [-L] [-t SEC] [TTY]`。
   - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
-  - `-t SEC`：**登录会话超时**（从 fork 登录程序进入会话开始计时，登录提示阶段
-    不超时）；超时后自动终止会话回到登录提示；
+  - `-t SEC`：**登录会话空闲超时**（无输入达到 SEC 秒自动登出，从登录成功/进入
+    shell 开始计时，登录提示与密码阶段不超时；有输入活动会刷新计时）；
   - 启动时打印 `/etc/issue` 横幅（路径可配置，不存在则跳过）；
   - 打印提示（`/etc/rbox.conf [getty] prompt`）后读取用户名，**fork 子进程**执行
     `/bin/rlogin <user>`（路径可配置）；父进程 wait：登录失败（非零退出）按
@@ -524,7 +524,7 @@ RestartSec = 1
 | [paths] | meminfo / iomem / proc | /proc/meminfo 等 | meminfo 命令数据源 |
 | [getty] | login_program | /bin/rlogin | rgetty fork 的登录程序 |
 | [getty] | prompt | "rbox login: " | 登录提示（生产示例为极简 "user: "） |
-| [getty] | default_timeout | 无 | 未给 -t 时的默认登录会话超时 |
+| [getty] | default_timeout | 无 | 未给 -t 时的默认空闲超时 |
 | [getty] | issue_file | /etc/issue | 登录前横幅 |
 | [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |

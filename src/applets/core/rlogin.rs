@@ -282,8 +282,29 @@ fn login_shell(entry: &PasswdEntry) -> io::Result<()> {
         let _ = io::stdout().flush();
     }
 
+    // 通知 rgetty"登录成功"：空闲超时从此刻（进入 shell 前）开始计时
+    notify_getty_ready();
+
     // exec 用户 shell（exec 只在失败时返回）
     Err(std::process::Command::new(shell).exec())
+}
+
+/// 若 rgetty 通过 RBOX_LOGIN_NOTIFY_FD 提供了通知管道写端，
+/// 写入 1 字节表示登录成功（随后关闭并清除环境变量，不泄漏给 shell）。
+fn notify_getty_ready() {
+    let fd: i32 = std::env::var("RBOX_LOGIN_NOTIFY_FD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1);
+    if fd >= 0 {
+        let b: u8 = 1;
+        unsafe {
+            libc::write(fd, &b as *const u8 as *const libc::c_void, 1);
+            libc::close(fd);
+        }
+        // SAFETY: 单线程 applet，无并发环境变量访问
+        unsafe { std::env::remove_var("RBOX_LOGIN_NOTIFY_FD") };
+    }
 }
 
 #[cfg(test)]

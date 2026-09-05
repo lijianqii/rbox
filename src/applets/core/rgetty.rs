@@ -6,8 +6,8 @@
 //!
 //! 用法：`rgetty [-L] [-t SEC] [TTY]`
 //! - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
-//! - `-t SEC`：**登录会话超时**（从 fork 登录程序进入会话开始计时，登录提示阶段
-//!   不超时），超时后自动终止会话回到登录提示；
+//! - `-t SEC`：**登录会话空闲超时**（无输入达到 SEC 秒自动登出回到登录提示，
+//!   登录提示阶段不超时；有输入活动会刷新计时，只对"空闲"会话生效）；
 //! - `TTY`：可写裸设备名（`ttyAMA0`）或完整路径（`/dev/ttyAMA0`）。
 //!
 //! 终端选择：仅使用命令行显式 TTY 参数（由 `ExecStart` 完整命令传入）；
@@ -24,7 +24,7 @@ pub static GETTY: &Getty = &Getty;
 /// rgetty 命令行选项。
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct GettyOpts {
-    /// `-t SEC`：登录会话超时秒数（登录提示阶段不超时）；None 表示不超时。
+    /// `-t SEC`：登录会话空闲超时秒数（无输入达到该时长自动登出）；None 表示不超时。
     pub(crate) timeout_secs: Option<u64>,
     /// `-L`：设置 CLOCAL（忽略载波检测）。
     pub(crate) clocal: bool,
@@ -155,7 +155,7 @@ fn print_issue(issue_file: &str) {
 /// 主循环：打印提示、读取用户名（登录提示阶段不超时）、fork 子进程执行 rlogin。
 /// rgetty 常驻：登录失败/会话超时/shell 退出后原地重新提示，
 /// 不经过 init 重启（init 的 Restart=always 仅兜底 rgetty 本身崩溃）。
-/// `-t` 超时从 fork 登录程序（进入登录会话）开始计时，超时自动登出。
+/// `-t` 超时为空闲超时：会话期间有输入活动会刷新计时，持续无输入才登出。
 fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> ExitCode {
     print_issue(&cfg.issue_file);
     loop {
@@ -178,8 +178,14 @@ fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> Exi
     }
 }
 
-/// fork 子进程执行登录程序；父进程带超时等待，按结果决定下一步。
+/// fork 子进程执行登录程序；父进程等待（空闲超时从登录成功开始计时）。
 fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) {
+    // 通知管道：rlogin 在 exec 用户 shell 前写 1 字节，
+    // rgetty 据此确定"登录成功"并开始空闲计时（登录过程不计时）
+    let mut notify = [-1i32; 2];
+    if unsafe { libc::pipe(notify.as_mut_ptr()) } != 0 {
+        notify = [-1, -1];
+    }
     let pid = unsafe {
         let pid = libc::fork();
         if pid < 0 {
@@ -191,10 +197,17 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             // 子进程：创建独立会话/进程组（自身 pid 即 pgid），
             // 使会话超时能终止整个登录会话（含 shell 派生的后台进程）
             libc::setsid();
+            // 关闭读端，把写端 fd 传给 rlogin（exec 后保留）
+            if notify[0] >= 0 {
+                libc::close(notify[0]);
+            }
             // exec 登录程序（成功则被替换，不会返回）
-            let err = std::process::Command::new(&cfg.login_program)
-                .arg(user)
-                .exec();
+            let mut cmd = std::process::Command::new(&cfg.login_program);
+            cmd.arg(user);
+            if notify[1] >= 0 {
+                cmd.env("RBOX_LOGIN_NOTIFY_FD", notify[1].to_string());
+            }
+            let err = cmd.exec();
             let _ = writeln!(
                 io::stderr(),
                 "rgetty: cannot exec {}: {}",
@@ -205,7 +218,11 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
         }
         pid
     };
-    match wait_child_with_timeout(pid, timeout_secs) {
+    // 父进程：关闭写端，保留读端用于等待登录成功通知
+    if notify[1] >= 0 {
+        unsafe { libc::close(notify[1]) };
+    }
+    match wait_child_with_timeout(pid, notify[0], timeout_secs) {
         Some(0) => {} // shell 正常退出：立即重新提示
         Some(_) => {
             // 登录失败（非零退出）：延迟再提示，避免失败刷屏
@@ -214,54 +231,120 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             }
         }
         None => {
-            // 会话超时：先换行（密码提示后无换行），再打印登出消息
+            // 空闲超时：先换行（密码提示后无换行），再打印登出消息
             let _ = writeln!(io::stdout(), "\nsession timed out, logging out");
         }
     }
 }
 
-/// 等待子进程退出（轮询 WNOHANG）；`timeout_secs` 内未退出则终止子进程并返回 None。
+/// 等待子进程退出（轮询 WNOHANG + 监控 stdin 输入活动）。
+/// 空闲计时从"登录成功"开始：先等 `notify_fd`（rlogin exec shell 前写入的通知，
+/// -1 表示无通知机制，直接开始计时）；之后登录会话持续无输入达到 `idle_secs`
+/// 则终止子进程并返回 None；有输入活动（用户敲键等）会刷新计时。
 /// 返回 Some(退出码) 表示子进程已退出（信号杀死按失败码 1 处理）。
-fn wait_child_with_timeout(pid: libc::pid_t, timeout_secs: Option<u64>) -> Option<i32> {
-    let deadline =
-        timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+fn wait_child_with_timeout(
+    pid: libc::pid_t,
+    notify_fd: i32,
+    idle_secs: Option<u64>,
+) -> Option<i32> {
+    let Some(idle) = idle_secs else {
+        // 无超时：循环等待退出
+        loop {
+            if let Some(code) = wait_child_exit(pid) {
+                return Some(code);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+
+    // 阶段 1：等待登录成功通知（登录过程不计入空闲时间）
+    if notify_fd >= 0 {
+        loop {
+            if let Some(code) = wait_child_exit(pid) {
+                return Some(code);
+            }
+            let mut fds = [libc::pollfd {
+                fd: notify_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, 200) };
+            if n > 0 {
+                // 读通知（1 字节）；EOF（rlogin 未通知即退出/exec 失败）则继续轮询
+                let mut b = [0u8; 1];
+                let r = unsafe { libc::read(notify_fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+                if r == 1 {
+                    break; // 登录成功，开始空闲计时
+                }
+            }
+        }
+    }
+
+    // 阶段 2：空闲计时循环
+    let mut last_active = std::time::Instant::now();
     loop {
-        let mut status: libc::c_int = 0;
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r == pid {
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else {
-                1
-            };
+        if let Some(code) = wait_child_exit(pid) {
             return Some(code);
         }
-        if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return Some(1); // waitpid 出错，按失败处理
-        }
-        if let Some(d) = deadline
-            && std::time::Instant::now() >= d
-        {
-            // 会话超时：先终止整个进程组（子进程 setsid 后其 pid 即 pgid，
-            // 可连带清理 shell 派生的后台进程），组不存在则回退单进程。
+
+        let now = std::time::Instant::now();
+        let deadline = last_active + std::time::Duration::from_secs(idle);
+        if now >= deadline {
+            // 空闲超时：终止整个进程组（子进程 setsid 后其 pid 即 pgid），
+            // 可连带清理 shell 派生的后台进程；组不存在则回退单进程。
             terminate_session(pid, libc::SIGTERM);
             let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             loop {
-                let r2 = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-                if r2 == pid {
+                if wait_child_exit(pid).is_some() {
                     break;
                 }
                 if std::time::Instant::now() >= kill_deadline {
                     terminate_session(pid, libc::SIGKILL);
-                    let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
+                    let _ = unsafe { libc::waitpid(pid, &mut std::mem::zeroed(), 0) };
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // 监控终端输入：仅当存在真实输入字节（FIONREAD > 0）才视为活动并刷新计时，
+        // 数据留给 shell 读取；EOF（poll 可读但无字节）不刷新。
+        let remaining = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        let mut fds = [libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, remaining) };
+        if n > 0 && fds[0].revents & libc::POLLIN != 0 {
+            let mut avail: libc::c_int = 0;
+            let has_input = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut avail) }
+                == 0
+                && avail > 0;
+            if has_input {
+                last_active = std::time::Instant::now();
+            }
+        }
+        // n == 0：poll 超时，循环顶部会触发空闲超时；n < 0：短暂重试
     }
+}
+
+/// 轮询等待子进程退出（WNOHANG）；已退出返回 Some(退出码)，未退出返回 None。
+fn wait_child_exit(pid: libc::pid_t) -> Option<i32> {
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if r == pid {
+        return Some(if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            1
+        });
+    }
+    if r < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        return Some(1); // waitpid 出错，按失败处理
+    }
+    None
 }
 
 /// 向会话进程组发送信号；进程组不存在（未 setsid 的测试子进程等）时回退单进程。
@@ -349,7 +432,7 @@ mod tests {
         if pid == 0 {
             unsafe { libc::_exit(42) };
         }
-        assert_eq!(wait_child_with_timeout(pid, None), Some(42));
+        assert_eq!(wait_child_with_timeout(pid, -1, None), Some(42));
     }
 
     #[test]
@@ -361,7 +444,7 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
         // 1 秒超时：子进程被终止，返回 None
-        assert_eq!(wait_child_with_timeout(pid, Some(1)), None);
+        assert_eq!(wait_child_with_timeout(pid, -1, Some(1)), None);
     }
 
     #[test]
