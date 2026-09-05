@@ -59,10 +59,14 @@ impl Applet for Login {
             }
         };
 
-        // 读取密码（关闭回显）
+        // 读取密码（关闭回显，带超时防挂住登录进程）
         let _ = write!(io::stdout(), "{}", cfg.login.password_prompt);
         let _ = io::stdout().flush();
-        let password = read_password();
+        let timeout = (cfg.login.password_timeout > 0).then_some(cfg.login.password_timeout);
+        let Some(password) = read_password(timeout) else {
+            let _ = writeln!(io::stdout(), "\nPassword timed out");
+            return ExitCode::FAILURE;
+        };
         let _ = writeln!(io::stdout());
 
         match authenticate(&user, &password) {
@@ -96,7 +100,8 @@ impl Drop for EchoGuard {
 }
 
 /// 读取一行密码（终端上关闭 ECHO；非 tty 时直接读取）。
-fn read_password() -> String {
+/// `timeout_secs` 内无输入返回 None（防恶意用户挂住登录进程）。
+fn read_password(timeout_secs: Option<u64>) -> Option<String> {
     let fd = libc::STDIN_FILENO;
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     let guard = if unsafe { libc::tcgetattr(fd, &mut term) } == 0 {
@@ -107,10 +112,40 @@ fn read_password() -> String {
         None
     };
 
-    let mut pass = String::new();
-    let _ = io::stdin().lock().read_line(&mut pass);
+    let deadline =
+        timeout_secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        if let Some(d) = deadline {
+            let now = std::time::Instant::now();
+            if now >= d {
+                drop(guard);
+                return None; // 密码输入超时
+            }
+            let mut fds = [libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ms = (d - now).as_millis().min(i32::MAX as u128) as i32;
+            if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
+                drop(guard);
+                return None;
+            }
+        }
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 {
+            drop(guard);
+            return None; // EOF / 读错误
+        }
+        if b[0] == b'\n' || b[0] == b'\r' {
+            break;
+        }
+        line.push(b[0]);
+    }
     drop(guard);
-    pass.trim_end_matches(['\n', '\r']).to_string()
+    Some(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// 解析 /etc/passwd 内容；跳过空行、注释行和字段不足的行。

@@ -197,6 +197,9 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             // 子进程：创建独立会话/进程组（自身 pid 即 pgid），
             // 使会话超时能终止整个登录会话（含 shell 派生的后台进程）
             libc::setsid();
+            // 注意：不在此抢占控制终端（TIOCSCTTY）。实测子进程抢到控制终端后
+            // 退出会使终端进入孤儿状态，导致 rgetty 后续操作异常（101 崩溃）。
+            // 本 shell 的 Ctrl-C 走自研 raw+0x03 机制，不依赖控制终端信号。
             // 关闭读端，把写端 fd 传给 rlogin（exec 后保留）
             if notify[0] >= 0 {
                 libc::close(notify[0]);

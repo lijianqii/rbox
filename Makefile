@@ -25,6 +25,11 @@ QEMU     := qemu-system-aarch64
 QEMU_OPTS := -M virt -cpu cortex-a72 -m 128M -nographic
 QEMU_KCMD := console=ttyAMA0 rdinit=/init
 
+# 持久化 rootfs（ext4 磁盘镜像，make disk 生成）
+DISK      := rootfs.ext4
+DISK_SIZE ?= 64M
+MKFS      := $(shell command -v mkfs.ext4 2>/dev/null || echo /sbin/mkfs.ext4)
+
 TEST_INITRD := initramfs.test.cpio.gz
 TEST_UNITS := tests/units/*.toml
 
@@ -35,7 +40,7 @@ GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc
 # applet 列表：从 rbox --list 自动提取，避免与 src/applet.rs 手动同步
 APPLETS := $(shell cargo run --target x86_64-unknown-linux-gnu --quiet -- --list 2>/dev/null)
 
-.PHONY: all build strip rootfs initramfs rootfs-test run test unittest verify fmt kernel clean help
+.PHONY: all build strip rootfs initramfs rootfs-test run run-disk disk test unittest verify fmt kernel clean help
 
 all: build rootfs initramfs
 
@@ -117,6 +122,26 @@ rootfs-test: rootfs
 	done
 	@echo "测试 initramfs 构建完成: $(TEST_INITRD) ($$(du -h $(TEST_INITRD) | cut -f1))"
 
+# ─── 持久化 rootfs（ext4 磁盘镜像）────────────────
+# 制作 rootfs.ext4：initramfs 的 init 检测到 root=/dev/vda 内核参数后，
+# 会挂载该设备并 switch_root 到持久 rootfs（见 src/applets/core/init/mod.rs）。
+disk: rootfs
+	@if [ ! -x "$(MKFS)" ]; then echo "错误: 缺少 mkfs.ext4（e2fsprogs）" >&2; exit 1; fi
+	dd if=/dev/zero of=$(DISK) bs=1M count=$(shell echo $(DISK_SIZE) | tr -d M) 2>/dev/null
+	$(MKFS) -q -d $(ROOTFS) $(DISK)
+	@echo "ext4 磁盘镜像构建完成: $(DISK) ($$(du -h $(DISK) | cut -f1))"
+
+# 从 ext4 磁盘镜像启动（root= 触发 init 的 switch_root）
+run-disk: disk
+	@if [ ! -f $(KERNEL)/arch/arm64/boot/Image ]; then \
+		echo "错误: 内核镜像不存在，请先 make kernel" >&2; exit 1; \
+	fi
+	$(QEMU) $(QEMU_OPTS) \
+		-kernel $(KERNEL)/arch/arm64/boot/Image \
+		-initrd $(INITRD) \
+		-drive file=$(DISK),format=raw,if=virtio \
+		-append "$(QEMU_KCMD) root=/dev/vda"
+
 # ─── 单元测试（宿主机）──────────────────────────
 unittest:
 	cargo test --target x86_64-unknown-linux-gnu
@@ -190,7 +215,9 @@ help:
 	@echo "  make rootfs    - 构建 rootfs（含符号链接 + glibc）"
 	@echo "  make initramfs - 打包 initramfs.cpio.gz"
 	@echo "  make rootfs-test - 构建含测试单元的 initramfs（不污染生产 rootfs）"
-	@echo "  make run       - QEMU 启动"
+	@echo "  make disk       - 制作 ext4 磁盘镜像 (rootfs.ext4)"
+	@echo "  make run-disk   - 从 ext4 磁盘镜像启动（持久 rootfs）"
+	@echo "  make run        - QEMU 启动（initramfs）"
 	@echo "  make test      - 集成测试"
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"
 	@echo "  make fmt       - cargo fmt --check 格式检查"

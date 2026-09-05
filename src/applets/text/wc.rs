@@ -116,7 +116,7 @@ impl Applet for Wc {
             }
         } else {
             for f in &files {
-                match std::fs::read(f) {
+                match crate::applets::text::util::read_file_fully(f) {
                     Ok(content) => {
                         let (l, w, b) = count_bytes_data(&content);
                         total_l += l;

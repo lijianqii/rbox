@@ -14,6 +14,7 @@
 - **系统初始化**：`/etc/fstab` 挂载、hostname、sysctl、PATH
 - **终端登录**：`rgetty` 登录提示（常驻 fork/wait，失败/超时原地重试，`-L`/`-t` 选项，TTY 直接作为 rgetty 参数写在 ExecStart 完整命令中，`/etc/issue` 横幅）+ `rlogin` 密码校验（/etc/passwd + /etc/shadow、crypt 哈希、降权、MOTD）
 - **全局配置**：`/etc/rbox.conf`（TOML）集中管理路径/提示/超时/缺省 shell 等，全部可覆盖
+- **持久化 rootfs**：`make disk` 生成 ext4 镜像，init 支持 `root=` 内核参数 switch_root（脱离 initramfs）
 - **交互式 shell**：
   - 管道 `|`、重定向 `>` `>>` `<`、后台 `&`
   - 控制操作符 `;` `&&` `||`

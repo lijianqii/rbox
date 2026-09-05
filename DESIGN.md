@@ -686,7 +686,9 @@ make test      # 集成测试
 | make build | 交叉编译 rbox（cargo build --target aarch64-unknown-linux-gnu --release） |
 | make rootfs | 拷贝 rbox 二进制 + 创建 33 个 applet 符号链接 + 拷贝 glibc 运行时 |
 | make initramfs | 将 rootfs/ 打包为 initramfs.cpio.gz（newc 格式 + gzip） |
-| make run | QEMU 全系统模拟启动 |
+| make run | QEMU 全系统模拟启动（initramfs） |
+| make disk | 制作 ext4 磁盘镜像（rootfs.ext4，mkfs.ext4 -d） |
+| make run-disk | 从 ext4 磁盘镜像启动（root=/dev/vda 触发 switch_root） |
 | make strip | strip 符号表（1.4M -> 965K） |
 | make rootfs-test | 构建含测试单元的 initramfs（不污染生产 rootfs） |
 | make kernel | 编译 ARM64 内核（defconfig + Image） |
@@ -854,6 +856,35 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 - NEEDED: libgcc_s.so.1
 - NEEDED: libc.so.6
 - Interpreter: /lib/ld-linux-aarch64.so.1
+## 持久化 rootfs（ext4 磁盘镜像）
+
+文件：src/applets/core/init/mod.rs（early_root_handoff）、Makefile（disk/run-disk）
+
+除 initramfs 外，rbox 支持从持久 ext4 磁盘镜像启动：
+
+```bash
+make disk       # dd 建 64MB 镜像 + mkfs.ext4 -d rootfs 填充内容
+make run-disk   # QEMU -drive virtio + root=/dev/vda
+```
+
+**启动流程**：
+
+```
+内核 ── initramfs(/init = rbox init) ── root=/dev/vda 检测
+  ├─ 挂载 proc/sys/dev（initramfs 无这些目录，先创建）
+  ├─ 解析 /proc/cmdline 的 root= → 挂载设备到 /newroot（显式 ext4）
+  ├─ chdir(/newroot) + chroot(".") → 新根
+  ├─ exec /init（新根上的 rbox init，PID 保持 1）
+  └─ 新 init：statfs("/") 检测已是 ext4 → 跳过切换 → 正常初始化（挂 fstab/服务/getty）
+```
+
+- 用 **chroot** 而非 pivot_root/MS_MOVE：两者在 initramfs 的 rootfs 根上都返回
+  EINVAL（内核限制）；chroot 无需挂载操作，代价是旧 initramfs 挂载树保留在
+  内存中（约几 MB）。
+- 二次切换防护：`statfs("/")` 的 f_type == EXT4_SUPER_MAGIC 时跳过
+  （不能用 /proc/mounts 判断，chroot 后挂载表仍显示 rootfs）。
+- 无 `root=` 内核参数时行为与原来完全一致（initramfs 模式）。
+
 ## 后续计划
 
 按优先级排列：
@@ -964,7 +995,7 @@ rbox 的动态链接依赖（`aarch64-linux-gnu-readelf -d` 确认）：
 | applet --help 支持 | `rbox <applet> --help` 打印帮助 | ✅ 已实现 |
 | 静态链接 musl | 减小 rootfs 依赖（aarch64-unknown-linux-musl） | TODO |
 | 压缩二进制 | make strip（strip 符号表，1.4M -> 965K） | ✅ 已实现 |
-| 持久化根文件系统 | ext4 磁盘镜像 + 真正的 init（非 initramfs） | TODO |
+| 持久化根文件系统 | ext4 磁盘镜像 + init 的 switch_root（root= 内核参数） | ✅ 已实现 |
 | 网络支持 | 内核配置 virtio-net + busybox-style 网络工具 | TODO |
 
 ---

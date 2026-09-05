@@ -30,6 +30,7 @@ use crate::applets::core::{LogLevel, log, log_at};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
@@ -79,6 +80,13 @@ impl Applet for Init {
             install_signal_handlers();
         } else {
             log("rbox init: running in test mode (not PID 1)");
+        }
+
+        // 早期根切换：内核指定 root= 且当前运行在 initramfs 时，
+        // 挂载并切换到持久 rootfs（ext4），然后 exec 新根上的 init。
+        if is_pid1 && early_root_handoff() {
+            // 成功后进程被替换，不会返回
+            return ExitCode::SUCCESS;
         }
 
         // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载 + 主机名 + sysctl）
@@ -209,6 +217,131 @@ impl Applet for Init {
         // 5. 主循环：回收子进程、响应控制请求，等待关机标志
         let status_listener = create_status_listener();
         reap_with_shutdown(&mut services, &units, status_listener)
+    }
+}
+
+/// 早期根切换（initramfs → 内核 root= 指定的持久 rootfs）。
+/// 流程：解析 root= → 挂载 proc/sys/dev → 挂载 root 设备到 /newroot →
+/// chdir + pivot_root + 卸载旧根 → exec 新根上的 /init。
+/// 成功时进程被替换不会返回；非 early 场景（无 root= / 已是真根）返回 false。
+fn early_root_handoff() -> bool {
+    use std::ffi::CString;
+
+    // 0. 先挂载 proc/sys/dev（early 阶段 mount_all_fs 尚未执行，
+    //    /proc/cmdline 与 /proc/mounts 依赖 proc；devtmpfs 提供 root 设备节点）
+    // initramfs 里可能没有 /proc /sys 目录，先创建再挂载
+    let _ = std::fs::create_dir_all("/proc");
+    let _ = std::fs::create_dir_all("/sys");
+    let _ = std::fs::create_dir_all("/dev");
+    for (src, tgt, fstype) in [
+        ("proc", "/proc", "proc"),
+        ("sysfs", "/sys", "sysfs"),
+        ("devtmpfs", "/dev", "devtmpfs"),
+    ] {
+        let _ = libc_mount(src, tgt, fstype);
+    }
+
+    // 1. 解析内核命令行 root=（去掉可选的 fs 类型/参数后缀）
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let root_dev = cmdline
+        .split_whitespace()
+        .find_map(|kv| kv.strip_prefix("root="))
+        .map(|v| v.split(',').next().unwrap_or(v).to_string())
+        .unwrap_or_default();
+    if root_dev.is_empty() {
+        return false;
+    }
+
+    // 2. 若当前根已经是 ext4（持久 rootfs）则跳过。
+    //    不能用 /proc/mounts 判断：chroot 后挂载表仍显示 rootfs，
+    //    但进程根实际已是 ext4，会导致二次切换。
+    // 若当前根已经是 ext4（持久 rootfs）则跳过。
+    // 不能用 /proc/mounts 判断：chroot 后挂载表仍显示 rootfs，
+    // 但进程根实际已是 ext4，会导致二次切换。
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c"/".as_ptr(), &mut st) } == 0
+        && st.f_type == libc::EXT4_SUPER_MAGIC as libc::c_long
+    {
+        return false; // 已是持久 rootfs
+    }
+
+    log(&format!(
+        "rbox init: switching to persistent root {}",
+        root_dev
+    ));
+
+    // 3. 挂载 root 设备到 /newroot（显式 ext4；自动探测对某些块设备返回 ENXIO）
+    let _ = std::fs::create_dir_all("/newroot");
+    if let Err(e) = libc_mount(&root_dev, "/newroot", "ext4") {
+        log_at(
+            LogLevel::Error,
+            &format!("rbox init: cannot mount root {}: {}", root_dev, e),
+        );
+        return false;
+    }
+
+    // 5. switch_root：chroot 到新根（pivot_root 与 MS_MOVE 在 initramfs 的
+    //    rootfs 根上都受限（EINVAL）；chroot 无需挂载操作，旧 initramfs
+    //    挂载树会保留在内存中，约几 MB，可接受）
+    unsafe {
+        let newroot = CString::new("/newroot").unwrap();
+        let root = CString::new("/").unwrap();
+        let dot = CString::new(".").unwrap();
+        // 先进入新根挂载点，再 chroot(".") 使当前目录成为新根
+        if libc::chdir(newroot.as_ptr()) != 0 {
+            log_at(
+                LogLevel::Error,
+                &format!(
+                    "rbox init: chdir /newroot failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
+            return false;
+        }
+        if libc::chroot(dot.as_ptr()) != 0 {
+            log_at(
+                LogLevel::Error,
+                &format!(
+                    "rbox init: chroot failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            );
+            return false;
+        }
+        libc::chdir(root.as_ptr());
+    }
+
+    // 6. exec 新根的 init（成功则进程被替换）
+    let err = std::process::Command::new("/init").exec();
+    log_at(
+        LogLevel::Error,
+        &format!("rbox init: cannot exec /init: {}", err),
+    );
+    false
+}
+
+/// 简单 mount 封装（不解析选项）。
+fn libc_mount(src: &str, tgt: &str, fstype: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+    let s =
+        CString::new(src).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let t =
+        CString::new(tgt).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let f = CString::new(fstype)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe {
+        libc::mount(
+            s.as_ptr(),
+            t.as_ptr(),
+            f.as_ptr(),
+            0,
+            std::ptr::null::<std::ffi::c_void>(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

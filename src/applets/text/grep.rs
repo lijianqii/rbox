@@ -48,7 +48,7 @@ impl Applet for Grep {
                     }
                 } else {
                     for f in &files {
-                        match std::fs::read(f) {
+                        match crate::applets::text::util::read_file_fully(f) {
                             Ok(bytes) => {
                                 let content = String::from_utf8_lossy(&bytes);
                                 let fname = if multi { Some(f.as_str()) } else { None };

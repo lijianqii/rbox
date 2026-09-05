@@ -113,6 +113,8 @@ pub(crate) struct LoginConfig {
     pub(crate) shell: String,
     /// 密码提示文本
     pub(crate) password_prompt: String,
+    /// 密码输入超时秒数（0 = 不超时；防恶意用户挂住登录进程）
+    pub(crate) password_timeout: u64,
 }
 
 impl Default for LoginConfig {
@@ -120,6 +122,7 @@ impl Default for LoginConfig {
         Self {
             shell: "/bin/sh".to_string(),
             password_prompt: "Password: ".to_string(),
+            password_timeout: 60,
         }
     }
 }
@@ -187,6 +190,7 @@ mod tests {
         assert_eq!(cfg.getty.failure_delay, 1);
         assert_eq!(cfg.login.shell, "/bin/sh");
         assert_eq!(cfg.login.password_prompt, "Password: ");
+        assert_eq!(cfg.login.password_timeout, 60);
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
         assert_eq!(cfg.paths.meminfo, "/proc/meminfo");
         assert_eq!(cfg.paths.proc, "/proc");
