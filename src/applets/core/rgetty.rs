@@ -211,8 +211,8 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             }
         }
         None => {
-            // 会话超时：子进程已被终止，自动登出回到登录提示
-            let _ = writeln!(io::stdout(), "session timed out, logging out");
+            // 会话超时：先换行（密码提示后无换行），再打印登出消息
+            let _ = writeln!(io::stdout(), "\nsession timed out, logging out");
         }
     }
 }
