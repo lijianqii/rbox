@@ -260,12 +260,19 @@ fn login_shell(entry: &PasswdEntry) -> io::Result<()> {
         "/".to_string()
     };
 
+    // 用户 shell：passwd 无 shell 字段时用配置的缺省 shell
+    let shell = if entry.shell.is_empty() {
+        crate::config::load().login.shell.clone()
+    } else {
+        entry.shell.clone()
+    };
+
     // 设置登录环境（单线程 applet，无并发访问）
     unsafe {
         std::env::set_var("USER", &entry.name);
         std::env::set_var("LOGNAME", &entry.name);
         std::env::set_var("HOME", &home);
-        std::env::set_var("SHELL", &entry.shell);
+        std::env::set_var("SHELL", &shell);
     }
 
     // 打印 MOTD（路径可配置）
@@ -275,12 +282,7 @@ fn login_shell(entry: &PasswdEntry) -> io::Result<()> {
         let _ = io::stdout().flush();
     }
 
-    // exec 用户 shell（passwd 无 shell 字段时用配置的缺省 shell）
-    let shell = if entry.shell.is_empty() {
-        crate::config::load().login.shell.as_str()
-    } else {
-        entry.shell.as_str()
-    };
+    // exec 用户 shell（exec 只在失败时返回）
     Err(std::process::Command::new(shell).exec())
 }
 

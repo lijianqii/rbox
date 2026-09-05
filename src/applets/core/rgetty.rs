@@ -188,7 +188,10 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             return;
         }
         if pid == 0 {
-            // 子进程：exec 登录程序（成功则被替换，不会返回）
+            // 子进程：创建独立会话/进程组（自身 pid 即 pgid），
+            // 使会话超时能终止整个登录会话（含 shell 派生的后台进程）
+            libc::setsid();
+            // exec 登录程序（成功则被替换，不会返回）
             let err = std::process::Command::new(&cfg.login_program)
                 .arg(user)
                 .exec();
@@ -239,8 +242,9 @@ fn wait_child_with_timeout(pid: libc::pid_t, timeout_secs: Option<u64>) -> Optio
         if let Some(d) = deadline
             && std::time::Instant::now() >= d
         {
-            // 会话超时：SIGTERM，1 秒宽限后 SIGKILL
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            // 会话超时：先终止整个进程组（子进程 setsid 后其 pid 即 pgid，
+            // 可连带清理 shell 派生的后台进程），组不存在则回退单进程。
+            terminate_session(pid, libc::SIGTERM);
             let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
             loop {
                 let r2 = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -248,7 +252,7 @@ fn wait_child_with_timeout(pid: libc::pid_t, timeout_secs: Option<u64>) -> Optio
                     break;
                 }
                 if std::time::Instant::now() >= kill_deadline {
-                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    terminate_session(pid, libc::SIGKILL);
                     let _ = unsafe { libc::waitpid(pid, &mut status, 0) };
                     break;
                 }
@@ -260,6 +264,13 @@ fn wait_child_with_timeout(pid: libc::pid_t, timeout_secs: Option<u64>) -> Optio
     }
 }
 
+/// 向会话进程组发送信号；进程组不存在（未 setsid 的测试子进程等）时回退单进程。
+fn terminate_session(pid: libc::pid_t, sig: i32) {
+    if unsafe { libc::kill(-pid, sig) } != 0 {
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
 /// 读取一行用户名（登录提示阶段不超时）；EOF 返回 None。
 fn read_username() -> Option<String> {
     let mut line = String::new();
@@ -267,15 +278,18 @@ fn read_username() -> Option<String> {
     if n == 0 { None } else { Some(line) }
 }
 
-/// 规范化用户名：去掉首尾空白，空输入返回 None。
+/// 规范化用户名：去掉首尾空白，限制长度（防超长用户名撑爆 exec argv）。
 fn normalize_username(raw: &str) -> Option<String> {
     let name = raw.trim();
     if name.is_empty() {
         None
     } else {
-        Some(name.to_string())
+        Some(name.chars().take(MAX_USERNAME_LEN).collect())
     }
 }
+
+/// 用户名最大长度（超过则截断）。
+const MAX_USERNAME_LEN: usize = 64;
 
 #[cfg(test)]
 mod tests {
@@ -364,6 +378,13 @@ mod tests {
             normalize_username("  alice \r\n"),
             Some("alice".to_string())
         );
+    }
+
+    #[test]
+    fn normalize_username_truncates_long() {
+        let long = "u".repeat(200);
+        let name = normalize_username(&long).unwrap();
+        assert_eq!(name.chars().count(), MAX_USERNAME_LEN);
     }
 
     #[test]
