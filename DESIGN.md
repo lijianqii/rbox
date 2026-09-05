@@ -126,6 +126,8 @@ rbox/
 ├── kernel/                 # Linux 内核源码 + 编译产物
 └── tests/
     ├── run_tests.sh        # 集成测试脚本（注入 tests/units 测试服务）
+    ├── login-console.service.toml  # 登录超时测试专用 console 单元（-t 8）
+    ├── rbox.test.conf      # 登录超时测试专用全局配置（password_timeout=3）
     └── units/              # 测试专用服务单元（运行时注入 rootfs，不入生产镜像）
 ```
 ## 架构设计
@@ -347,7 +349,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 30 个测试组、127 个断言（涵盖 33 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 31 个测试组、131 个断言（涵盖 33 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -378,10 +380,11 @@ enum Token {
 | console respawn | 初始环境变量、exit 后 respawn 保留配置 | 2 |
 | 前台 Ctrl-C 中断 | sleep 被 SIGINT 中断，$?=130 | 1 |
 | rgetty/rlogin 登录 | 登录提示、issue 横幅、错误密码拒绝、登录后 shell 可用、串口指定、退出后重新登录 | 6 |
+| rgetty/rlogin 超时 | 持续输入不超时、空闲超时登出、密码输入超时、超时后重新登录 | 4 |
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
 | 内存信息/进程树 | meminfo 输出、分类核算、iomem 树、processes 进程树 | 15 |
-| **合计** | | **127** |
+| **合计** | | **131** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -480,7 +483,9 @@ init ──Restart=always 服务──► rgetty（常驻）──fork──► 
   **终端选择**：仅使用命令行显式 TTY 参数（由 `ExecStart` 完整命令直接传给 rgetty）；
   未指定时使用继承的 stdin/stdout/stderr（init 启动服务时继承的 stdio 即登录终端）。
   TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
-- **rlogin**：无参数时先提示用户名（提示文本可配置）；随后关闭回显读取密码。密码校验规则：
+- **rlogin**：无参数时先提示用户名（提示文本可配置）；随后关闭回显读取密码。密码读取带超时
+  （`/etc/rbox.conf [login] password_timeout`，默认 60s，0 = 不超时；超时输出 `Password timed out`
+  并退出，防恶意用户挂住登录进程）。密码校验规则：
   - `/etc/passwd`（路径可配置）密码字段为 `x` 时读取 `/etc/shadow`（路径可配置）；
     空字段 = 免密登录，`!`/`*` 开头 = 账户锁定；
   - 存储串以 `$` 开头（`$5$...` 等）：用 libc crypt() 校验（与 glibc/busybox 兼容，
@@ -529,6 +534,7 @@ RestartSec = 1
 | [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |
 | [login] | shell | /bin/sh | passwd 缺 shell 字段时缺省 |
 | [login] | password_prompt | "Password: " | 密码提示（生产示例为极简 "passwd: "） |
+| [login] | password_timeout | 60（0 = 不超时） | rlogin 密码输入超时秒数 |
 | [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
 | [shell] | default_ps1 | "> " | 未设置 $PS1 时的默认提示符 |
 
@@ -732,7 +738,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 30 个测试组、127 个断言，覆盖全部 33 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 31 个测试组、131 个断言，覆盖全部 33 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -766,14 +772,14 @@ make unittest
 | init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request、TTY/ExecStart | 16 |
 | init/server | 控制协议处理 | 8 |
 | init/services | 服务生命周期、schedule_restart（on-failure/always）、finish_daemonize | 13 |
-| init/mount | fstab 挂载 | 5 |
+| init/mount | fstab 挂载、mount_line_matches 匹配 | 7 |
 | init/mod | failed_required_dep、compute_next_timeout | 6 |
 | config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
 | text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19、proc 5、processes 9 | 53 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 11、rlogin 11 | 32 |
-| **合计** | | **441** |
+| **合计** | | **443** |
 
 测试结果示例：
 
@@ -800,7 +806,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 127 通过, 0 失败
+结果: 131 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -976,17 +982,17 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 启动失败降级 | default.target 失败 → 自动进入 rescue | TODO |
 | 看门狗喂狗 | /dev/watchdog 周期性喂狗，挂死自动重启 | TODO |
 | 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
-| SIGCHLD 驱动回收 | 信号触发立即 try_wait，替代 200ms 轮询 | TODO |
+| SIGCHLD 驱动回收 | self-pipe + poll 事件驱动，信号唤醒即 try_wait（无 200ms 轮询） | ✅ 已实现 |
 | ExecStop 超时 | ExecStop 命令超时限制 | TODO |
 | fstab pass 字段 | 按 dump/pass 决定挂载顺序 | TODO |
-| head 字符设备兼容 | head 读取 /dev/kmsg 等设备文件（当前 EINVAL） | TODO |
+| head 字符设备兼容 | head/tail/grep/wc 读取 /dev/kmsg 等设备文件（read_file_fully：EINVAL 重试 + O_NONBLOCK） | ✅ 已实现 |
 
 ### 第四优先级：工程化进阶
 
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（441 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（443 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

@@ -224,6 +224,7 @@ failure_delay = 2
 [login]
 shell = "/bin/ash"
 password_prompt = "Password: "
+password_timeout = 5
 
 [init]
 default_path = "/bin:/sbin"
@@ -235,6 +236,7 @@ default_path = "/bin:/sbin"
         assert_eq!(cfg.getty.default_timeout, Some(120));
         assert_eq!(cfg.getty.failure_delay, 2);
         assert_eq!(cfg.login.shell, "/bin/ash");
+        assert_eq!(cfg.login.password_timeout, 5);
         assert_eq!(cfg.init.default_path, "/bin:/sbin");
     }
 

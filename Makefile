@@ -203,7 +203,7 @@ clippy:
 # ─── 清理 ────────────────────────────────────────
 clean:
 	cargo clean
-	rm -f $(INITRD)
+	rm -f $(INITRD) $(TEST_INITRD) login-test.cpio.gz
 
 help:
 	@echo "rbox 构建系统"

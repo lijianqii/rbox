@@ -1,0 +1,13 @@
+[Unit]
+Description = "Console login (timeout test override: rgetty with -t 8 idle timeout)"
+Name = "console-shell"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rgetty -L -t 8 ttyAMA0"
+# 测试覆盖：空闲超时登出 / 密码超时后由 Restart=always 兜底
+Restart = "always"
+RestartSec = 1
+
+[Install]
+WantedBy = ["default.target"]

@@ -72,6 +72,50 @@ assert_contains_in "$LOGIN_OUT" "登录后 shell 可用" "LOGIN_OK"
 assert_contains_in "$LOGIN_OUT" "rgetty 使用命令行指定串口" "0 -> /dev/ttyAMA0"
 assert_contains_in "$LOGIN_OUT" "退出后重新登录" "LOGIN_AGAIN"
 
+# ─── rgetty/rlogin 超时流程（独立测试 initramfs：console -t 8 空闲超时 +
+#      rbox.conf password_timeout=3 密码超时；备份/恢复生产文件）───
+# 验证：登录成功后可空闲超时登出、密码阶段可超时拒绝、超时后仍可重新登录。
+build_login_test_initramfs() {
+    local bak_unit=/tmp/rbox_console_bak.toml
+    local bak_conf=/tmp/rbox_conf_bak
+    cp rootfs/etc/rbox/system/console-shell.service.toml "$bak_unit"
+    cp rootfs/etc/rbox.conf "$bak_conf"
+    cp tests/login-console.service.toml rootfs/etc/rbox/system/console-shell.service.toml
+    cp tests/rbox.test.conf rootfs/etc/rbox.conf
+    (cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip > ../login-test.cpio.gz)
+    mv "$bak_unit" rootfs/etc/rbox/system/console-shell.service.toml
+    mv "$bak_conf" rootfs/etc/rbox.conf
+}
+build_login_test_initramfs
+TIMEOUT_OUT=$(timeout 150 bash -c '
+{
+  sleep 18
+  # 第一次登录：成功后每 3s 输入一次（< -t 8），持续 15s 不应超时；
+  # K1..K5 中偶发单次丢失不影响结论（间隔仍 < 8s）
+  printf "root\n"; sleep 2
+  printf "root\n"; sleep 3
+  printf "echo K1\n"; sleep 3
+  printf "echo K2\n"; sleep 3
+  printf "echo K3\n"; sleep 3
+  printf "echo K4\n"; sleep 3
+  printf "echo K5\n"; sleep 10
+  # 空闲 10s（> -t 8）触发空闲超时登出
+  # 第二次登录：密码阶段静默 5s（> password_timeout 3）触发密码超时
+  printf "root\n"; sleep 5
+  # 第三次登录：恢复正常，确认超时后仍可重新登录
+  printf "root\n"; sleep 2
+  printf "root\n"; sleep 2
+  printf "echo TIMEOUT_LOGIN_OK\n"; sleep 1
+  printf "shutdown\n"; sleep 8
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel '"$KERNEL"' -initrd login-test.cpio.gz -append '"'$APPEND'"'
+' 2>&1) || true
+rm -f login-test.cpio.gz
+assert_contains_in "$TIMEOUT_OUT" "持续输入不超时" "K5"
+assert_contains_in "$TIMEOUT_OUT" "空闲超时登出" "session timed out, logging out"
+assert_contains_in "$TIMEOUT_OUT" "密码输入超时" "Password timed out"
+assert_contains_in "$TIMEOUT_OUT" "超时后重新登录" "TIMEOUT_LOGIN_OK"
+
 # 单次 QEMU 运行所有测试命令
 # 命令序列本身约 30 秒，超时需留足内核启动余量（负载高时启动会变慢）
 # 注意：整个命令块在外层 bash -c '...' 单引号中，内部 printf 必须用双引号，
