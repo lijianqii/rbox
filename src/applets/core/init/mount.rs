@@ -66,12 +66,38 @@ pub(crate) fn mount_all_fs() {
         ));
         let _ = fs::create_dir_all(&e.mountpoint);
         if let Err(err) = run_mount(&e.device, &e.mountpoint, &e.fstype, &e.options) {
+            // EBUSY 且目标已以相同类型挂载（early 阶段预挂或内核自动挂载）
+            // 属正常情况，不报错
+            if err.raw_os_error() == Some(libc::EBUSY) && is_mounted_with(&e.mountpoint, &e.fstype)
+            {
+                continue;
+            }
             log(&format!(
                 "rbox init: mount {} on {} failed: {}",
                 e.device, e.mountpoint, err
             ));
         }
     }
+}
+
+/// 检查 /proc/mounts 中 mountpoint 是否已以 fstype 挂载（EBUSY 时区分
+/// “已挂载”与“挂载点被其他类型占用”两种情况）。
+fn is_mounted_with(mountpoint: &str, fstype: &str) -> bool {
+    let Ok(content) = fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+    content
+        .lines()
+        .any(|l| mount_line_matches(l, mountpoint, fstype))
+}
+
+/// 判断一行挂载记录（/proc/mounts 格式）是否匹配指定的挂载点与文件系统类型。
+fn mount_line_matches(line: &str, mountpoint: &str, fstype: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let _dev = fields.next();
+    let mp = fields.next().unwrap_or("");
+    let ft = fields.next().unwrap_or("");
+    mp == mountpoint && ft == fstype
 }
 
 /// 为所有子进程（shell、服务）提供默认 PATH（可配置）。
@@ -223,6 +249,43 @@ mod tests {
             libc::MS_RDONLY | libc::MS_NOEXEC | libc::MS_NOSUID
         );
         assert_eq!(parse_mount_flags("unknownopt"), 0);
+    }
+
+    #[test]
+    fn mount_line_matches_basic() {
+        assert!(mount_line_matches(
+            "proc /proc proc rw,relatime 0 0",
+            "/proc",
+            "proc"
+        ));
+        assert!(!mount_line_matches(
+            "proc /proc proc rw,relatime 0 0",
+            "/proc",
+            "sysfs"
+        ));
+        assert!(!mount_line_matches(
+            "devtmpfs /dev devtmpfs rw 0 0",
+            "/dev",
+            "proc"
+        ));
+    }
+
+    #[test]
+    fn mount_line_matches_wrong_type() {
+        // 挂载点相同但类型不同 → 不匹配
+        assert!(!mount_line_matches(
+            "/dev/vda /mnt ext4 rw 0 0",
+            "/mnt",
+            "tmpfs"
+        ));
+        // 类型相同但挂载点不同 → 不匹配
+        assert!(!mount_line_matches(
+            "tmpfs /run tmpfs rw 0 0",
+            "/tmp",
+            "tmpfs"
+        ));
+        // 字段不足的行 → 不匹配
+        assert!(!mount_line_matches("proc /proc", "/proc", "proc"));
     }
 
     #[test]

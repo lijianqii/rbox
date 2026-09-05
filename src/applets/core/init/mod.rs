@@ -227,19 +227,12 @@ impl Applet for Init {
 fn early_root_handoff() -> bool {
     use std::ffi::CString;
 
-    // 0. 先挂载 proc/sys/dev（early 阶段 mount_all_fs 尚未执行，
-    //    /proc/cmdline 与 /proc/mounts 依赖 proc；devtmpfs 提供 root 设备节点）
-    // initramfs 里可能没有 /proc /sys 目录，先创建再挂载
+    // 0. 仅挂载 proc（读 /proc/cmdline 必需）。sysfs 切换流程用不到；
+    //    devtmpfs 仅在确认要切换后才挂（提供 root 设备节点），
+    //    避免后续 mount_all_fs 重复挂载报 EBUSY。
+    //    initramfs 里可能没有 /proc 目录，先创建再挂载
     let _ = std::fs::create_dir_all("/proc");
-    let _ = std::fs::create_dir_all("/sys");
-    let _ = std::fs::create_dir_all("/dev");
-    for (src, tgt, fstype) in [
-        ("proc", "/proc", "proc"),
-        ("sysfs", "/sys", "sysfs"),
-        ("devtmpfs", "/dev", "devtmpfs"),
-    ] {
-        let _ = libc_mount(src, tgt, fstype);
-    }
+    let _ = libc_mount("proc", "/proc", "proc");
 
     // 1. 解析内核命令行 root=（去掉可选的 fs 类型/参数后缀）
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
@@ -270,7 +263,12 @@ fn early_root_handoff() -> bool {
         root_dev
     ));
 
-    // 3. 挂载 root 设备到 /newroot（显式 ext4；自动探测对某些块设备返回 ENXIO）
+    // 3. 挂载 devtmpfs 提供 root 设备节点（内核未自动挂载时）；
+    //    已挂载（EBUSY）时节点由内核的 devtmpfs 提供，忽略即可
+    let _ = std::fs::create_dir_all("/dev");
+    let _ = libc_mount("devtmpfs", "/dev", "devtmpfs");
+
+    // 4. 挂载 root 设备到 /newroot（显式 ext4；自动探测对某些块设备返回 ENXIO）
     let _ = std::fs::create_dir_all("/newroot");
     if let Err(e) = libc_mount(&root_dev, "/newroot", "ext4") {
         log_at(

@@ -178,12 +178,12 @@ OUT=$(timeout 400 bash -c '
   printf "sleep 3 &\n"; sleep 0.5
   printf "true\n"; sleep 0.5
   printf "echo bg_true_rc=\$?\n"; sleep 0.5
-  # 10.7 内存信息
-  printf "meminfo\n"; sleep 0.5
-  printf "meminfo -m\n"; sleep 0.5
-  printf "processes\n"; sleep 0.5
+  # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
+  printf "meminfo\n"; sleep 1.5
+  printf "meminfo -m\n"; sleep 1.5
+  printf "processes\n"; sleep 1
   # 11. 文本处理 applets
-  printf "echo -e \x27line1\\nline2\\nline3\x27 | head -n 2\n"; sleep 0.5
+  printf "%s\n" "echo -e 'line1\\nline2\\nline3' | head -n 2"; sleep 1
   printf "printf name=%%s-num=%%d rbox 42\n"; sleep 1
   printf "echo hello | wc -c\n"; sleep 0.5
   printf "echo hello | grep -o hel\n"; sleep 0.5
@@ -219,8 +219,8 @@ OUT=$(timeout 400 bash -c '
   printf "echo \x27export SOURCED=yes\x27 > /tmp/srctest.sh; source /tmp/srctest.sh; echo \$SOURCED\n"; sleep 0.5
   # 22. PS1 提示符（通过 source /etc/profile）
   printf "export PS1=\\x27test# \\x27; echo done\n"; sleep 0.5
-  # 23. here-doc
-  printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\n"; sleep 0.5
+  # 23. here-doc（三行发送，间隔稍长）
+  printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\n"; sleep 1
   # 24. console shell respawn 保留配置（Environment 注入后 shell 退出重启仍保留）
   printf "echo console_init=\$RBOX_CONSOLE\n"; sleep 0.5
   printf "exit\n"; sleep 3
