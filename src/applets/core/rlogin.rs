@@ -99,8 +99,12 @@ impl Drop for EchoGuard {
     }
 }
 
+/// 密码最大长度（字节）：超限拒绝登录（防超长粘贴撑爆内存）。
+const MAX_PASSWORD_LEN: usize = 256;
+
 /// 读取一行密码（终端上关闭 ECHO；非 tty 时直接读取）。
 /// `timeout_secs` 内无输入返回 None（防恶意用户挂住登录进程）。
+/// 支持退格键（0x7f / 0x08）删除已输入字符；超长输入返回 None 拒绝登录。
 fn read_password(timeout_secs: Option<u64>) -> Option<String> {
     let fd = libc::STDIN_FILENO;
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
@@ -128,7 +132,11 @@ fn read_password(timeout_secs: Option<u64>) -> Option<String> {
                 revents: 0,
             }];
             let ms = (d - now).as_millis().min(i32::MAX as u128) as i32;
-            if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
+            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue; // 被信号打断：继续等待，不误判超时
+            }
+            if n <= 0 {
                 drop(guard);
                 return None;
             }
@@ -139,8 +147,17 @@ fn read_password(timeout_secs: Option<u64>) -> Option<String> {
             drop(guard);
             return None; // EOF / 读错误
         }
+        // 退格键（BS 0x08 或 DEL 0x7f）：删除最后一个已输入字符
+        if b[0] == 0x08 || b[0] == 0x7f {
+            line.pop();
+            continue;
+        }
         if b[0] == b'\n' || b[0] == b'\r' {
             break;
+        }
+        if line.len() >= MAX_PASSWORD_LEN {
+            drop(guard);
+            return None; // 密码过长：拒绝登录
         }
         line.push(b[0]);
     }

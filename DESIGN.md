@@ -475,7 +475,10 @@ init ──Restart=always 服务──► rgetty（常驻）──fork──► 
   - `-L`：设置 CLOCAL（忽略载波检测，真实串口常用，同 busybox getty）；
   - `-t SEC`：**登录会话空闲超时**（无输入达到 SEC 秒自动登出，从登录成功/进入
     shell 开始计时，登录提示与密码阶段不超时；有输入活动会刷新计时）；
-  - 启动时打印 `/etc/issue` 横幅（路径可配置，不存在则跳过）；
+  - 每次提示前打印 `/etc/issue` 横幅（路径可配置，不存在则跳过；登录失败/退出后
+    重新提示时横幅重现，同 busybox getty）；
+  - 忽略 SIGINT/SIGQUIT：登录提示与密码阶段的 Ctrl-C/\ 不打断登录链路
+    （shell 会话阶段由 shell 自己接管 SIGINT，不受影响）；
   - 打印提示（`/etc/rbox.conf [getty] prompt`）后读取用户名，**fork 子进程**执行
     `/bin/rlogin <user>`（路径可配置）；父进程 wait：登录失败（非零退出）按
     `failure_delay` 延迟后原地重新提示，shell 正常退出立即重新提示；
@@ -485,7 +488,8 @@ init ──Restart=always 服务──► rgetty（常驻）──fork──► 
   TTY 可写裸设备名（`ttyAMA0`）或 `/dev/` 路径。启动时会把终端恢复为行缓冲模式。
 - **rlogin**：无参数时先提示用户名（提示文本可配置）；随后关闭回显读取密码。密码读取带超时
   （`/etc/rbox.conf [login] password_timeout`，默认 60s，0 = 不超时；超时输出 `Password timed out`
-  并退出，防恶意用户挂住登录进程）。密码校验规则：
+  并退出，防恶意用户挂住登录进程）；支持退格键删除已输入字符，密码长度上限 256 字节
+  （超限拒绝登录）。密码校验规则：
   - `/etc/passwd`（路径可配置）密码字段为 `x` 时读取 `/etc/shadow`（路径可配置）；
     空字段 = 免密登录，`!`/`*` 开头 = 账户锁定；
   - 存储串以 `$` 开头（`$5$...` 等）：用 libc crypt() 校验（与 glibc/busybox 兼容，

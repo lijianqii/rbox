@@ -144,6 +144,16 @@ fn reset_terminal() {
     unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) };
 }
 
+/// 忽略 SIGINT/SIGQUIT（登录提示与密码阶段 Ctrl-C/\ 不打断登录链路）。
+/// 子进程（rlogin → shell）继承该设置；shell 会话阶段由 shell 自己
+/// 重新安装 SIGINT handler（raw + 0x03 机制），不受影响。
+fn ignore_sigint() {
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+    }
+}
+
 /// 打印登录前横幅（/etc/issue，配置可改；文件不存在则跳过）。
 fn print_issue(issue_file: &str) {
     if let Ok(content) = std::fs::read_to_string(issue_file) {
@@ -157,9 +167,14 @@ fn print_issue(issue_file: &str) {
 /// 不经过 init 重启（init 的 Restart=always 仅兜底 rgetty 本身崩溃）。
 /// `-t` 超时为空闲超时：会话期间有输入活动会刷新计时，持续无输入才登出。
 fn run_getty(cfg: &crate::config::GettyConfig, timeout_secs: Option<u64>) -> ExitCode {
-    print_issue(&cfg.issue_file);
+    // 登录提示/密码阶段 Ctrl-C 不应杀掉登录链路（与 busybox login 一致，
+    // Ctrl-C 被忽略，密码超时兜底）；shell 会话阶段由 shell 自己接管 SIGINT。
+    ignore_sigint();
     loop {
         reset_terminal();
+        // 每次提示前重打 issue 横幅（与 busybox getty 一致：登录失败/超时/退出后
+        // 重新登录时横幅重现）
+        print_issue(&cfg.issue_file);
         let _ = write!(io::stdout(), "\r\n{}", cfg.prompt);
         let _ = io::stdout().flush();
 
