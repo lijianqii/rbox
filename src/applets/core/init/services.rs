@@ -68,7 +68,16 @@ impl ServiceInstance {
             Some(c) => format!("{} running pid={}{}\n", self.name, c.id(), restart),
             None => {
                 let state = if self.stopped { "stopped" } else { "exited" };
-                format!("{} {}{}\n", self.name, state, restart)
+                let mut line = format!("{} {}{}", self.name, state, restart);
+                // 诊断：显示失败/重启计数（crash-loop 时可见 giving-up 趋势）
+                if self.fail_count > 0 {
+                    line.push_str(&format!(
+                        " failed={}/{}",
+                        self.fail_count, self.start_limit_burst
+                    ));
+                }
+                line.push('\n');
+                line
             }
         }
     }

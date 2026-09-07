@@ -115,7 +115,7 @@ fn execute_control_request(
     units: &HashMap<String, Unit>,
 ) -> String {
     match req {
-        ControlRequest::Status(unit) => format_status(unit.unwrap_or(""), services),
+        ControlRequest::Status(unit) => format_status(unit.unwrap_or(""), services, units),
         ControlRequest::Start(name) => do_start(name, services, units),
         ControlRequest::Stop(name) => do_stop(name, services),
         ControlRequest::Reload(name) => do_reload(name, services),
@@ -218,24 +218,61 @@ fn do_stop(name: &str, services: &mut [ServiceInstance]) -> String {
     format!("{} stopped\n", name)
 }
 
-/// 生成 status 响应文本。`unit` 为空列出全部；否则查单个单元。
-fn format_status(unit: &str, services: &[ServiceInstance]) -> String {
+/// 生成 status 响应文本。`unit` 为空列出全部（含未启动单元）；否则查单个单元。
+/// 未启动单元显示 not-started，与运行实例（services）状态合并呈现。
+fn format_status(
+    unit: &str,
+    services: &[ServiceInstance],
+    units: &HashMap<String, Unit>,
+) -> String {
     let unit = unit.trim();
     let mut out = String::new();
 
     if unit.is_empty() {
         out.push_str(&format!("init pid={}\n", std::process::id()));
+        // 列出全部服务单元（按名排序），运行实例合并其状态；
+        // services 中不在 units 里的实例（手动注册）也一并列出
+        let mut names: Vec<&str> = units
+            .iter()
+            .filter(|(_, u)| !u.is_target)
+            .map(|(n, _)| n.as_str())
+            .collect();
         for svc in services {
-            out.push_str(&svc.status_line());
+            if !names.contains(&svc.name.as_str()) {
+                names.push(&svc.name);
+            }
+        }
+        names.sort_unstable();
+        for name in names {
+            match services.iter().find(|s| s.name == name) {
+                Some(svc) => out.push_str(&svc.status_line()),
+                None => out.push_str(&not_started_line(name, units)),
+            }
         }
     } else if unit == "init" {
         out.push_str(&format!("init pid={}\n", std::process::id()));
     } else if let Some(svc) = services.iter().find(|s| s.name == unit) {
         out.push_str(&svc.status_line());
+    } else if let Some(u) = units.get(unit) {
+        if u.is_target {
+            out.push_str(&format!("{} target\n", unit));
+        } else {
+            out.push_str(&not_started_line(unit, units));
+        }
     } else {
         out.push_str(&format!("unknown unit: {}\n", unit));
     }
     out
+}
+
+/// 已配置但从未运行的单元状态行（含重启策略提示）。
+fn not_started_line(name: &str, units: &HashMap<String, Unit>) -> String {
+    let restart = match units.get(name).map(|u| u.service.restart.as_str()) {
+        Some("always") => " restart=always",
+        Some("on-failure") => " restart=on-failure",
+        _ => "",
+    };
+    format!("{} not-started{}\n", name, restart)
 }
 
 #[cfg(test)]
@@ -246,7 +283,7 @@ mod tests {
     #[test]
     fn format_status_lists_all() {
         let services = vec![test_svc("a.service", false), test_svc("b.service", true)];
-        let out = format_status("", &services);
+        let out = format_status("", &services, &HashMap::new());
         assert!(out.contains("init pid="), "out: {}", out);
         assert!(out.contains("a.service exited"), "out: {}", out);
         assert!(
@@ -259,14 +296,14 @@ mod tests {
     #[test]
     fn format_status_single_unit() {
         let services = vec![test_svc("a.service", false)];
-        let out = format_status("a.service", &services);
+        let out = format_status("a.service", &services, &HashMap::new());
         assert!(out.contains("a.service exited"), "out: {}", out);
         assert!(!out.contains("init pid="), "out: {}", out);
     }
 
     #[test]
     fn format_status_unknown_unit() {
-        let out = format_status("ghost.service", &[]);
+        let out = format_status("ghost.service", &[], &HashMap::new());
         assert!(out.contains("unknown unit: ghost.service"), "out: {}", out);
     }
 
@@ -275,13 +312,79 @@ mod tests {
         // console 现在是普通服务（Restart=always），status 同样列出
         let mut svc = test_svc("console-shell.service", false);
         svc.restart_always = true;
-        let out = format_status("", &[svc]);
+        let out = format_status("", &[svc], &HashMap::new());
         assert!(
             out.contains("console-shell.service exited restart=always"),
             "out: {}",
             out
         );
         assert!(!out.contains("console-shell stopped"), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_lists_not_started_units() {
+        // 配置了但从未运行的服务单元应出现在完整清单中（not-started）
+        let units = units_with_names(&["foo.service", "bar.service"]);
+        let out = format_status("", &[], &units);
+        assert!(out.contains("foo.service not-started"), "out: {}", out);
+        assert!(out.contains("bar.service not-started"), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_single_not_started_unit() {
+        let units = units_with_names(&["foo.service"]);
+        let out = format_status("foo.service", &[], &units);
+        assert!(out.contains("foo.service not-started"), "out: {}", out);
+        assert!(!out.contains("init pid="), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_target() {
+        let mut units = units_with_names(&["default.target"]);
+        units.get_mut("default.target").unwrap().is_target = true;
+        let out = format_status("default.target", &[], &units);
+        assert!(out.contains("default.target target"), "out: {}", out);
+        // 完整清单不列出 target
+        let out = format_status("", &[], &units);
+        assert!(!out.contains("default.target"), "out: {}", out);
+    }
+
+    #[test]
+    fn format_status_merges_running_and_units() {
+        // 运行实例 + 未启动单元同时呈现
+        let mut units = units_with_names(&["a.service", "c.service"]);
+        units.get_mut("a.service").unwrap().service.restart = "always".to_string();
+        let mut svc = test_svc("b.service", false);
+        svc.child = Some(std::process::Command::new("true").spawn().unwrap());
+        let out = format_status("", &[svc], &units);
+        assert!(
+            out.contains("a.service not-started restart=always"),
+            "out: {}",
+            out
+        );
+        assert!(out.contains("b.service running"), "out: {}", out);
+        assert!(out.contains("c.service not-started"), "out: {}", out);
+    }
+
+    #[test]
+    fn status_line_shows_fail_count() {
+        let mut svc = test_svc("a.service", false);
+        svc.fail_count = 3;
+        svc.start_limit_burst = 5;
+        let out = svc.status_line();
+        assert!(out.contains("a.service exited failed=3/5"), "out: {}", out);
+    }
+
+    /// 构造仅含给定名称单元的 map（is_target=false，无 ExecStart）。
+    fn units_with_names(names: &[&str]) -> HashMap<String, Unit> {
+        names
+            .iter()
+            .map(|n| {
+                let mut u = Unit::default();
+                u.name = n.to_string();
+                (n.to_string(), u)
+            })
+            .collect()
     }
 
     #[test]
