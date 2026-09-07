@@ -329,7 +329,7 @@ fn new_service_instance(
 
 /// 服务退出后调度重启：失败计数 +1（成功退出清零），
 /// 窗口内失败次数超过 StartLimitBurst 后放弃；距首次失败超过
-/// StartLimitIntervalSec 则计数重置（时间窗）。失败时按 RestartSec 退避。
+/// StartLimitIntervalSec 则计数重置（时间窗）。失败后按固定 RestartSec 间隔重启。
 /// 策略：Restart=always 无论成败都重启；Restart=on-failure 仅失败重启。
 pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
     let now = std::time::Instant::now();
@@ -456,9 +456,12 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
         }
         let _ = child.wait();
     }
-    // forking daemon：向 daemon pid 发信号并等待其退出（init 收养后 waitpid 可收割）
+    // forking daemon：向 daemon 进程组发信号并等待其退出（init 收养后 waitpid 可收割）。
+    // daemon 化通常伴随 setsid，此时 pgid == pid，kill(-pid) 可连同 daemon 派生的工作进程
+    // 一起终止；组不存在（未 setsid）时 kill_process_group 失败，回退单进程。
     if let Some(pid) = svc.tracked_pid.take() {
-        let _ = kill_process(pid, libc::SIGTERM);
+        let _ =
+            kill_process_group(pid, libc::SIGTERM).or_else(|_| kill_process(pid, libc::SIGTERM));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let mut status: libc::c_int = 0;
         loop {
@@ -467,7 +470,8 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                let _ = kill_process(pid, libc::SIGKILL);
+                let _ = kill_process_group(pid, libc::SIGKILL)
+                    .or_else(|_| kill_process(pid, libc::SIGKILL));
                 unsafe { libc::waitpid(pid as i32, &mut status, 0) };
                 break;
             }

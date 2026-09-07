@@ -167,6 +167,7 @@ impl Applet for Init {
                     if !unit.service.restart.is_empty()
                         && unit.service.restart != "on-failure"
                         && unit.service.restart != "always"
+                        && unit.service.restart != "no"
                     {
                         log_at(
                             LogLevel::Warn,
@@ -248,9 +249,6 @@ fn early_root_handoff() -> bool {
     // 2. 若当前根已经是 ext4（持久 rootfs）则跳过。
     //    不能用 /proc/mounts 判断：chroot 后挂载表仍显示 rootfs，
     //    但进程根实际已是 ext4，会导致二次切换。
-    // 若当前根已经是 ext4（持久 rootfs）则跳过。
-    // 不能用 /proc/mounts 判断：chroot 后挂载表仍显示 rootfs，
-    // 但进程根实际已是 ext4，会导致二次切换。
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c"/".as_ptr(), &mut st) } == 0
         && st.f_type == libc::EXT4_SUPER_MAGIC as libc::c_long
@@ -626,24 +624,51 @@ fn reap_orphans(services: &mut [ServiceInstance]) {
     }
 }
 
+/// 关机总超时（秒）：逐服务 stop + 残留进程回收共用此 deadline，
+/// 到点后直接 SIGKILL 全部残留进程，避免被忽略 SIGTERM 的进程拖住。
+const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
 /// 执行有序关机：逆序停止服务，杀残留进程，再 power off。
 fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
     log("rbox init: shutting down");
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
     for svc in services.iter_mut().rev() {
+        if std::time::Instant::now() >= deadline {
+            log_at(
+                LogLevel::Warn,
+                "rbox init: shutdown deadline reached, skipping remaining services",
+            );
+            break;
+        }
         stop_service_instance(svc);
     }
     log("rbox init: sending SIGTERM to all processes");
     let _ = kill_all(libc::SIGTERM);
-    // 等待所有子进程退出（最多 5 秒），实现优雅关机；超时继续关机流程
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // 等待所有子进程退出（受总 deadline 约束）；到点升级 SIGKILL，避免忽略
+    // SIGTERM 的进程无限拖延关机。
     loop {
+        if std::time::Instant::now() >= deadline {
+            log("rbox init: sending SIGKILL to all processes");
+            let _ = kill_all(libc::SIGKILL);
+            // 给 SIGKILL 一个极短收割窗口（最多 1 秒）
+            let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < kill_deadline {
+                let mut status: libc::c_int = 0;
+                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+                if pid < 0 {
+                    break; // ECHILD：无子进程
+                }
+                if pid == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            break;
+        }
         let mut status: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
         if pid < 0 {
             break; // ECHILD：无子进程
-        }
-        if std::time::Instant::now() >= deadline {
-            break;
         }
         if pid == 0 {
             std::thread::sleep(std::time::Duration::from_millis(50));

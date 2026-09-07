@@ -8,7 +8,7 @@
 
 - **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 33 个命令
 - **systemd 风格 init**：TOML 单元文件、依赖拓扑排序、`Type=simple/forking`、
-  `Restart=on-failure/always`（退避 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
+  `Restart=on-failure/always`（固定 RestartSec 间隔 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
 - **有序关机/重启**：ExecStop 逆序执行、进程组清理、孤儿进程收割、kmsg 日志
 - **系统初始化**：`/etc/fstab` 挂载、hostname、sysctl、PATH

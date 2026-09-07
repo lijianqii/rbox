@@ -8,11 +8,15 @@ use crate::applets::core::init::services::{
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 /// 创建控制 socket（非阻塞）；失败时返回 None（不影响启动）。
 pub(crate) fn create_status_listener() -> Option<UnixListener> {
+    // UnixListener::bind 不会清理已存在的 socket 文件；initramfs 重启时 /tmp 是
+    // tmpfs 会自然消失，但持久盘启动（fstab 未挂 tmpfs /tmp）或 init 被 re-exec 时
+    // 残留文件会导致 bind EADDRINUSE，控制协议静默失效。这里先尝试移除旧文件。
+    let _ = std::fs::remove_file(status_socket());
     match UnixListener::bind(status_socket()) {
         Ok(l) => {
             let _ = l.set_nonblocking(true);
@@ -26,23 +30,41 @@ pub(crate) fn create_status_listener() -> Option<UnixListener> {
 }
 
 /// 处理一次控制连接：读一行请求，分发到 status/start/stop/restart/reload，回写响应，关闭。
-/// 读请求带 100ms 超时，避免异常客户端挂住主循环。
+/// 连接设为非阻塞并用 10ms poll 等数据，避免异常客户端（连接后不发数据）挂住主循环。
 pub(crate) fn handle_control_connection(
     mut stream: UnixStream,
     services: &mut Vec<ServiceInstance>,
     units: &HashMap<String, Unit>,
 ) {
+    let _ = stream.set_nonblocking(true);
     let mut req = String::new();
-    if let Ok(peer) = stream.try_clone() {
-        // 读请求带 100ms 超时，避免异常客户端（连接后不发数据）挂住主循环
-        let _ = peer.set_read_timeout(Some(std::time::Duration::from_millis(100)));
-        let mut reader = std::io::BufReader::new(peer);
-        let _ = reader.read_line(&mut req);
+    // 等数据：最多 10ms（主循环单次被阻塞量级可接受）；非阻塞读直到 EAGAIN 或换行
+    let mut buf = [0u8; 256];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+    loop {
+        if req.ends_with('\n') || std::time::Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if req.len() > 4096 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
     }
     let resp = match parse_control_request(&req) {
         Ok(r) => execute_control_request(r, services, units),
         Err(e) => format!("error: {}\n", e),
     };
+    // 读阶段用非阻塞避免挂主循环；写响应时恢复阻塞，避免小响应遇 WouldBlock 丢失
+    let _ = stream.set_nonblocking(false);
     let _ = stream.write_all(resp.as_bytes());
 }
 

@@ -15,6 +15,17 @@ use crate::applet::Applet;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // PID 1 崩溃保护：panic → abort 会导致 PID 1 死亡（kernel panic），
+    // 这里把 panic 信息写一行到 /dev/kmsg，便于事后从 dmesg/console 定位死因。
+    std::panic::set_hook(Box::new(|info| {
+        let msg = format!("rbox panic: {}", info);
+        if let Ok(mut kmsg) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+            use std::io::Write;
+            let _ = kmsg.write_all(format!("\n{}\n", msg).as_bytes());
+        }
+        eprintln!("{}", msg);
+    }));
+
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.is_empty() {
         eprintln!("rbox: no argv[0]");

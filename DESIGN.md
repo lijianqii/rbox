@@ -586,7 +586,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
 5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop
-6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（退避 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用）；检测关机标志
+6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（固定 RestartSec 间隔 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用）；检测关机标志
 
 `Type=` 目前支持 `simple` 与 `forking`；其他值会打印警告并按 simple 处理。
 `Restart=` 目前支持 `no`（默认）、`on-failure` 与 `always`，其他值打印警告并按 no 处理。
@@ -617,9 +617,10 @@ reboot 命令   / SIGINT  ──► 重启（设置 REBOOT_REQUESTED 标志）
   +-- 设置对应全局标志
   +-- do_shutdown():
   |     +-- 逆序遍历已启动的服务，执行 ExecStop + SIGTERM 等服务退出
-  |     |    （1 秒超时后 SIGKILL 强杀，避免挂起）
+  |     |    （单服务 1 秒超时后 SIGKILL 强杀，避免挂起）
   |     +-- kill(-1, SIGTERM) -> 所有残留进程
-  |     +-- sleep 500ms
+  |     +-- 收割循环（50ms 轮询，受总 deadline 约束）
+  |     |    （总超时 10s 到点后 kill(-1, SIGKILL) 强制清理，再给 1s 收割窗口）
   |     +-- sync()
   |     +-- reboot(RB_POWER_OFF)（关机）或 reboot(RB_AUTOBOOT)（重启）
   +-- QEMU 退出 / 重启
@@ -963,7 +964,7 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | Restart=on-failure | 服务退出后自动重启 | ✅ 已实现 |
-| RestartSec / StartLimitBurst | 重启退避间隔与连续失败上限（防 crash-loop 刷屏） | ✅ 已实现 |
+| RestartSec / StartLimitBurst | 固定 RestartSec 间隔与连续失败上限（防 crash-loop 刷屏） | ✅ 已实现 |
 | Type=forking | daemon 化服务：等待父进程退出 + PIDFile 跟踪 + TimeoutStartSec 超时 | ✅ 已实现 |
 | ExecReload | rservice reload <unit> 执行 ExecReload 命令（不重启） | ✅ 已实现 |
 | 服务输出重定向 | LogFile= 将 stdout/stderr 写入日志文件 | ✅ 已实现 |
