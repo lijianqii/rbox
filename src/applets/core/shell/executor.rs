@@ -10,11 +10,22 @@ use super::expander::expand_pipeline;
 use super::parser::build_command_list;
 use super::tokenizer::tokenize;
 use super::types::*;
+use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+/// 前台命令等待期间，Ctrl-C 监控线程读到的非 0x03 字节缓存于此。
+/// REPL 主循环读取 stdin 前先消费本队列，避免监控线程与主线程
+/// 并发读 stdin 导致字节错位/丢失（TIOCSTI 推回队尾会乱序，已弃用）。
+static PENDING_STDIN: OnceLock<Mutex<VecDeque<u8>>> = OnceLock::new();
+
+pub(crate) fn pending_stdin() -> &'static Mutex<VecDeque<u8>> {
+    PENDING_STDIN.get_or_init(|| Mutex::new(VecDeque::new()))
+}
 
 /// 以覆盖或追加方式打开文件用于重定向。
 fn open_redirect(path: &str, append: bool) -> Option<std::fs::File> {
@@ -260,10 +271,10 @@ fn execute_pipeline(pipeline: &Pipeline) -> i32 {
                     }
                     return;
                 } else {
-                    // 其他字节推回 stdin（root 下 TIOCSTI 可用；失败则丢弃）
-                    unsafe {
-                        libc::ioctl(stdin_fd, libc::TIOCSTI, &buf[0] as *const u8 as *const _);
-                    }
+                    // 非 Ctrl-C 字节：缓存到 pending 队列，主循环随后消费。
+                    // （TIOCSTI 推回会追加到 tty 输入队列队尾，与主线程并发
+                    //   读 stdin 时乱序/错位，改为共享队列保序）
+                    pending_stdin().lock().unwrap().push_back(buf[0]);
                 }
             } else {
                 // 没有数据，短暂休眠后重试

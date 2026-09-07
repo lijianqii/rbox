@@ -165,6 +165,7 @@ mod tests {
             state: state.to_string(),
             name: name.to_string(),
             exe: format!("/bin/{}", name),
+            cpu_ticks: 0,
         }
     }
 

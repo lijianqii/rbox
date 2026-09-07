@@ -418,9 +418,10 @@ raw 模式下 **ISIG 已关闭**，Ctrl-C 不产生 SIGINT 信号，而是作为
 1. `execute_pipeline()` 设置 `FOREGROUND_PGID`（第一个子进程的 pid）
 2. 启动 stdin 监控线程，非阻塞 read stdin：
    - 收到 `0x03` -> `kill(-pgid, SIGINT)` 转发给子进程组，线程退出
-   - 收到其他字节 -> `ioctl(TIOCSTI)` 推回 stdin（root 下可用），供 shell 后续读取
+   - 收到其他字节 -> 缓存到共享 pending 队列（保序不丢失），供 shell 后续读取
 3. shell 主线程 `wait()` 子进程退出（信号终止的退出码取 `128 + signal`，如 SIGINT -> 130）
-4. 设置 stop_flag 停止监控线程，`join()` 等待退出
+4. 设置 stop_flag 停止监控线程，`join()` 等待退出；REPL 读取 stdin 前**先消费 pending
+   队列**（TIOCSTI 推回追加到 tty 队列队尾会乱序/错位，已弃用）
 5. 清除 `FOREGROUND_PGID`，如果退出码为 130 则打印换行
 
 子进程在 `pre_exec` 中通过 `setpgid(0, 0)` 创建独立进程组，同时恢复 SIGINT/SIGQUIT/SIGTSTP 为 `SIG_DFL`（不继承 shell handler）。
@@ -604,6 +605,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 | 请求 | 说明 |
 |------|------|
 | `status` / 空 | 列出全部单元状态（init、各服务；含未启动的 not-started，运行实例带 pid/重启策略/失败计数 failed=N/burst） |
+| `status` 进程明细 | 运行实例额外显示**进程树**（pid/名称/状态/CPU 占用率/内存）：`procs=N mem=M cpu=%` 汇总行 + 树形明细；CPU% 由控制线程对 /proc 双采样（间隔 300ms）计算 |
 | `status <unit>` | 查询单个单元（target 显示 `target`；未运行单元显示 not-started） |
 | `start <unit>` | 启动服务（已停止的重新拉起；未启动过的从单元文件新建） |
 | `stop <unit>` | 停止服务（执行 ExecStop + SIGTERM 进程组，超时 SIGKILL；标记 stopped 禁止自动重启） |
@@ -784,7 +786,7 @@ make unittest
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19、proc 5、processes 9 | 53 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 11、rlogin 11 | 32 |
-| **合计** | | **443** |
+| **合计** | | **453** |
 
 测试结果示例：
 
@@ -997,7 +999,7 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（443 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（453 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

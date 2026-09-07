@@ -14,6 +14,8 @@ pub(crate) struct ProcMem {
     pub(crate) name: String,
     /// 可执行文件路径（/proc/<pid>/exe；内核线程/不可读时为空）
     pub(crate) exe: String,
+    /// 累计 CPU 时间（utime+stime，clock tick 数；status 双采样算占用率用）
+    pub(crate) cpu_ticks: u64,
 }
 
 /// 遍历 /proc 收集所有进程的信息（statm 的 size/resident + stat 的 ppid/state）。
@@ -32,6 +34,7 @@ pub(crate) fn collect_processes() -> Vec<ProcMem> {
         let (size_pages, rss_pages) = parse_statm(&read_proc_file(pid, "statm"));
         let ppid = parse_stat_ppid(&read_proc_file(pid, "stat"));
         let state = parse_stat_state(&read_proc_file(pid, "stat"));
+        let cpu_ticks = parse_stat_cpu(&read_proc_file(pid, "stat"));
         let comm = read_proc_file(pid, "comm").trim().to_string();
         let exe = read_proc_exe(pid);
         out.push(ProcMem {
@@ -42,6 +45,7 @@ pub(crate) fn collect_processes() -> Vec<ProcMem> {
             state,
             name: comm,
             exe,
+            cpu_ticks,
         });
     }
     out
@@ -134,6 +138,21 @@ pub(crate) fn parse_stat_state(content: &str) -> String {
         .to_string()
 }
 
+/// 解析 stat 文本，返回累计 CPU 时间（utime + stime，")" 后第 12、13 字段）。
+/// 单位是 clock tick（sysconf _SC_CLK_TCK，通常 100/s）。
+pub(crate) fn parse_stat_cpu(content: &str) -> u64 {
+    let tail = stat_tail(content);
+    let utime = tail
+        .get(11)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = tail
+        .get(12)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    utime.saturating_add(stime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +181,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_stat_cpu_utime_stime() {
+        // ") " 后字段：state ppid pgrp session tty tpgid flags minflt cminflt majflt
+        //  cmajflt utime stime ...：这里 utime=10, stime=5 -> 15
+        let stat = "1 (rbox) S 0 1 1 0 0 0 0 0 0 0 10 5 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(parse_stat_cpu(stat), 15);
+        assert_eq!(parse_stat_cpu("1 (rbox) R 0 1 1\n"), 0);
+        assert_eq!(parse_stat_cpu("no parens\n"), 0);
+    }
+
+    #[test]
     fn cmdline_argv0_parses() {
         assert_eq!(cmdline_argv0(b"hello\0world\0"), "hello");
         assert_eq!(cmdline_argv0(b"rbox\0processes"), "rbox");
@@ -180,6 +209,7 @@ mod tests {
                 state: "S".into(),
                 name: "a".into(),
                 exe: "/bin/a".into(),
+                cpu_ticks: 0,
             },
             ProcMem {
                 pid: 2,
@@ -189,6 +219,7 @@ mod tests {
                 state: "S".into(),
                 name: "b".into(),
                 exe: "/bin/b".into(),
+                cpu_ticks: 0,
             },
             ProcMem {
                 pid: 3,
@@ -198,6 +229,7 @@ mod tests {
                 state: "R".into(),
                 name: "c".into(),
                 exe: "/bin/c".into(),
+                cpu_ticks: 0,
             },
         ];
         sort_processes(&mut procs);

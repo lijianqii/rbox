@@ -328,7 +328,16 @@ impl Shell {
 
         loop {
             let mut byte = [0u8; 1];
-            let n = match input.read(&mut byte) {
+            // 前台命令等待期间被 Ctrl-C 监控线程缓存的标准输入，优先消费
+            // （保序队列，避免并发读 stdin 丢失/错位）
+            let n = match executor::pending_stdin().lock().unwrap().pop_front() {
+                Some(b) => {
+                    byte[0] = b;
+                    Ok(1)
+                }
+                None => input.read(&mut byte),
+            };
+            let n = match n {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
                     abort_line(&mut line, &mut cursor, &mut pending_line, &mut hist_idx);
