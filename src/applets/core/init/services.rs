@@ -28,8 +28,6 @@ pub(crate) struct ServiceInstance {
     pub(crate) is_forking: bool,
     pub(crate) pidfile: Option<String>,
     pub(crate) timeout_start_sec: u64,
-    /// 进程组 id（spawn 父进程时的 pid）；forking 服务用于进程组清理
-    pub(crate) pgid: Option<u32>,
     /// forking 服务：已 spawn 父进程、等待其 daemon 化（异步状态机）
     pub(crate) waiting_daemonize: bool,
     /// forking 服务 daemon 化超时时间点
@@ -246,7 +244,6 @@ pub(crate) fn start_forking_service(
     let cfg = SpawnConfig::from_unit(unit);
     let child = spawn_unit_command(&unit.name, cmd, env, &cfg)?;
     let mut inst = new_service_instance(unit, cmd, env, Some(child), None);
-    inst.pgid = inst.child.as_ref().map(|c| c.id());
     inst.waiting_daemonize = true;
     inst.daemonize_deadline = Some(
         std::time::Instant::now() + std::time::Duration::from_secs(unit.service.timeout_start_sec),
@@ -320,7 +317,6 @@ fn new_service_instance(
         is_forking: unit.service.typ == "forking",
         pidfile: unit.service.pidfile.clone(),
         timeout_start_sec: unit.service.timeout_start_sec,
-        pgid: None,
         waiting_daemonize: false,
         daemonize_deadline: None,
         stopped: false,
@@ -383,7 +379,6 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
         return;
     }
     // forking：spawn 父进程后异步等待 daemon 化（主循环按 TimeoutStartSec 处理超时）
-    svc.pgid = svc.child.as_ref().map(|c| c.id());
     svc.waiting_daemonize = svc.child.is_some();
     svc.daemonize_deadline = if svc.waiting_daemonize {
         Some(std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_start_sec))
@@ -395,14 +390,16 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
 /// ExecStop/ExecReload 命令超时（秒）。超时后 SIGKILL 该命令。
 pub(crate) const EXEC_COMMAND_TIMEOUT: u64 = 5;
 
-/// 运行一个命令并等待其退出，带超时（默认超时后 SIGKILL）。
-/// 返回是否在超时内正常退出；argv 为空或 spawn 失败返回 false。
+/// 运行一个命令并等待其退出，带超时（默认超时后按进程组 SIGKILL）。
+/// 命令放入独立进程组，超时后整组强杀，避免 ExecStop/ExecReload 派生的
+/// 后代进程残留。返回是否在超时内正常退出；argv 为空或 spawn 失败返回 false。
 pub(crate) fn run_command_with_timeout(argv: &[String], timeout_secs: u64) -> bool {
     if argv.is_empty() {
         return false;
     }
     let mut child = match std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .process_group(0)
         .spawn()
     {
         Ok(c) => c,
@@ -414,7 +411,7 @@ pub(crate) fn run_command_with_timeout(argv: &[String], timeout_secs: u64) -> bo
             Ok(Some(_)) => return true,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
+                    let _ = kill_process_group(child.id(), libc::SIGKILL).or_else(|_| child.kill());
                     let _ = child.wait();
                     return false;
                 }
@@ -541,7 +538,6 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         is_forking: false,
         pidfile: None,
         timeout_start_sec: 10,
-        pgid: None,
         waiting_daemonize: false,
         daemonize_deadline: None,
         restart_on_failure,

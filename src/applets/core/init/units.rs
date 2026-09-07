@@ -136,6 +136,11 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     let mut units: HashMap<String, Unit> = HashMap::new();
     let dir = Path::new(&crate::config::load().paths.system_dir);
     if !dir.exists() {
+        // 目录缺失（如测试模式/配置错误）：告警避免"无服务也能正常启动"的假象
+        log_at(
+            LogLevel::Warn,
+            &format!("rbox init: unit dir {} not found", dir.display()),
+        );
         return Ok(units);
     }
     for entry in fs::read_dir(dir)? {

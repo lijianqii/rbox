@@ -222,8 +222,8 @@ impl Applet for Init {
 }
 
 /// 早期根切换（initramfs → 内核 root= 指定的持久 rootfs）。
-/// 流程：解析 root= → 挂载 proc/sys/dev → 挂载 root 设备到 /newroot →
-/// chdir + pivot_root + 卸载旧根 → exec 新根上的 /init。
+/// 流程：解析 root= → 挂载 proc/dev → 挂载 root 设备到 /newroot →
+/// chdir(/newroot) + chroot(".") → exec 新根上的 /init。
 /// 成功时进程被替换不会返回；非 early 场景（无 root= / 已是真根）返回 false。
 fn early_root_handoff() -> bool {
     use std::ffi::CString;
@@ -354,6 +354,7 @@ fn failed_required_dep<'a>(
 }
 
 /// 单元加载/依赖解析失败时的降级路径：循环拉起一个 emergency shell。
+/// 轮询等待 shell 退出并同时响应关机标志（SIGTERM 到来时不再等 shell 退出）。
 fn run_without_units() -> ExitCode {
     log_at(LogLevel::Error, "rbox init: emergency shell (no units)");
     loop {
@@ -368,7 +369,21 @@ fn run_without_units() -> ExitCode {
                 continue;
             }
         };
-        let _ = child.wait();
+        // 轮询等待 shell 退出；期间响应关机标志（终止 shell 后进入关机流程）
+        loop {
+            if shutdown_requested() {
+                let _ = kill_all(libc::SIGTERM);
+                let _ = child.wait();
+                break;
+            }
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => break,
+            }
+        }
     }
 }
 
