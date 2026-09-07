@@ -15,14 +15,14 @@ impl Applet for Head {
         "head [-n N] [file] - print first N lines (default 10)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
-        let (n, files) = parse_n_files(args, "head");
+        let (n, files, ok_args) = parse_n_files(args, "head");
         let mut out = std::io::stdout().lock();
         let ok = each_input(&files, "head", &mut out, |content, out| {
             for line in head_lines(content, n) {
                 let _ = writeln!(out, "{}", line);
             }
         });
-        if ok {
+        if ok && ok_args {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)

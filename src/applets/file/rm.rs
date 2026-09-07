@@ -24,6 +24,7 @@ impl Applet for Rm {
         let mut recursive = false;
         let mut force = false;
         let mut targets: Vec<&str> = Vec::new();
+        let mut had_error = false;
 
         for a in args {
             if a.starts_with('-') && a.len() > 1 && a != "-" {
@@ -31,7 +32,10 @@ impl Applet for Rm {
                     match c {
                         'r' | 'R' => recursive = true,
                         'f' => force = true,
-                        _ => {}
+                        _ => {
+                            eprintln!("rm: invalid option: -{}", c);
+                            had_error = true;
+                        }
                     }
                 }
             } else {
@@ -47,7 +51,6 @@ impl Applet for Rm {
             return ExitCode::SUCCESS;
         }
 
-        let mut had_error = false;
         for t in &targets {
             if let Err(e) = remove_one(t, recursive, force) {
                 if !force {

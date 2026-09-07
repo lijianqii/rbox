@@ -46,6 +46,7 @@ impl Applet for Uname {
         let mut want_m = false;
         let mut want_a = false;
         let mut any = false;
+        let mut had_error = false;
 
         for a in args {
             if a.starts_with('-') && a.len() > 1 {
@@ -75,7 +76,10 @@ impl Applet for Uname {
                             want_m = true;
                             any = true;
                         }
-                        _ => {}
+                        _ => {
+                            eprintln!("uname: invalid option: -{}", c);
+                            had_error = true;
+                        }
                     }
                 }
             }
@@ -91,6 +95,10 @@ impl Applet for Uname {
             want_r = true;
             want_v = true;
             want_m = true;
+        }
+
+        if had_error {
+            return ExitCode::FAILURE;
         }
 
         let mut parts: Vec<String> = Vec::new();

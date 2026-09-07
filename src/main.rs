@@ -141,3 +141,70 @@ fn print_version() -> ExitCode {
     println!("rbox {}", env!("CARGO_PKG_VERSION"));
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_is_nonempty_and_unique() {
+        assert!(!applet::APPLETS.is_empty());
+        let mut names: Vec<&str> = applet::APPLETS.iter().map(|a| a.name()).collect();
+        names.sort_unstable();
+        let mut dedup = names.clone();
+        dedup.dedup();
+        assert_eq!(names, dedup, "applet 名字必须唯一");
+    }
+
+    #[test]
+    fn applet_for_finds_registered() {
+        assert!(applet_for("echo").is_some());
+        assert!(applet_for("cat").is_some());
+        assert!(applet_for("rservice").is_some());
+        assert_eq!(applet_for("echo").unwrap().name(), "echo");
+    }
+
+    #[test]
+    fn applet_for_unknown_returns_none() {
+        assert!(applet_for("ghost-command").is_none());
+        assert!(applet_for("").is_none());
+    }
+
+    #[test]
+    fn help_flag_returns_success_for_known_applet() {
+        let args = vec!["--help".to_string()];
+        assert!(try_print_help("echo", &args).is_some());
+        let args = vec!["-h".to_string()];
+        assert!(try_print_help("cat", &args).is_some());
+    }
+
+    #[test]
+    fn help_flag_unknown_applet_returns_none() {
+        // 未知命令的 --help 不该打印帮助，交给分发层报 unknown command
+        let args = vec!["--help".to_string()];
+        assert!(try_print_help("ghost", &args).is_none());
+    }
+
+    #[test]
+    fn non_help_args_return_none() {
+        let args = vec!["-n".to_string(), "3".to_string()];
+        assert!(try_print_help("head", &args).is_none());
+        let args: Vec<String> = vec![];
+        assert!(try_print_help("echo", &args).is_none());
+    }
+
+    #[test]
+    fn every_applet_has_help_text() {
+        // 帮助文本非空且提及命令名（sh 的 help 以 "rbox shell" 开头，为特例）
+        for app in applet::APPLETS {
+            let h = app.help();
+            assert!(!h.is_empty(), "{} 缺少 help", app.name());
+            assert!(
+                h.contains(app.name()),
+                "{} 的 help 应提及命令名: {}",
+                app.name(),
+                h
+            );
+        }
+    }
+}

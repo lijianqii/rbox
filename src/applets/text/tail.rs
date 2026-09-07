@@ -15,14 +15,14 @@ impl Applet for Tail {
         "tail [-n N] [file] - print last N lines (default 10)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
-        let (n, files) = parse_n_files(args, "tail");
+        let (n, files, ok_args) = parse_n_files(args, "tail");
         let mut out = std::io::stdout().lock();
         let ok = each_input(&files, "tail", &mut out, |content, out| {
             for line in tail_lines(content, n) {
                 let _ = writeln!(out, "{}", line);
             }
         });
-        if ok {
+        if ok && ok_args {
             ExitCode::SUCCESS
         } else {
             ExitCode::from(1)

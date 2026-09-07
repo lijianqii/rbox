@@ -20,12 +20,17 @@ impl Applet for Mkdir {
     fn run(&self, args: &[String]) -> ExitCode {
         let mut parents = false;
         let mut dirs: Vec<&str> = Vec::new();
+        let mut had_error = false;
 
         for a in args {
             if a.starts_with('-') && a.len() > 1 {
                 for c in a[1..].chars() {
-                    if c == 'p' {
-                        parents = true;
+                    match c {
+                        'p' => parents = true,
+                        _ => {
+                            eprintln!("mkdir: invalid option: -{}", c);
+                            had_error = true;
+                        }
                     }
                 }
             } else {
@@ -38,7 +43,6 @@ impl Applet for Mkdir {
             return ExitCode::FAILURE;
         }
 
-        let mut had_error = false;
         for d in &dirs {
             let r = if parents {
                 fs::create_dir_all(d)

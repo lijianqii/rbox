@@ -13,7 +13,7 @@ use std::fs;
 use std::io::Write;
 
 /// 日志级别。
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum LogLevel {
     Error,
     Warn,
@@ -79,5 +79,28 @@ mod tests {
         assert_eq!(LogLevel::Warn.tag(), "W");
         assert_eq!(LogLevel::Info.tag(), "I");
         assert_eq!(LogLevel::Debug.tag(), "D");
+    }
+    #[test]
+    fn current_log_level_parses_env() {
+        // 环境变量全局共享，串行测试 + 收尾清理
+        unsafe {
+            std::env::set_var("RBOX_LOG", "debug");
+            assert_eq!(current_log_level(), LogLevel::Debug);
+            std::env::set_var("RBOX_LOG", "warn");
+            assert_eq!(current_log_level(), LogLevel::Warn);
+            std::env::set_var("RBOX_LOG", "ERROR");
+            assert_eq!(current_log_level(), LogLevel::Error);
+            std::env::set_var("RBOX_LOG", "garbage");
+            assert_eq!(current_log_level(), LogLevel::Info); // 非法值回退默认
+            std::env::remove_var("RBOX_LOG");
+            assert_eq!(current_log_level(), LogLevel::Info); // 未设置回退默认
+        }
+    }
+
+    #[test]
+    fn log_at_filters_by_level() {
+        // 仅验证过滤逻辑不 panic（输出到 stderr/kmsg，不断言内容）
+        log_at(LogLevel::Debug, "debug msg");
+        log_at(LogLevel::Error, "error msg");
     }
 }

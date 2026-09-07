@@ -27,6 +27,7 @@ impl Applet for Ls {
         let mut long = false;
         let mut one_per_line = false;
         let mut paths: Vec<&str> = Vec::new();
+        let mut had_error = false;
 
         for a in args {
             if a.starts_with('-') && a.len() > 1 {
@@ -35,7 +36,10 @@ impl Applet for Ls {
                         'a' => show_all = true,
                         'l' => long = true,
                         '1' => one_per_line = true,
-                        _ => {}
+                        _ => {
+                            eprintln!("ls: invalid option: -{}", c);
+                            had_error = true;
+                        }
                     }
                 }
             } else {
@@ -47,7 +51,6 @@ impl Applet for Ls {
             paths.push(".");
         }
 
-        let mut had_error = false;
         let multi = paths.len() > 1;
 
         for (i, p) in paths.iter().enumerate() {

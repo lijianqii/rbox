@@ -17,11 +17,14 @@ impl Applet for Env {
         // 解析 VAR=value 形式的参数
         while i < args.len() && args[i].contains('=') {
             let pair = args[i].splitn(2, '=').collect::<Vec<_>>();
-            if pair.len() == 2 {
+            // 空变量名（如 `env =foo`）会让 set_var panic，报错并跳过
+            if pair.len() == 2 && !pair[0].is_empty() {
                 // SAFETY: single-threaded applet context
                 unsafe {
                     std::env::set_var(pair[0], pair[1]);
                 }
+            } else if pair.len() == 2 {
+                eprintln!("env: invalid variable name in '{}'", args[i]);
             }
             i += 1;
         }
@@ -97,5 +100,25 @@ mod tests {
         let args = vec!["/nonexistent_cmd_xyz".to_string()];
         let _ = ENV.run(&args);
         // Can't directly compare ExitCode, but it should not panic
+    }
+
+    #[test]
+    fn env_empty_name_does_not_panic() {
+        // `env =foo`：空变量名，set_var 会 panic——应报错并跳过而非崩溃
+        let args = vec!["=foo".to_string()];
+        let _ = ENV.run(&args);
+        // 环境里不应出现名为空串的变量
+        assert!(std::env::vars().all(|(k, _)| !k.is_empty()));
+    }
+
+    #[test]
+    fn env_value_with_equals() {
+        // `A=b=c`：值可以包含 =，只按第一个 = 切分
+        let args = vec!["RBOX_ENV_EQ=x=y=z".to_string()];
+        let _ = ENV.run(&args);
+        assert_eq!(std::env::var("RBOX_ENV_EQ").unwrap(), "x=y=z");
+        unsafe {
+            std::env::remove_var("RBOX_ENV_EQ");
+        }
     }
 }
