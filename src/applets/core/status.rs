@@ -1,6 +1,6 @@
 //! `status` - 查询 init 服务状态。
 //!
-//! 通过 unix socket (/tmp/rbox.sock) 与 PID 1 通信：
+//! 通过 unix socket (/run/rbox.sock) 与 PID 1 通信：
 //! - `rbox status`           列出所有服务状态
 //! - `rbox status <unit>`    查询单个单元
 

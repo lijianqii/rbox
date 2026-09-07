@@ -524,7 +524,7 @@ RestartSec = 1
 |------|------|--------|--------|
 | [paths] | system_dir | /etc/rbox/system | init 单元目录 |
 | [paths] | default_target | default.target | 启动根 target |
-| [paths] | status_socket | /tmp/rbox.sock | 控制协议 socket（status/rservice 客户端同源） |
+| [paths] | status_socket | /run/rbox.sock | 控制协议 socket（/run 为 tmpfs root 目录，创建后 chmod 600，仅 root 可连） |
 | [paths] | passwd / shadow | /etc/passwd / /etc/shadow | rlogin 账号校验 |
 | [paths] | motd | /etc/motd | 登录后欢迎信息 |
 | [paths] | profile | /etc/profile | shell 启动时 source |
@@ -567,10 +567,10 @@ ExecReload = "/bin/rbox echo ok"   # 可选：rservice reload 执行的命令
 Environment = ["HELLO=world"]      # 可选：服务环境变量
 Restart = "on-failure"             # 可选：非零退出自动重启（默认 no）
 RestartSec = 1                      # 可选：重启间隔秒（默认 1）
-StartLimitBurst = 5                 # 可选：连续失败上限（默认 5，达到后放弃）
+StartLimitBurst = 5                 # 可选：失败/重启上限（默认 5；burst 为允许的重启次数，第 burst+1 次失败放弃）
 TimeoutStartSec = 10                # 可选：forking 等待父进程退出超时（默认 10）
 PIDFile = "/var/run/x.pid"         # 可选：forking 的 daemon PID 文件
-LogFile = "/var/log/x.log"         # 可选：stdout/stderr 重定向文件
+LogFile = "/var/log/x.log"         # 可选：stdout/stderr 重定向文件（打不开仅告警并回退 console，不阻止启动）
 User = "nobody"                    # 可选：降权用户（getpwnam）
 Group = "nogroup"                  # 可选：降权组（getgrnam）
 Restart = "always"                 # 可选：退出即重启（console/getty 用；另有 on-failure）
@@ -585,19 +585,19 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 
 ### 启动流程
 
-1. **信号处理**：安装 SIGTERM/SIGINT 处理器（SIGTERM 设关机标志，SIGINT 设重启标志）
-2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs）；读取 /etc/hostname 设置主机名（sethostname）
+1. **信号处理**：安装 SIGTERM/SIGINT/SIGCHLD 处理器（SIGTERM 设关机标志，SIGINT 设重启标志，SIGCHLD 唤醒主循环）；SIGHUP/SIGPIPE/SIGQUIT 显式忽略——PID 1 不能被这些信号终止（tty 断开/写断管道/终端转义符一旦命中即 kernel panic）
+2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs//run）；early 阶段先试读 /proc/cmdline，失败才挂载 proc；读取 /etc/hostname 设置主机名（sethostname）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
 5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop
-6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（固定 RestartSec 间隔 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/tmp/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用）；检测关机标志
+6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（固定 RestartSec 间隔 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/run/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用；控制连接在独立线程处理，ExecStop 数秒级操作不再阻塞主循环）；检测关机标志
 
 `Type=` 目前支持 `simple` 与 `forking`；其他值会打印警告并按 simple 处理。
 `Restart=` 目前支持 `no`（默认）、`on-failure` 与 `always`，其他值打印警告并按 no 处理。
 
-关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。
+关机时按进程组（`process_group(0)`）SIGTERM 服务及其后代进程，1 秒超时后 SIGKILL，不再只杀直接子进程。全部停产后 sync_fs 并尝试将根文件系统 remount 只读再触发 reboot（initramfs 根不可 remount 时忽略失败）。
 
-### 控制协议（/tmp/rbox.sock）
+### 控制协议（/run/rbox.sock）
 
 单行请求，文本响应：
 

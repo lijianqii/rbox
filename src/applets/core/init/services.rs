@@ -106,8 +106,13 @@ pub(crate) fn spawn_unit_command(
     if argv.is_empty() {
         return None;
     }
-    let (program, args) = if (argv[0] == "rbox" || argv[0] == "/bin/rbox") && argv.len() >= 2 {
-        ("/bin/rbox", &argv[1..])
+    // 以 rbox 自身（rbox / /bin/rbox）开头的命令走当前可执行文件路径，
+    // 避免 rootfs 布局变化时写死 /bin/rbox 失效。
+    let self_path = rbox_self_path();
+    let (program, args) = if (argv[0] == "rbox" || argv[0] == "/bin/rbox" || argv[0] == self_path)
+        && argv.len() >= 2
+    {
+        (self_path.as_str(), &argv[1..])
     } else {
         (argv[0].as_str(), &argv[1..])
     };
@@ -115,7 +120,8 @@ pub(crate) fn spawn_unit_command(
     command.args(args);
     command.envs(env.iter().cloned());
     command.process_group(0);
-    // 输出重定向到日志文件（追加），超过阈值则轮转，否则继承 console
+    // 输出重定向到日志文件（追加），超过阈值则轮转，否则继承 console。
+    // 日志文件打不开只告警并继续（继承 console），日志失败不应阻止服务启动。
     if let Some(path) = cfg.logfile {
         rotate_log_if_needed(path);
         match std::fs::OpenOptions::new()
@@ -134,10 +140,9 @@ pub(crate) fn spawn_unit_command(
             },
             Err(e) => {
                 log(&format!(
-                    "rbox init: cannot open log file {} for {}: {}",
+                    "rbox init: cannot open log file {} for {}, falling back to console: {}",
                     path, name, e
                 ));
-                return None;
             }
         }
     }
@@ -355,6 +360,8 @@ pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
     if !want_restart || svc.stopped || shutdown_requested() {
         return;
     }
+    // 达到 StartLimitBurst 后放弃：burst 为“允许失败/重启的次数”，
+    // 第 burst+1 次失败时 fail_count = burst+1 > burst → 停止重启。
     if svc.fail_count > svc.start_limit_burst {
         log(&format!(
             "rbox init: {} failed {} times, giving up (StartLimitBurst={})",
@@ -480,11 +487,21 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
 /// 拉起降级/应急 shell（路径用配置的缺省 shell，默认 /bin/sh）。
 pub(crate) fn spawn_fresh_shell() -> Option<Child> {
     let shell = crate::config::load().login.shell.clone();
-    std::process::Command::new("/bin/rbox")
+    std::process::Command::new(rbox_self_path())
         .arg("sh")
         .spawn()
         .or_else(|_| std::process::Command::new(shell).spawn())
         .ok()
+}
+
+/// 获取 rbox 自身可执行文件路径（ExecStart 以 rbox 开头或 emergency shell 用）。
+/// 优先 current_exe()（PID 1 时为 /bin/rbox），失败回退硬编码路径。
+pub(crate) fn rbox_self_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/bin/rbox".to_string())
 }
 
 /// 日志轮转阈值（256 KB）。超过此大小则截断为空，避免 LogFile 无限增长。

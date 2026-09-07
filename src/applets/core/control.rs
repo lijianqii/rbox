@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// 控制协议 socket 路径（/etc/rbox.conf [paths] status_socket，默认 /tmp/rbox.sock）。
+/// 控制协议 socket 路径（/etc/rbox.conf [paths] status_socket，默认 /run/rbox.sock）。
 pub fn status_socket() -> String {
     crate::config::load().paths.status_socket.clone()
 }

@@ -10,6 +10,7 @@ const DEFAULT_FSTAB: &[&str] = &[
     "devtmpfs /dev       devtmpfs  defaults  0 0",
     "devpts   /dev/pts   devpts    defaults  0 0",
     "tmpfs    /tmp       tmpfs     defaults  0 0",
+    "tmpfs    /run       tmpfs     defaults  0 0",
 ];
 
 /// 一条 fstab 挂载记录：<device> <mountpoint> <type> <options> [<dump> <pass>]。

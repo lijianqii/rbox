@@ -33,6 +33,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// 全局关机标志：SIGTERM 信号处理器设置，主循环检查。
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -215,9 +216,12 @@ impl Applet for Init {
 
         log("rbox init: startup complete");
 
-        // 5. 主循环：回收子进程、响应控制请求，等待关机标志
+        // 5. 主循环：回收子进程、响应控制请求，等待关机标志。
+        //    服务状态用 Mutex 共享给控制连接线程（见 reap_with_shutdown）。
         let status_listener = create_status_listener();
-        reap_with_shutdown(&mut services, &units, status_listener)
+        let services_shared = Arc::new(Mutex::new(services));
+        let units_shared = Arc::new(units);
+        reap_with_shutdown(&services_shared, &units_shared, status_listener)
     }
 }
 
@@ -228,15 +232,17 @@ impl Applet for Init {
 fn early_root_handoff() -> bool {
     use std::ffi::CString;
 
-    // 0. 仅挂载 proc（读 /proc/cmdline 必需）。sysfs 切换流程用不到；
-    //    devtmpfs 仅在确认要切换后才挂（提供 root 设备节点），
+    // 0. 读 /proc/cmdline 解析 root=。initramfs 早期 /proc 通常未挂载，
+    //    先试读，失败才创建目录并挂载 proc（若已由内核/前序挂载则不再重复挂）。
+    //    sysfs 切换流程用不到；devtmpfs 仅在确认要切换后才挂（提供 root 设备节点），
     //    避免后续 mount_all_fs 重复挂载报 EBUSY。
-    //    initramfs 里可能没有 /proc 目录，先创建再挂载
-    let _ = std::fs::create_dir_all("/proc");
-    let _ = libc_mount("proc", "/proc", "proc");
-
-    // 1. 解析内核命令行 root=（去掉可选的 fs 类型/参数后缀）
-    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let mut cmdline = std::fs::read_to_string("/proc/cmdline");
+    if cmdline.is_err() {
+        let _ = std::fs::create_dir_all("/proc");
+        let _ = libc_mount("proc", "/proc", "proc");
+        cmdline = std::fs::read_to_string("/proc/cmdline");
+    }
+    let cmdline = cmdline.unwrap_or_default();
     let root_dev = cmdline
         .split_whitespace()
         .find_map(|kv| kv.strip_prefix("root="))
@@ -389,6 +395,8 @@ fn run_without_units() -> ExitCode {
 
 /// 安装 SIGTERM/SIGINT/SIGCHLD 信号处理器（sigaction + SA_RESTART）。
 /// SIGCHLD 用于唤醒主循环收割子进程；SA_NOCLDSTOP 忽略子进程停止事件。
+/// SIGHUP/SIGPIPE/SIGQUIT 显式忽略：PID 1 不能被这些信号终止
+/// （tty 断开/写断管道/终端退格符都会触发，一旦命中即 kernel panic）。
 fn install_signal_handlers() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -400,6 +408,13 @@ fn install_signal_handlers() {
         libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
+        // 以下三个信号保持运行，绝不终止 PID 1：
+        // - SIGHUP：控制终端断开（串口拔出/会话首进程挂断）
+        // - SIGPIPE：写已关闭的管道（日志/控制连接等）
+        // - SIGQUIT：终端 \ 不应能 core dump PID 1
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
     }
 }
 
@@ -465,9 +480,11 @@ fn compute_next_timeout(services: &[ServiceInstance]) -> i32 {
 
 /// 主循环：回收/重启服务、响应 rservice/rbox status 控制请求，检测关机标志。
 /// 所有服务统一由 Restart 策略管理（console/getty 用 Restart=always）。
+/// 服务状态用 `Mutex` 保护，控制连接在独立线程处理，主循环不被
+/// ExecStop（最坏数秒）等长操作阻塞。
 fn reap_with_shutdown(
-    services: &mut Vec<ServiceInstance>,
-    units: &HashMap<String, Unit>,
+    services_shared: &Arc<Mutex<Vec<ServiceInstance>>>,
+    units: &Arc<HashMap<String, Unit>>,
     status_listener: Option<UnixListener>,
 ) -> ExitCode {
     // 创建 self-pipe：信号处理器写 1 字节唤醒主循环 poll
@@ -476,7 +493,17 @@ fn reap_with_shutdown(
 
     loop {
         // 1. 回收已退出的服务进程 + forking daemon 化等待；
-        //    Restart=on-failure/always 时安排重启（退避 + 上限）
+        //    Restart=on-failure/always 时安排重启（退避 + 上限）。
+        //    用 try_lock：控制线程正在执行 stop/restart 时短暂等待，
+        //    不阻塞也不忙抢（控制线程通常毫秒级完成，最坏 ExecStop 数秒）。
+        let mut services_guard = match services_shared.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+        };
+        let services = &mut *services_guard;
         for svc in services.iter_mut() {
             // 1a. forking 服务等待父进程 daemon 化（异步状态机，不阻塞主循环）
             if svc.waiting_daemonize {
@@ -566,6 +593,7 @@ fn reap_with_shutdown(
         // 4. 事件等待：poll 监听 self-pipe 与 status socket。
         //    超时为最近的 restart 退避 / daemon 化超时（无定时则无限等待，纯事件驱动）。
         let timeout = compute_next_timeout(services);
+        drop(services_guard); // poll 期间释放锁，控制线程可获锁执行请求
         let status_fd = status_listener.as_ref().map(|l| l.as_raw_fd());
         let mut fds = [
             libc::pollfd {
@@ -585,12 +613,14 @@ fn reap_with_shutdown(
             if fds[0].revents & libc::POLLIN != 0 {
                 drain_signal_pipe(signal_pipe_read);
             }
-            // 响应控制请求（rbox status / rservice）
+            // 响应控制请求（rbox status / rservice）：独立线程处理，不阻塞主循环
             if fds[1].revents & libc::POLLIN != 0
                 && let Some(listener) = &status_listener
                 && let Ok((stream, _)) = listener.accept()
             {
-                handle_control_connection(stream, services, units);
+                let svc = services_shared.clone();
+                let u = units.clone();
+                std::thread::spawn(move || handle_control_connection(stream, svc, u));
             }
         } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
@@ -691,6 +721,19 @@ fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
         // pid > 0：已收割一个，立即继续收割其余
     }
     sync_fs();
+    // 有序关机：先把根文件系统 remount 只读，再触发 reboot 系统调用
+    // （initramfs 根已是 tmpfs/rootfs 且不可 remount ro 时忽略失败，仅尽力而为）
+    let root = std::ffi::CString::new("/").unwrap();
+    let opts = std::ffi::CString::new("remount,ro").unwrap();
+    let _ = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    };
     let is_reboot = REBOOT_REQUESTED.load(Ordering::SeqCst);
     if is_reboot {
         log("rbox init: rebooting");

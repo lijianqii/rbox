@@ -9,16 +9,20 @@ use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 
 /// 创建控制 socket（非阻塞）；失败时返回 None（不影响启动）。
 pub(crate) fn create_status_listener() -> Option<UnixListener> {
-    // UnixListener::bind 不会清理已存在的 socket 文件；initramfs 重启时 /tmp 是
-    // tmpfs 会自然消失，但持久盘启动（fstab 未挂 tmpfs /tmp）或 init 被 re-exec 时
+    // UnixListener::bind 不会清理已存在的 socket 文件；initramfs 重启时 /run 是
+    // tmpfs 会自然消失，但持久盘启动（fstab 未挂 tmpfs /run）或 init 被 re-exec 时
     // 残留文件会导致 bind EADDRINUSE，控制协议静默失效。这里先尝试移除旧文件。
     let _ = std::fs::remove_file(status_socket());
     match UnixListener::bind(status_socket()) {
         Ok(l) => {
+            // 限制权限：仅 root 可连（服务管理接口，防普通用户 stop/restart 任意服务）
+            let _ =
+                std::fs::set_permissions(status_socket(), std::fs::Permissions::from_mode(0o600));
             let _ = l.set_nonblocking(true);
             Some(l)
         }
@@ -30,11 +34,12 @@ pub(crate) fn create_status_listener() -> Option<UnixListener> {
 }
 
 /// 处理一次控制连接：读一行请求，分发到 status/start/stop/restart/reload，回写响应，关闭。
-/// 连接设为非阻塞并用 10ms poll 等数据，避免异常客户端（连接后不发数据）挂住主循环。
+/// 在独立线程中执行（由主循环 spawn），共享服务状态通过 Mutex；
+/// 连接设为非阻塞并用 10ms poll 等数据，避免异常客户端（连接后不发数据）挂住线程。
 pub(crate) fn handle_control_connection(
     mut stream: UnixStream,
-    services: &mut Vec<ServiceInstance>,
-    units: &HashMap<String, Unit>,
+    services: std::sync::Arc<std::sync::Mutex<Vec<ServiceInstance>>>,
+    units: std::sync::Arc<HashMap<String, Unit>>,
 ) {
     let _ = stream.set_nonblocking(true);
     let mut req = String::new();
@@ -60,10 +65,13 @@ pub(crate) fn handle_control_connection(
         }
     }
     let resp = match parse_control_request(&req) {
-        Ok(r) => execute_control_request(r, services, units),
+        Ok(r) => match services.lock() {
+            Ok(mut guard) => execute_control_request(r, &mut guard, &units),
+            Err(_) => "error: service state poisoned\n".to_string(),
+        },
         Err(e) => format!("error: {}\n", e),
     };
-    // 读阶段用非阻塞避免挂主循环；写响应时恢复阻塞，避免小响应遇 WouldBlock 丢失
+    // 读阶段用非阻塞避免挂住线程；写响应时恢复阻塞，避免小响应遇 WouldBlock 丢失
     let _ = stream.set_nonblocking(false);
     let _ = stream.write_all(resp.as_bytes());
 }

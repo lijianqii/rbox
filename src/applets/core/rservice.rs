@@ -1,6 +1,6 @@
 //! `rservice` - 服务管理：列出/启动/停止/重启/重载服务。
 //!
-//! 通过 unix socket (/tmp/rbox.sock) 与 PID 1 通信：
+//! 通过 unix socket (/run/rbox.sock) 与 PID 1 通信：
 //! - `rservice` / `rservice list`             列出所有服务状态
 //! - `rservice status [unit]`                 查询单个服务
 //! - `rservice start|stop|restart|reload <unit>` 管理服务

@@ -61,7 +61,7 @@ impl Default for PathsConfig {
         Self {
             system_dir: "/etc/rbox/system".to_string(),
             default_target: "default.target".to_string(),
-            status_socket: "/tmp/rbox.sock".to_string(),
+            status_socket: "/run/rbox.sock".to_string(),
             passwd: "/etc/passwd".to_string(),
             shadow: "/etc/shadow".to_string(),
             motd: "/etc/motd".to_string(),
@@ -179,7 +179,7 @@ mod tests {
         let cfg = RboxConfig::default();
         assert_eq!(cfg.paths.system_dir, "/etc/rbox/system");
         assert_eq!(cfg.paths.default_target, "default.target");
-        assert_eq!(cfg.paths.status_socket, "/tmp/rbox.sock");
+        assert_eq!(cfg.paths.status_socket, "/run/rbox.sock");
         assert_eq!(cfg.paths.passwd, "/etc/passwd");
         assert_eq!(cfg.paths.shadow, "/etc/shadow");
         assert_eq!(cfg.paths.motd, "/etc/motd");
