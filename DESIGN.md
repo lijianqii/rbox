@@ -989,7 +989,7 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 看门狗喂狗 | /dev/watchdog 周期性喂狗，挂死自动重启 | TODO |
 | 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
 | SIGCHLD 驱动回收 | self-pipe + poll 事件驱动，信号唤醒即 try_wait（无 200ms 轮询） | ✅ 已实现 |
-| ExecStop 超时 | ExecStop 命令超时限制 | TODO |
+| ExecStop 超时 | ExecStop/ExecReload 命令超时限制（5s，超时按进程组 SIGKILL，见 run_command_with_timeout） | ✅ 已实现 |
 | fstab pass 字段 | 按 dump/pass 决定挂载顺序 | TODO |
 | head 字符设备兼容 | head/tail/grep/wc 读取 /dev/kmsg 等设备文件（read_file_fully：EINVAL 重试 + O_NONBLOCK） | ✅ 已实现 |
 
