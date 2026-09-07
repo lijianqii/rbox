@@ -241,7 +241,8 @@ fn do_stop(name: &str, services: &mut [ServiceInstance]) -> String {
 
 /// 生成 status 响应文本。`unit` 为空列出全部（含未启动单元）；否则查单个单元。
 /// 未启动单元显示 not-started，与运行实例（services）状态合并呈现。
-/// 有 procs 快照时，运行中的服务额外显示进程树（pid/状态/CPU%/内存）。
+/// 有 procs 快照时：init 在最顶（带自身 cpu/mem），各服务以 tree 风格
+/// （├──/└──/│）分支，运行实例挂进程树明细（pid/状态/CPU%/内存）。
 fn format_status(
     unit: &str,
     services: &[ServiceInstance],
@@ -250,9 +251,19 @@ fn format_status(
 ) -> String {
     let unit = unit.trim();
     let mut out = String::new();
+    // 快照索引（有采样时）；无采样（单测/异常）时 prev/now 为 None
+    let (prev_map, now_map, interval) = match procs {
+        Some((prev, now, iv)) => {
+            let pm: HashMap<u32, &ProcMem> = prev.iter().map(|p| (p.pid, p)).collect();
+            let nm: HashMap<u32, &ProcMem> = now.iter().map(|p| (p.pid, p)).collect();
+            (Some(pm), Some(nm), iv)
+        }
+        None => (None, None, 0.0),
+    };
 
     if unit.is_empty() {
-        out.push_str(&format!("init pid={}\n", std::process::id()));
+        // init 根行：最顶上，带自身 cpu/mem（tree 风格根节点）
+        out.push_str(&init_line(prev_map.as_ref(), now_map.as_ref(), interval));
         // 列出全部服务单元（按名排序），运行实例合并其状态；
         // services 中不在 units 里的实例（手动注册）也一并列出
         let mut names: Vec<&str> = units
@@ -266,20 +277,51 @@ fn format_status(
             }
         }
         names.sort_unstable();
-        for name in names {
-            match services.iter().find(|s| s.name == name) {
+        for (i, name) in names.iter().enumerate() {
+            let is_last = i + 1 == names.len();
+            let branch = if is_last { "└── " } else { "├── " };
+            match services.iter().find(|s| s.name == *name) {
                 Some(svc) => {
-                    out.push_str(&svc.status_line());
-                    append_service_procs(&mut out, svc, procs);
+                    let mut line = format!("{}{}", branch, svc.status_line().trim_end());
+                    if let (Some(pm), Some(nm)) = (&prev_map, &now_map)
+                        && let Some(tree) = service_root_tree(svc, nm)
+                    {
+                        // 运行实例：汇总并入服务行，进程树挂在分支下
+                        let (count, mem, cpu) = summarize_tree(&tree, pm, nm, interval);
+                        line.push_str(&format!(
+                            " procs={} mem={} cpu={:.1}%",
+                            count,
+                            human_kb(mem),
+                            cpu
+                        ));
+                        line.push('\n');
+                        out.push_str(&line);
+                        let prefix = if is_last { "    " } else { "│   " };
+                        render_status_node(&tree, pm, nm, interval, prefix, true, &mut out);
+                    } else {
+                        line.push('\n');
+                        out.push_str(&line);
+                    }
                 }
-                None => out.push_str(&not_started_line(name, units)),
+                None => out.push_str(&format!("{}{}", branch, not_started_line(name, units))),
             }
         }
     } else if unit == "init" {
-        out.push_str(&format!("init pid={}\n", std::process::id()));
+        out.push_str(&init_line(prev_map.as_ref(), now_map.as_ref(), interval));
     } else if let Some(svc) = services.iter().find(|s| s.name == unit) {
         out.push_str(&svc.status_line());
-        append_service_procs(&mut out, svc, procs);
+        if let (Some(pm), Some(nm)) = (&prev_map, &now_map)
+            && let Some(tree) = service_root_tree(svc, nm)
+        {
+            let (count, mem, cpu) = summarize_tree(&tree, pm, nm, interval);
+            out.push_str(&format!(
+                "    procs={} mem={} cpu={:.1}%\n",
+                count,
+                human_kb(mem),
+                cpu
+            ));
+            render_status_node(&tree, pm, nm, interval, "    ", true, &mut out);
+        }
     } else if let Some(u) = units.get(unit) {
         if u.is_target {
             out.push_str(&format!("{} target\n", unit));
@@ -290,6 +332,22 @@ fn format_status(
         out.push_str(&format!("unknown unit: {}\n", unit));
     }
     out
+}
+
+/// init 根行：`init pid=1`，有快照时附加自身 cpu/mem。
+fn init_line(
+    prev_map: Option<&HashMap<u32, &ProcMem>>,
+    now_map: Option<&HashMap<u32, &ProcMem>>,
+    interval: f64,
+) -> String {
+    let mut line = format!("init pid={}\n", std::process::id());
+    if let (Some(pm), Some(nm)) = (prev_map, now_map)
+        && let Some(p) = nm.get(&1)
+    {
+        let cpu = cpu_percent_for(1, pm, nm, interval).unwrap_or(0.0);
+        line = format!("init pid=1 cpu={:.1}% mem={}\n", cpu, human_kb(p.rss_kb));
+    }
+    line
 }
 
 /// 已配置但从未运行的单元状态行（含重启策略提示）。
@@ -311,38 +369,12 @@ struct StatusProc {
     children: Vec<StatusProc>,
 }
 
-/// 为运行中的服务追加进程树明细（pid/状态/CPU%/内存）。
-/// procs 为 None、服务未运行或根进程已消失时跳过。
-fn append_service_procs(
-    out: &mut String,
-    svc: &ServiceInstance,
-    procs: Option<(&[ProcMem], &[ProcMem], f64)>,
-) {
-    let Some((prev, now, interval)) = procs else {
-        return;
-    };
-    let root_pid = svc.child.as_ref().map(|c| c.id()).or(svc.tracked_pid);
-    let Some(tree) = root_pid.and_then(|p| build_service_tree(p, now)) else {
-        return;
-    };
-    let prev_map: HashMap<u32, &ProcMem> = prev.iter().map(|p| (p.pid, p)).collect();
-    let now_map: HashMap<u32, &ProcMem> = now.iter().map(|p| (p.pid, p)).collect();
-    // 汇总：进程数 / 总内存 / 总 CPU
-    let (count, mem, cpu) = summarize_tree(&tree, &prev_map, &now_map, interval);
-    out.push_str(&format!(
-        "    procs={} mem={} cpu={:.1}%\n",
-        count,
-        human_kb(mem),
-        cpu
-    ));
-    render_status_node(&tree, &prev_map, &now_map, interval, "    ", true, out);
-}
-
-/// 从根 pid 构建服务的进程树（procs 中不存在根则返回 None）。
-fn build_service_tree(root_pid: u32, procs: &[ProcMem]) -> Option<StatusProc> {
-    let by_pid: HashMap<u32, &ProcMem> = procs.iter().map(|p| (p.pid, p)).collect();
-    let root = by_pid.get(&root_pid)?;
-    Some(build_status_node(root, &by_pid))
+/// 从服务根 pid（simple=主进程，forking=daemon）构建进程树；
+/// 根进程不在快照中（已退出）时返回 None。
+fn service_root_tree(svc: &ServiceInstance, now: &HashMap<u32, &ProcMem>) -> Option<StatusProc> {
+    let root_pid = svc.child.as_ref().map(|c| c.id()).or(svc.tracked_pid)?;
+    let root = now.get(&root_pid)?;
+    Some(build_status_node(root, now))
 }
 
 /// 递归构建节点（子进程按 PID 升序）。
@@ -365,7 +397,7 @@ fn build_status_node(p: &ProcMem, by_pid: &HashMap<u32, &ProcMem>) -> StatusProc
     }
 }
 
-/// 递归渲染进程树（ASCII 连接符，兼容串口终端）。
+/// 递归渲染进程树（tree 风格连接符：├──/└──/│）。
 fn render_status_node(
     node: &StatusProc,
     prev: &HashMap<u32, &ProcMem>,
@@ -379,7 +411,7 @@ fn render_status_node(
         Some(p) => format!("{:.1}%", p),
         None => "-".to_string(),
     };
-    let branch = if is_last { "\\- " } else { "|- " };
+    let branch = if is_last { "└── " } else { "├── " };
     out.push_str(&format!(
         "{}{}{} {} {} cpu={} mem={}\n",
         prefix,
@@ -393,7 +425,7 @@ fn render_status_node(
     let child_prefix = if is_last {
         format!("{}    ", prefix)
     } else {
-        format!("{}|   ", prefix)
+        format!("{}│   ", prefix)
     };
     for (i, child) in node.children.iter().enumerate() {
         render_status_node(
@@ -583,17 +615,38 @@ mod tests {
         let mut svc = test_svc("console.service", false);
         svc.tracked_pid = Some(49); // 模拟 forking 根
         let out = format_status("", &[svc], &HashMap::new(), Some((&prev, &now, 1.0)));
+        // tree 风格：init 在最顶，服务为唯一分支（└──），进程树挂其下
+        assert!(out.starts_with("init pid="), "out: {}", out);
         assert!(
-            out.contains("console.service running pid=49"),
+            out.contains("└── console.service running pid=49 procs=3 mem=2.9M cpu=30.0%"),
             "out: {}",
             out
         );
-        assert!(out.contains("procs=3"), "out: {}", out);
-        assert!(out.contains("\\- 49 rgetty"), "out: {}", out);
-        assert!(out.contains("\\- 120 rlogin"), "out: {}", out);
-        assert!(out.contains("\\- 130 sh"), "out: {}", out);
+        assert!(
+            out.contains("    └── 49 rgetty S cpu=30.0% mem=1.2M"),
+            "out: {}",
+            out
+        );
+        assert!(out.contains("        └── 120 rlogin S"), "out: {}", out);
         assert!(out.contains("cpu=0.0% mem=1000K"), "out: {}", out); // sh
-        assert!(out.contains("mem=2.9M"), "out: {}", out); // 1200+800+1000=3000KB
+        assert!(out.contains("└── 130 sh S"), "out: {}", out);
+    }
+
+    #[test]
+    fn status_tree_connectors_and_init_line() {
+        // 多服务：非最后 ├──、最后 └──；init 行带自身 cpu/mem
+        let prev = vec![pmem(1, 0, "init", 3000, 10), pmem(10, 1, "svc1", 100, 0)];
+        let now = vec![pmem(1, 0, "init", 3000, 10), pmem(10, 1, "svc1", 100, 0)];
+        let mut a = test_svc("a.service", false);
+        a.tracked_pid = Some(10);
+        let b = test_svc("b.service", false);
+        let out = format_status("", &[a, b], &HashMap::new(), Some((&prev, &now, 1.0)));
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("init pid=1 cpu="), "out: {}", out);
+        assert!(lines[0].contains("mem=2.9M"), "out: {}", out);
+        assert!(lines[1].starts_with("├── a.service"), "out: {}", out);
+        assert!(lines[2].starts_with("│   └── 10"), "out: {}", out);
+        assert!(lines[3].starts_with("└── b.service exited"), "out: {}", out);
     }
 
     #[test]

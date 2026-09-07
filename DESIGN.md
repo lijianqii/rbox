@@ -604,8 +604,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 
 | 请求 | 说明 |
 |------|------|
-| `status` / 空 | 列出全部单元状态（init、各服务；含未启动的 not-started，运行实例带 pid/重启策略/失败计数 failed=N/burst） |
-| `status` 进程明细 | 运行实例额外显示**进程树**（pid/名称/状态/CPU 占用率/内存）：`procs=N mem=M cpu=%` 汇总行 + 树形明细；CPU% 由控制线程对 /proc 双采样（间隔 300ms）计算 |
+| `status` / 空 | **tree 风格**树形输出：`init` 在最顶（带自身 cpu/mem），各服务以 `├──`/`└──` 分支（含未启动的 not-started，运行实例带 pid/重启策略/失败计数 failed=N/burst），运行服务下挂进程树（pid/名称/状态/CPU%/内存，`│` 延续）；CPU% 由控制线程对 /proc 双采样（间隔 300ms）计算 |
 | `status <unit>` | 查询单个单元（target 显示 `target`；未运行单元显示 not-started） |
 | `start <unit>` | 启动服务（已停止的重新拉起；未启动过的从单元文件新建） |
 | `stop <unit>` | 停止服务（执行 ExecStop + SIGTERM 进程组，超时 SIGKILL；标记 stopped 禁止自动重启） |
