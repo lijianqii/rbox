@@ -534,7 +534,7 @@ RestartSec = 1
 | [paths] | meminfo / iomem / proc | /proc/meminfo 等 | meminfo 命令数据源 |
 | [getty] | login_program | /bin/rlogin | rgetty fork 的登录程序 |
 | [getty] | prompt | "rbox login: " | 登录提示（生产示例为极简 "user: "） |
-| [getty] | timeout_message | "session timed out, logging out — time flies when you're idle!" | 会话空闲超时登出消息（俏皮默认，可自定义） |
+| [getty] | timeout_message | "Session timed out, logging out — time flies when you're idle!" | 会话空闲超时登出消息（俏皮默认，可自定义） |
 | [getty] | default_timeout | 无 | 未给 -t 时的默认空闲超时 |
 | [getty] | issue_file | /etc/issue | 登录前横幅 |
 | [getty] | failure_delay | 1 | 登录失败后重新提示延迟 |

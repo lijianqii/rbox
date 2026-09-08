@@ -103,7 +103,7 @@ impl Default for GettyConfig {
             default_timeout: None,
             issue_file: "/etc/issue".to_string(),
             failure_delay: 1,
-            timeout_message: "session timed out, logging out — time flies when you're idle!"
+            timeout_message: "Session timed out, logging out — time flies when you're idle!"
                 .to_string(),
         }
     }
@@ -230,7 +230,7 @@ prompt = "rbox login: "
 default_timeout = 120
 issue_file = "/etc/issue"
 failure_delay = 2
-timeout_message = "session timed out, see ya!"
+timeout_message = "Session timed out, see ya!"
 
 [login]
 shell = "/bin/ash"
@@ -247,7 +247,7 @@ default_path = "/bin:/sbin"
         assert_eq!(cfg.paths.history_file, "~/.rbox_history");
         assert_eq!(cfg.getty.default_timeout, Some(120));
         assert_eq!(cfg.getty.failure_delay, 2);
-        assert_eq!(cfg.getty.timeout_message, "session timed out, see ya!");
+        assert_eq!(cfg.getty.timeout_message, "Session timed out, see ya!");
         assert_eq!(cfg.login.shell, "/bin/ash");
         assert_eq!(cfg.login.password_timeout, 5);
         assert_eq!(
