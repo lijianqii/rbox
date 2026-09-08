@@ -91,6 +91,8 @@ pub(crate) struct GettyConfig {
     pub(crate) issue_file: String,
     /// 登录失败（子进程非零退出）后重新提示前的延迟秒数
     pub(crate) failure_delay: u64,
+    /// 会话空闲超时登出消息（俏皮默认，可自定义）
+    pub(crate) timeout_message: String,
 }
 
 impl Default for GettyConfig {
@@ -101,6 +103,8 @@ impl Default for GettyConfig {
             default_timeout: None,
             issue_file: "/etc/issue".to_string(),
             failure_delay: 1,
+            timeout_message: "session timed out, logging out — time flies when you're idle!"
+                .to_string(),
         }
     }
 }
@@ -115,6 +119,8 @@ pub(crate) struct LoginConfig {
     pub(crate) password_prompt: String,
     /// 密码输入超时秒数（0 = 不超时；防恶意用户挂住登录进程）
     pub(crate) password_timeout: u64,
+    /// 密码输入超时消息（俏皮默认，可自定义）
+    pub(crate) password_timeout_message: String,
 }
 
 impl Default for LoginConfig {
@@ -123,6 +129,8 @@ impl Default for LoginConfig {
             shell: "/bin/sh".to_string(),
             password_prompt: "Password: ".to_string(),
             password_timeout: 60,
+            password_timeout_message: "Password timed out — daydreaming at the login prompt?"
+                .to_string(),
         }
     }
 }
@@ -188,9 +196,11 @@ mod tests {
         assert_eq!(cfg.getty.prompt, "rbox login: ");
         assert_eq!(cfg.getty.issue_file, "/etc/issue");
         assert_eq!(cfg.getty.failure_delay, 1);
+        assert!(cfg.getty.timeout_message.contains("time flies"));
         assert_eq!(cfg.login.shell, "/bin/sh");
         assert_eq!(cfg.login.password_prompt, "Password: ");
         assert_eq!(cfg.login.password_timeout, 60);
+        assert!(cfg.login.password_timeout_message.contains("daydreaming"));
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
         assert_eq!(cfg.paths.meminfo, "/proc/meminfo");
         assert_eq!(cfg.paths.proc, "/proc");
@@ -220,11 +230,13 @@ prompt = "rbox login: "
 default_timeout = 120
 issue_file = "/etc/issue"
 failure_delay = 2
+timeout_message = "session timed out, see ya!"
 
 [login]
 shell = "/bin/ash"
 password_prompt = "Password: "
 password_timeout = 5
+password_timeout_message = "Password timed out, take your time next time"
 
 [init]
 default_path = "/bin:/sbin"
@@ -235,8 +247,13 @@ default_path = "/bin:/sbin"
         assert_eq!(cfg.paths.history_file, "~/.rbox_history");
         assert_eq!(cfg.getty.default_timeout, Some(120));
         assert_eq!(cfg.getty.failure_delay, 2);
+        assert_eq!(cfg.getty.timeout_message, "session timed out, see ya!");
         assert_eq!(cfg.login.shell, "/bin/ash");
         assert_eq!(cfg.login.password_timeout, 5);
+        assert_eq!(
+            cfg.login.password_timeout_message,
+            "Password timed out, take your time next time"
+        );
         assert_eq!(cfg.init.default_path, "/bin:/sbin");
     }
 

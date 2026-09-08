@@ -64,7 +64,7 @@ impl Applet for Login {
         let _ = io::stdout().flush();
         let timeout = (cfg.login.password_timeout > 0).then_some(cfg.login.password_timeout);
         let Some(password) = read_password(timeout) else {
-            let _ = writeln!(io::stdout(), "\nPassword timed out");
+            let _ = writeln!(io::stdout(), "\n{}", cfg.login.password_timeout_message);
             return ExitCode::FAILURE;
         };
         let _ = writeln!(io::stdout());

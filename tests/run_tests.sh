@@ -80,7 +80,7 @@ LOGIN_OUT=$(timeout 150 bash -c '
   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append '"'$APPEND'"'
 ' 2>&1) || true
 assert_contains_in "$LOGIN_OUT" "rgetty 登录提示" "user: "
-assert_contains_in "$LOGIN_OUT" "登录前 issue 横幅" "rbox!"
+assert_contains_in "$LOGIN_OUT" "登录前 issue 横幅" "██"
 assert_contains_in "$LOGIN_OUT" "错误密码被拒绝" "Login incorrect"
 assert_contains_in "$LOGIN_OUT" "登录后 shell 可用" "LOGIN_OK"
 assert_contains_in "$LOGIN_OUT" "rgetty 使用命令行指定串口" "0 -> /dev/ttyAMA0"
@@ -126,8 +126,9 @@ TIMEOUT_OUT=$(timeout 150 bash -c '
 ' 2>&1 | tee /tmp/main_out.txt) || true
 rm -f login-test.cpio.gz
 assert_contains_in "$TIMEOUT_OUT" "持续输入不超时" "K5"
-assert_contains_in "$TIMEOUT_OUT" "空闲超时登出" "session timed out, logging out"
-assert_contains_in "$TIMEOUT_OUT" "密码输入超时" "Password timed out"
+# 自定义超时消息（rbox.test.conf 显式设置，验证配置化生效）
+assert_contains_in "$TIMEOUT_OUT" "空闲超时登出（自定义消息）" "custom test message"
+assert_contains_in "$TIMEOUT_OUT" "密码输入超时（自定义消息）" "Password timed out"
 assert_contains_in "$TIMEOUT_OUT" "超时后重新登录" "TIMEOUT_LOGIN_OK"
 
 # 单次 QEMU 运行所有测试命令

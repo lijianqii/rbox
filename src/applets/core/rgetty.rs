@@ -249,8 +249,8 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
             }
         }
         None => {
-            // 空闲超时：先换行（密码提示后无换行），再打印登出消息
-            let _ = writeln!(io::stdout(), "\nsession timed out, logging out");
+            // 空闲超时：先换行（密码提示后无换行），再打印登出消息（可配置，默认俏皮版）
+            let _ = writeln!(io::stdout(), "\n{}", cfg.timeout_message);
         }
     }
 }
