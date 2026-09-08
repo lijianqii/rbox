@@ -38,6 +38,14 @@ pub(crate) struct UnitSection {
     #[serde(default)]
     #[serde(rename = "Requires")]
     pub(crate) requires: Vec<String>,
+    /// 尽力依赖：参与排序（先启动），但失败不阻止本单元
+    #[serde(default)]
+    #[serde(rename = "Wants")]
+    pub(crate) wants: Vec<String>,
+    /// 前置检查依赖：不激活依赖；启动前要求依赖已成功，否则本单元跳过
+    #[serde(default)]
+    #[serde(rename = "Requisite")]
+    pub(crate) requisite: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -228,6 +236,9 @@ pub(crate) fn compute_start_order(
 
         let mut deps = unit.unit.requires.clone();
         deps.extend(unit.unit.after.iter().cloned());
+        deps.extend(unit.unit.wants.iter().cloned());
+        // Wants：尽力依赖，参与排序（先启动）但失败不传播；
+        // Requisite：不参与排序（不激活依赖），仅在启动前检查状态
         // target 节点：把所有 WantedBy=该 target 的服务拉进来（反向依赖）
         if unit.is_target {
             for (other_name, other) in units.iter() {
@@ -310,6 +321,8 @@ mod tests {
                 name: String::new(),
                 after: after.iter().map(|s| s.to_string()).collect(),
                 requires: requires.iter().map(|s| s.to_string()).collect(),
+                wants: Vec::new(),
+                requisite: Vec::new(),
             },
             service: ServiceSection {
                 typ: "simple".to_string(),
@@ -459,6 +472,31 @@ mod tests {
     fn start_order_missing_root_is_ok() {
         let units: HashMap<String, Unit> = HashMap::new();
         assert!(compute_start_order(&units, "ghost.target").is_ok());
+    }
+
+    #[test]
+    fn start_order_respects_wants() {
+        // Wants 参与排序（先启动），但不要求成功
+        let mut units = HashMap::new();
+        let mut t = unit("default.target", true, &[], &[], &[]);
+        t.unit.wants = vec!["a.service".to_string()];
+        units.insert("default.target".into(), t);
+        units.insert("a.service".into(), unit("a.service", false, &[], &[], &[]));
+        let order = compute_start_order(&units, "default.target").unwrap();
+        assert_eq!(order, vec!["a.service", "default.target"]);
+    }
+
+    #[test]
+    fn start_order_ignores_requisite() {
+        // Requisite 不激活依赖：不参与拓扑排序，仅启动前检查状态
+        let mut units = HashMap::new();
+        let mut t = unit("default.target", true, &[], &[], &[]);
+        t.unit.requisite = vec!["b.service".to_string()];
+        units.insert("default.target".into(), t);
+        units.insert("b.service".into(), unit("b.service", false, &[], &[], &[]));
+        let order = compute_start_order(&units, "default.target").unwrap();
+        // b.service 未被激活，不在启动顺序中
+        assert_eq!(order, vec!["default.target"]);
     }
 
     #[test]

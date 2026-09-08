@@ -1,0 +1,10 @@
+[Unit]
+Description = "Boot-time spawn failure (tests dependency failure propagation)"
+Name = "failboot"
+
+[Service]
+Type = "simple"
+ExecStart = "/nonexistent_cmd_xyz"
+
+[Install]
+WantedBy = ["default.target"]

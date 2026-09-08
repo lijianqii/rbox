@@ -349,7 +349,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 31 个测试组、131 个断言（涵盖 33 个 applet、Shell 全功能、init 服务管理、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 34 个测试组、143 个断言（涵盖 33 个 applet、Shell 全功能、init 服务管理、Wants/Requisite 依赖、emergency/single 启动模式、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -384,7 +384,7 @@ enum Token {
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
 | 内存信息/进程树 | meminfo 输出、分类核算、iomem 树、processes 进程树 | 15 |
-| **合计** | | **131** |
+| **合计** | | **143** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -558,7 +558,9 @@ RestartSec = 1
 Description = "Hello service"
 Name = "hello"                        # 可选：单元名（rservice/status/依赖引用用它；缺省回退文件名）
 After = ["network.service"]        # 可选：在此服务之后启动
-Requires = ["network.service"]     # 可选：硬依赖
+Requires = ["network.service"]     # 可选：硬依赖（失败则本单元跳过）
+Wants = ["log.service"]            # 可选：尽力依赖（参与排序，失败不传播）
+Requisite = ["db.service"]         # 可选：前置检查（不激活依赖；未成功则本单元跳过）
 
 [Service]
 Type = "simple"                    # simple（默认）/ forking（daemon 化）
@@ -590,7 +592,7 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 2. **环境与挂载**：设置默认 PATH（shell/服务子进程继承）；读取 /etc/fstab 逐个挂载（缺失时回退内置默认集：proc/sysfs/devtmpfs/devpts/tmpfs//run）；early 阶段先试读 /proc/cmdline，失败才挂载 proc；读取 /etc/hostname 设置主机名（sethostname）
 3. **加载单元**：解析 /etc/rbox/system/*.toml，serde 反序列化
 4. **拓扑排序**：从 default.target 出发 DFS，Requires=/After= 构成边，WantedBy= 构成反向依赖（target 拉入所有 WantedBy 它的服务），含环检测
-5. **启动服务**：按排序结果依次 fork+exec ExecStart（独立进程组，带 Environment），记录 Child 句柄和 ExecStop
+5. **启动服务**：按依赖深度分层（同层无依赖边），逐层并发 fork+exec ExecStart（独立进程组，带 Environment），按拓扑顺序合并结果（services 顺序保持启动顺序，ExecStop 逆序语义不变），记录 Child 句柄和 ExecStop
 6. **常驻**：主循环回收服务进程（try_wait，避免僵尸）；`Restart=on-failure` 非零退出自动重启、`Restart=always` 退出即重启（固定 RestartSec 间隔 + StartLimitBurst 上限）；**waitpid(-1) 收割收养的孤儿进程**（防僵尸累积）；通过 `/run/rbox.sock` 响应控制请求（`status`/`start`/`stop`/`restart`/`reload`，供 rbox status / rservice 使用；控制连接在独立线程处理，ExecStop 数秒级操作不再阻塞主循环）；检测关机标志
 
 `Type=` 目前支持 `simple` 与 `forking`；其他值会打印警告并按 simple 处理。
@@ -744,7 +746,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 31 个测试组、131 个断言，覆盖全部 33 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 34 个测试组、143 个断言，覆盖全部 33 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -785,7 +787,7 @@ make unittest
 | file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
 | sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19、proc 5、processes 9 | 53 |
 | core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 11、rlogin 11 | 32 |
-| **合计** | | **470** |
+| **合计** | | **480** |
 
 测试结果示例：
 
@@ -812,7 +814,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 131 通过, 0 失败
+结果: 143 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -982,9 +984,9 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 服务管理命令 | rservice start/stop/restart/reload（unix socket 控制协议） | ✅ 已实现 |
 | 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
 | 多 target 切换 | boot.target / multi-user.target / rescue.target | TODO |
-| 依赖更精细控制 | Wants= / Requisite= / Before= | TODO |
+| 依赖更精细控制 | Wants= / Requisite= / Before=（Wants 尽力依赖参与排序、Requisite 前置检查不激活；Before= TODO） | ✅ 部分实现 |
 | ExecStartPre/Post 钩子 | 启动前/后执行额外命令 | TODO |
-| 内核 cmdline 解析 | single/emergency（跳过服务直接进 shell）、quiet | TODO |
+| 内核 cmdline 解析 | single/emergency（跳过服务直接进 shell）、quiet | ✅ 部分实现（single/emergency；quiet TODO） |
 | 启动失败降级 | default.target 失败 → 自动进入 rescue | TODO |
 | 看门狗喂狗 | /dev/watchdog 周期性喂狗，挂死自动重启 | TODO |
 | 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
@@ -998,7 +1000,7 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | 功能 | 说明 | 状态 |
 |------|------|------|
 | CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（470 个） | ✅ 已实现 |
+| 单元测试 | Rust #[test] 模块（480 个） | ✅ 已实现 |
 | Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
 | rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
 | Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |

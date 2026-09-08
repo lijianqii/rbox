@@ -1,0 +1,11 @@
+[Unit]
+Description = "Wants dep: starts even if dep fails"
+Name = "wants-test"
+Wants = ["failboot"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox echo WANTS_OK"
+
+[Install]
+WantedBy = ["default.target"]

@@ -1,0 +1,11 @@
+[Unit]
+Description = "Requisite dep: skipped because dep not active"
+Name = "req-test"
+Requisite = ["failboot"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox echo REQ_SHOULD_NOT_RUN"
+
+[Install]
+WantedBy = ["default.target"]

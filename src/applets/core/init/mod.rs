@@ -97,6 +97,15 @@ impl Applet for Init {
         apply_sysctl(&crate::config::load().paths.sysctl_conf);
         log("rbox init: basic filesystems mounted");
 
+        // 1.5 内核 cmdline 的 single/emergency：跳过单元加载，直接进应急/单用户 shell
+        if is_pid1 {
+            match boot_mode_from_cmdline() {
+                BootMode::Emergency => return run_emergency_shell("emergency"),
+                BootMode::Single => return run_emergency_shell("single"),
+                BootMode::Normal => {}
+            }
+        }
+
         // 2. 解析所有单元文件
         let units = match load_all_units() {
             Ok(u) => {
@@ -108,7 +117,7 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: failed to load units: {}", e),
                 );
-                return run_without_units();
+                return run_emergency_shell("no units");
             }
         };
 
@@ -124,23 +133,30 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: dependency error: {}", e),
                 );
-                return run_without_units();
+                return run_emergency_shell("no units");
             }
         };
 
-        // 4. 依次启动服务，记录已启动的实例
+        // 4. 按依赖深度分层启动服务（同层无依赖边，可并行 fork），
+        //    记录已启动的实例与结果（Requires/Requisite 失败传播用；target 恒为成功）。
         let mut services: Vec<ServiceInstance> = Vec::new();
-        // 记录每个单元的启动结果（Requires 失败传播用）；target 恒为成功
         let mut started_ok: HashMap<String, bool> = HashMap::new();
-        for unit_name in &order {
-            if let Some(unit) = units.get(unit_name) {
+        let depths = compute_depths(&order, &units);
+        let max_depth = depths.values().max().copied().unwrap_or(0);
+        for depth in 0..=max_depth {
+            let layer: Vec<&String> = order.iter().filter(|n| depths[*n] == depth).collect();
+            // 失败传播检查（主线程按拓扑顺序）：Requires 失败跳过、Requisite
+            // 未激活跳过；Wants 失败不传播（尽力依赖）；After 仅排序
+            let mut to_start: Vec<&String> = Vec::new();
+            for unit_name in &layer {
+                let Some(unit) = units.get(*unit_name) else {
+                    continue;
+                };
                 if unit.is_target {
                     log(&format!("rbox init: reached target {}", unit_name));
-                    started_ok.insert(unit_name.clone(), true);
+                    started_ok.insert((*unit_name).clone(), true);
                     continue;
                 }
-                // Requires 失败传播：任一 required 单元启动失败则跳过本服务
-                // （After 仅排序，不传播失败）
                 if let Some(failed_dep) = failed_required_dep(unit, &started_ok) {
                     log_at(
                         LogLevel::Error,
@@ -149,67 +165,51 @@ impl Applet for Init {
                             unit_name, failed_dep
                         ),
                     );
-                    started_ok.insert(unit_name.clone(), false);
+                    started_ok.insert((*unit_name).clone(), false);
                     continue;
                 }
-                if let Some(cmd) = &unit.service.exec_start {
-                    if !unit.service.typ.is_empty()
-                        && unit.service.typ != "simple"
-                        && unit.service.typ != "forking"
-                    {
-                        log_at(
-                            LogLevel::Warn,
-                            &format!(
-                                "rbox init: {} Type={:?} unsupported, treating as simple",
-                                unit_name, unit.service.typ
-                            ),
-                        );
+                if let Some(missing_dep) = failed_requisite_dep(unit, &started_ok) {
+                    log_at(
+                        LogLevel::Error,
+                        &format!(
+                            "rbox init: skipping {} because requisite unit {} not active",
+                            unit_name, missing_dep
+                        ),
+                    );
+                    started_ok.insert((*unit_name).clone(), false);
+                    continue;
+                }
+                to_start.push(unit_name);
+            }
+            // 同层并发 spawn（spawn 不等待子进程退出，fork 本身是 O(1)；
+            // 并发结构为将来同步启动步骤（如 ExecStartPre）预留，且日志更紧凑）
+            let mut results: Vec<(String, bool, Option<ServiceInstance>)> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = to_start
+                        .iter()
+                        .map(|name| {
+                            let unit = units.get(*name).unwrap();
+                            s.spawn(move || {
+                                let (ok, inst) = start_unit(unit);
+                                ((*name).clone(), ok, inst)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or((String::new(), false, None)))
+                        .collect()
+                });
+            // 按拓扑顺序合并结果：services 顺序保持启动顺序（ExecStop 逆序语义不变）
+            for unit_name in &layer {
+                if let Some((_, ok, inst)) = results
+                    .iter_mut()
+                    .find(|(n, _, _)| n.as_str() == unit_name.as_str())
+                {
+                    started_ok.insert((*unit_name).clone(), *ok);
+                    if let Some(inst) = inst.take() {
+                        services.push(inst);
                     }
-                    if !unit.service.restart.is_empty()
-                        && unit.service.restart != "on-failure"
-                        && unit.service.restart != "always"
-                        && unit.service.restart != "no"
-                    {
-                        log_at(
-                            LogLevel::Warn,
-                            &format!(
-                                "rbox init: {} Restart={:?} unsupported, ignoring",
-                                unit_name, unit.service.restart
-                            ),
-                        );
-                    }
-                    if unit.unit.description.is_empty() {
-                        log(&format!("rbox init: starting {}: {}", unit_name, cmd));
-                    } else {
-                        log(&format!(
-                            "rbox init: starting {} ({}): {}",
-                            unit_name, unit.unit.description, cmd
-                        ));
-                    }
-                    let env = parse_environment(&unit.service.environment);
-                    // spawn 成功与否决定 Requires 失败传播；forking 服务以父进程
-                    // spawn 成功为"成功"（daemon 化结果异步，见主循环）
-                    let spawned_ok = if unit.service.typ == "forking" {
-                        match start_forking_service(unit, cmd, &env) {
-                            Some(inst) => {
-                                services.push(inst);
-                                true
-                            }
-                            None => false,
-                        }
-                    } else {
-                        match start_service(unit, cmd, &env) {
-                            Some(inst) => {
-                                services.push(inst);
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    started_ok.insert(unit_name.clone(), spawned_ok);
-                } else {
-                    // 无 ExecStart 的单元（如占位服务）视为启动成功
-                    started_ok.insert(unit_name.clone(), true);
                 }
             }
         }
@@ -359,10 +359,150 @@ fn failed_required_dep<'a>(
         .find(|dep| matches!(started_ok.get(*dep), Some(false)))
 }
 
+/// 计算每个单元按拓扑顺序的启动深度（最长依赖链长度；无依赖为 0）。
+/// 同深度的单元之间无依赖边，可并行启动。依赖计 Requires/After/Wants（参与
+/// 排序）以及 Requisite（不参与拓扑激活，但计入深度：保证前置检查发生时依赖
+/// 已在本层之前尝试启动，未激活时检查自然失败）。
+/// 同层单元在 order 中的先后不定（WantedBy 反向遍历依赖 HashMap 顺序），
+/// 因此深度需要多遍迭代直到收敛，不能依赖单遍顺序。
+fn compute_depths(order: &[String], units: &HashMap<String, Unit>) -> HashMap<String, usize> {
+    let mut depths: HashMap<String, usize> = HashMap::new();
+    loop {
+        let mut changed = false;
+        for name in order {
+            let Some(unit) = units.get(name) else {
+                continue;
+            };
+            let deps = unit
+                .unit
+                .requires
+                .iter()
+                .chain(unit.unit.after.iter())
+                .chain(unit.unit.wants.iter())
+                .chain(unit.unit.requisite.iter());
+            let depth = deps
+                .filter_map(|d| depths.get(d))
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            if depths.get(name) != Some(&depth) {
+                depths.insert(name.clone(), depth);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    depths
+}
+
+/// 启动一个服务单元（依赖检查由调用方完成）；返回 (是否成功, 运行实例)。
+/// spawn 成功与否决定 Requires 失败传播；forking 服务以父进程 spawn 成功为
+/// "成功"（daemon 化结果异步，见主循环）；无 ExecStart 的单元视为成功。
+fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
+    let Some(cmd) = &unit.service.exec_start else {
+        return (true, None); // 无 ExecStart 的单元（如占位服务）视为启动成功
+    };
+    if !unit.service.typ.is_empty() && unit.service.typ != "simple" && unit.service.typ != "forking"
+    {
+        log_at(
+            LogLevel::Warn,
+            &format!(
+                "rbox init: {} Type={:?} unsupported, treating as simple",
+                unit.name, unit.service.typ
+            ),
+        );
+    }
+    if !unit.service.restart.is_empty()
+        && unit.service.restart != "on-failure"
+        && unit.service.restart != "always"
+        && unit.service.restart != "no"
+    {
+        log_at(
+            LogLevel::Warn,
+            &format!(
+                "rbox init: {} Restart={:?} unsupported, ignoring",
+                unit.name, unit.service.restart
+            ),
+        );
+    }
+    if unit.unit.description.is_empty() {
+        log(&format!("rbox init: starting {}: {}", unit.name, cmd));
+    } else {
+        log(&format!(
+            "rbox init: starting {} ({}): {}",
+            unit.name, unit.unit.description, cmd
+        ));
+    }
+    let env = parse_environment(&unit.service.environment);
+    if unit.service.typ == "forking" {
+        match start_forking_service(unit, cmd, &env) {
+            Some(inst) => (true, Some(inst)),
+            None => (false, None),
+        }
+    } else {
+        match start_service(unit, cmd, &env) {
+            Some(inst) => (true, Some(inst)),
+            None => (false, None),
+        }
+    }
+}
+
+/// 检查 Requisite 依赖是否已成功激活：依赖未启动（不在 started_ok）或
+/// 启动失败均视为不满足，返回第一个不满足的依赖名。
+/// Requisite 不参与拓扑排序，依赖靠 Requires/After/Wants 或手动 start 激活；
+/// 未激活时本单元跳过（systemd 语义：Requisite 失败）。
+fn failed_requisite_dep<'a>(
+    unit: &'a Unit,
+    started_ok: &HashMap<String, bool>,
+) -> Option<&'a String> {
+    unit.unit
+        .requisite
+        .iter()
+        .find(|dep| !matches!(started_ok.get(*dep), Some(true)))
+}
+
 /// 单元加载/依赖解析失败时的降级路径：循环拉起一个 emergency shell。
 /// 轮询等待 shell 退出并同时响应关机标志（SIGTERM 到来时不再等 shell 退出）。
-fn run_without_units() -> ExitCode {
-    log_at(LogLevel::Error, "rbox init: emergency shell (no units)");
+/// 启动模式：内核 cmdline 的 `single`/`emergency` 单词决定。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BootMode {
+    /// 正常启动（默认）
+    Normal,
+    /// 单用户模式：跳过服务，进 root shell
+    Single,
+    /// 应急模式：跳过服务，进 emergency shell
+    Emergency,
+}
+
+/// 从 /proc/cmdline 解析启动模式：包含单词 `emergency` 或 `single` 时生效
+/// （精确单词匹配，避免误匹配 root=/dev/single 之类参数）。
+fn boot_mode_from_cmdline() -> BootMode {
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let words: Vec<&str> = cmdline.split_whitespace().collect();
+    boot_mode_from_words(&words)
+}
+
+/// 从 cmdline 单词列表解析启动模式（纯函数，便于单测）。
+fn boot_mode_from_words(words: &[&str]) -> BootMode {
+    if words.contains(&"emergency") {
+        BootMode::Emergency
+    } else if words.contains(&"single") {
+        BootMode::Single
+    } else {
+        BootMode::Normal
+    }
+}
+
+/// 应急/单用户 shell：跳过单元加载，循环 spawn root shell；
+/// shell 退出后重新拉起，期间响应关机标志（terminate shell 后进入关机流程）。
+/// `reason` 用于日志区分（no units / emergency / single）。
+fn run_emergency_shell(reason: &str) -> ExitCode {
+    log_at(
+        LogLevel::Error,
+        &format!("rbox init: {} mode, emergency shell", reason),
+    );
     loop {
         if shutdown_requested() {
             return do_shutdown(&mut []);
@@ -788,6 +928,34 @@ mod tests {
     }
 
     #[test]
+    fn boot_mode_from_words_matches_exact_words() {
+        assert_eq!(boot_mode_from_words(&[]), BootMode::Normal);
+        assert_eq!(
+            boot_mode_from_words(&["console=ttyAMA0", "rdinit=/init"]),
+            BootMode::Normal
+        );
+        assert_eq!(
+            boot_mode_from_words(&["root=/dev/vda", "single"]),
+            BootMode::Single
+        );
+        assert_eq!(boot_mode_from_words(&["emergency"]), BootMode::Emergency);
+        // emergency 优先于 single（systemd 语义：emergency 更深）
+        assert_eq!(
+            boot_mode_from_words(&["single", "emergency"]),
+            BootMode::Emergency
+        );
+        // 非精确单词不误匹配（root=/dev/single 之类）
+        assert_eq!(
+            boot_mode_from_words(&["root=/dev/single"]),
+            BootMode::Normal
+        );
+        assert_eq!(
+            boot_mode_from_words(&["console=ttyAMA0,emergency"]),
+            BootMode::Normal
+        );
+    }
+
+    #[test]
     fn failed_required_dep_all_ok() {
         let u = unit_with_requires(&["a.service"]);
         let mut ok = HashMap::new();
@@ -801,6 +969,99 @@ mod tests {
         let u = unit_with_requires(&["ghost.service"]);
         let ok = HashMap::new();
         assert_eq!(failed_required_dep(&u, &ok), None);
+    }
+
+    #[test]
+    fn failed_requisite_dep_not_started_is_failure() {
+        // Requisite 依赖未激活（不在 started_ok）-> 本单元跳过
+        let mut u = unit_with_requires(&[]);
+        u.unit.requisite = vec!["b.service".to_string()];
+        let ok = HashMap::new();
+        assert_eq!(
+            failed_requisite_dep(&u, &ok),
+            Some(&"b.service".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_requisite_dep_failed_is_failure() {
+        let mut u = unit_with_requires(&[]);
+        u.unit.requisite = vec!["b.service".to_string()];
+        let mut ok = HashMap::new();
+        ok.insert("b.service".to_string(), false);
+        assert_eq!(
+            failed_requisite_dep(&u, &ok),
+            Some(&"b.service".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_requisite_dep_started_ok() {
+        let mut u = unit_with_requires(&[]);
+        u.unit.requisite = vec!["b.service".to_string()];
+        let mut ok = HashMap::new();
+        ok.insert("b.service".to_string(), true);
+        assert_eq!(failed_requisite_dep(&u, &ok), None);
+    }
+
+    #[test]
+    fn compute_depths_chains() {
+        // a(0) -> b(1) -> c(2)；wants 计入深度，requisite 也计入（保证检查时依赖已尝试启动）
+        let mut units = HashMap::new();
+        units.insert("a.service".into(), unit_with_requires(&[]));
+        let mut b = unit_with_requires(&["a.service"]);
+        b.unit.wants = vec!["x.service".to_string()];
+        units.insert("b.service".into(), b);
+        let mut c = unit_with_requires(&["b.service"]);
+        c.unit.requisite = vec!["z.service".to_string()];
+        units.insert("c.service".into(), c);
+        // z.service 被拓扑激活（在 order 中）：requisite 计入深度 -> c 深度 3
+        units.insert("z.service".into(), unit_with_requires(&[]));
+        let order = vec![
+            "a.service".to_string(),
+            "b.service".to_string(),
+            "c.service".to_string(),
+            "z.service".to_string(),
+        ];
+        let depths = compute_depths(&order, &units);
+        assert_eq!(depths["a.service"], 0);
+        assert_eq!(depths["b.service"], 1); // wants 计入
+        assert_eq!(depths["z.service"], 0);
+        assert_eq!(depths["c.service"], 2); // max(requires b=1, requisite z=0) + 1
+    }
+
+    #[test]
+    fn compute_depths_siblings_share_depth() {
+        // 同层（无依赖边）深度相同，可并行
+        let mut units = HashMap::new();
+        units.insert("a.service".into(), unit_with_requires(&[]));
+        units.insert("b.service".into(), unit_with_requires(&[]));
+        units.insert("c.service".into(), unit_with_requires(&["a.service"]));
+        let order = vec![
+            "a.service".to_string(),
+            "b.service".to_string(),
+            "c.service".to_string(),
+        ];
+        let depths = compute_depths(&order, &units);
+        assert_eq!(depths["a.service"], 0);
+        assert_eq!(depths["b.service"], 0); // 与 a 同层
+        assert_eq!(depths["c.service"], 1);
+    }
+
+    #[test]
+    fn compute_depths_converges_when_dep_later_in_order() {
+        // 回归：requisite 依赖在 order 中排在后面（同层顺序不定），
+        // 深度必须多遍迭代收敛而非依赖单遍顺序
+        let mut units = HashMap::new();
+        units.insert("dep.service".into(), unit_with_requires(&[]));
+        let mut u = unit_with_requires(&[]);
+        u.unit.requisite = vec!["dep.service".to_string()];
+        units.insert("u.service".into(), u);
+        // dep 排在 u 之后（模拟 HashMap 遍历顺序不定）
+        let order = vec!["u.service".to_string(), "dep.service".to_string()];
+        let depths = compute_depths(&order, &units);
+        assert_eq!(depths["dep.service"], 0);
+        assert_eq!(depths["u.service"], 1); // 依赖在 order 后面也能正确传播
     }
 
     #[test]

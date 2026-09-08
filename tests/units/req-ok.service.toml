@@ -1,0 +1,11 @@
+[Unit]
+Description = "Requisite dep ok: starts when dep active"
+Name = "req-ok"
+Requisite = ["hello"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox echo REQ_OK"
+
+[Install]
+WantedBy = ["default.target"]

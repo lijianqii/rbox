@@ -42,6 +42,20 @@ assert_contains() {
     assert_contains_in "$OUT" "$1" "$2"
 }
 
+# 断言输出不包含某字符串
+assert_not_contains_in() {
+    local out="$1"
+    local desc="$2"
+    local pattern="$3"
+    if echo "$out" | tr -d '\r' | grep -q "$pattern"; then
+        echo "  FAIL  $desc (不应包含: '$pattern')"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS  $desc"
+        PASS=$((PASS + 1))
+    fi
+}
+
 # ─── rgetty/rlogin 登录流程（使用生产 initramfs，console 为 rgetty）───
 # 放在主会话之前：机器空闲时先跑短会话，避免连续两个 QEMU 负载叠加。
 # 验证：登录提示、错误密码拒绝、登录后 shell 可用、shell 退出后 init
@@ -109,7 +123,7 @@ TIMEOUT_OUT=$(timeout 150 bash -c '
   printf "shutdown\n"; sleep 8
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel '"$KERNEL"' -initrd login-test.cpio.gz -append '"'$APPEND'"'
-' 2>&1) || true
+' 2>&1 | tee /tmp/main_out.txt) || true
 rm -f login-test.cpio.gz
 assert_contains_in "$TIMEOUT_OUT" "持续输入不超时" "K5"
 assert_contains_in "$TIMEOUT_OUT" "空闲超时登出" "session timed out, logging out"
@@ -156,6 +170,10 @@ OUT=$(timeout 400 bash -c '
   printf "rservice reload longrun\n"; sleep 0.5
   printf "rservice reload console-shell\n"; sleep 0.5
   printf "rservice status console-shell\n"; sleep 0.5
+  # Wants/Requisite 依赖语义
+  printf "rbox status req-test\n"; sleep 0.5
+  printf "rbox status req-ok\n"; sleep 0.5
+  printf "rbox status wants-test\n"; sleep 0.5
   printf "cat /proc/sys/kernel/panic\n"; sleep 0.5
   printf "cat /tmp/usertest.log\n"; sleep 0.5
   printf "rbox head -n 60 /dev/kmsg\n"; sleep 0.5
@@ -337,6 +355,12 @@ echo ""
 echo "[init 增强]"
 assert_contains "ExecReload 执行" "reloaded-ok"
 assert_contains "console reload 提示" "console-shell has no ExecReload"
+assert_contains "Wants 失败不传播" "WANTS_OK"
+assert_contains "Wants 服务已启动" "wants-test exited"
+assert_contains "Requisite 未激活跳过" "skipping req-test"
+assert_contains "Requisite 激活成功" "req-ok exited"
+assert_not_contains_in "$OUT" "Requisite 跳过单元未执行" "REQ_SHOULD_NOT_RUN"
+assert_contains "Requisite 跳过单元状态" "req-test not-started"
 assert_contains "status 单查 console" "console-shell running"
 assert_contains "sysctl kernel.panic" "10"
 assert_contains "User= 降权 nobody" "65534"
@@ -497,6 +521,31 @@ echo "[关机流程]"
 assert_contains "shutdown 触发关机" "shutting down"
 assert_contains "ExecStop 逆序执行" "stopping"
 assert_contains "power off" "power off"
+
+# ─── 内核 cmdline 启动模式：emergency / single（独立 QEMU 会话）───
+echo ""
+echo "[emergency/single 启动模式]"
+EMERGENCY_OUT=$(timeout 130 bash -c '
+{
+  sleep 15
+  printf "echo EMERGENCY_SHELL_OK\n"; sleep 1
+  printf "shutdown\n"; sleep 8
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' emergency"
+' 2>&1) || true
+assert_contains_in "$EMERGENCY_OUT" "emergency 模式进入应急 shell" "emergency mode, emergency shell"
+assert_not_contains_in "$EMERGENCY_OUT" "emergency 跳过服务启动" "starting console-shell"
+assert_contains_in "$EMERGENCY_OUT" "应急 shell 可用" "EMERGENCY_SHELL_OK"
+
+SINGLE_OUT=$(timeout 130 bash -c '
+{
+  sleep 15
+  printf "echo SINGLE_SHELL_OK\n"; sleep 1
+  printf "shutdown\n"; sleep 8
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' single"
+' 2>&1) || true
+assert_contains_in "$SINGLE_OUT" "single 模式进入单用户 shell" "single mode, emergency shell"
+assert_not_contains_in "$SINGLE_OUT" "single 跳过服务启动" "starting console-shell"
+assert_contains_in "$SINGLE_OUT" "单用户 shell 可用" "SINGLE_SHELL_OK"
 
 echo ""
 echo "========================================"
