@@ -240,7 +240,7 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
     if notify[1] >= 0 {
         unsafe { libc::close(notify[1]) };
     }
-    match wait_child_with_timeout(pid, notify[0], timeout_secs) {
+    match wait_child_with_timeout(pid, notify[0], libc::STDIN_FILENO, timeout_secs) {
         Some(0) => {} // shell 正常退出：立即重新提示
         Some(_) => {
             // 登录失败（非零退出）：延迟再提示，避免失败刷屏
@@ -263,6 +263,7 @@ fn run_login(user: &str, cfg: &crate::config::GettyConfig, timeout_secs: Option<
 fn wait_child_with_timeout(
     pid: libc::pid_t,
     notify_fd: i32,
+    stdin_fd: i32,
     idle_secs: Option<u64>,
 ) -> Option<i32> {
     let Some(idle) = idle_secs else {
@@ -328,14 +329,15 @@ fn wait_child_with_timeout(
 
         // 监控终端输入：仅当存在真实输入字节（FIONREAD > 0）才视为活动并刷新计时，
         // 数据留给 shell 读取；EOF（poll 可读但无字节）不刷新。
+        // stdin_fd < 0（测试/无终端）时 poll 忽略该 fd，仅按 remaining 超时等待。
         let remaining = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
         let mut fds = [libc::pollfd {
-            fd: libc::STDIN_FILENO,
+            fd: stdin_fd,
             events: libc::POLLIN,
             revents: 0,
         }];
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, remaining) };
-        if n > 0 && fds[0].revents & libc::POLLIN != 0 {
+        if n > 0 && stdin_fd >= 0 && fds[0].revents & libc::POLLIN != 0 {
             let mut avail: libc::c_int = 0;
             let has_input = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut avail) }
                 == 0
@@ -450,7 +452,7 @@ mod tests {
         if pid == 0 {
             unsafe { libc::_exit(42) };
         }
-        assert_eq!(wait_child_with_timeout(pid, -1, None), Some(42));
+        assert_eq!(wait_child_with_timeout(pid, -1, -1, None), Some(42));
     }
 
     #[test]
@@ -461,8 +463,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_secs(10));
             unsafe { libc::_exit(0) };
         }
-        // 1 秒超时：子进程被终止，返回 None
-        assert_eq!(wait_child_with_timeout(pid, -1, Some(1)), None);
+        // 1 秒超时：子进程被终止，返回 None。stdin_fd=-1 禁用终端输入监控，
+        // 避免终端输入刷新空闲计时导致测试被拖到子进程退出才结束。
+        assert_eq!(wait_child_with_timeout(pid, -1, -1, Some(1)), None);
     }
 
     #[test]
