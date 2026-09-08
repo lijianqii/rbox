@@ -194,6 +194,19 @@ fmt:
 # ─── 验证（CI 用）────────────────────────────────
 verify: check clippy fmt unittest
 
+# ─── 环境自检 ────────────────────────────────────
+# 一次性验证宿主机环境：工具链 / QEMU / 内核 / 权限 / 残留控制 socket。
+# unittest 卡住多为环境问题（如 /run/rbox.sock 残留导致测试挂起），先跑本目标定位。
+doctor:
+	@echo "=== rbox 环境自检 ==="
+	@command -v cargo >/dev/null 2>&1 && echo "[ok]   cargo" || echo "[FAIL] cargo 未安装"
+	@command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && echo "[ok]   交叉工具链 aarch64-linux-gnu-gcc" || echo "[FAIL] 交叉工具链缺失 (make kernel 需要，make unittest 不需要)"
+	@command -v qemu-system-aarch64 >/dev/null 2>&1 && echo "[ok]   qemu-system-aarch64" || echo "[WARN] qemu 未安装 (make test/run 需要)"
+	@if [ -f $(KERNEL)/arch/arm64/boot/Image ]; then echo "[ok]   内核镜像 $(KERNEL)/arch/arm64/boot/Image"; else echo "[WARN] 内核镜像缺失 (make kernel)"; fi
+	@if [ -w /dev/kmsg ]; then echo "[ok]   /dev/kmsg 可写"; else echo "[WARN] /dev/kmsg 不可写（init 日志回退 stderr，QEMU 内无影响）"; fi
+	@if [ ! -e /run/rbox.sock ]; then echo "[ok]   无残留控制 socket /run/rbox.sock"; else echo "[FAIL] 残留 /run/rbox.sock（宿主机有 init 在跑？删除后重试 unittest）"; fi
+	@echo "=== 自检完成 ==="
+
 check:
 	cargo check --target x86_64-unknown-linux-gnu
 
@@ -222,5 +235,6 @@ help:
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"
 	@echo "  make fmt       - cargo fmt --check 格式检查"
 	@echo "  make verify    - check + clippy + fmt + unittest（CI 用）"
+	@echo "  make doctor    - 环境自检（工具链/QEMU/内核/权限/残留 socket）"
 	@echo "  make kernel    - 编译 ARM64 内核（源码缺失时自动从清华镜像下载）"
 	@echo "  make clean     - 清理产物"
