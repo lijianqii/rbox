@@ -24,7 +24,7 @@
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
   - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
   - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、481 个单元测试、143 个集成断言、rustfmt、make strip、make doctor 环境自检
+- **工程化**：Clippy 零警告、482 个单元测试、145 个集成断言、rustfmt、make strip、make doctor 环境自检
 
 ## 快速开始
 

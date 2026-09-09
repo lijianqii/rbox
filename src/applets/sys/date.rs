@@ -19,7 +19,9 @@ impl Applet for Date {
             return ExitCode::from(1);
         }
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&secs, &mut tm) };
+        // 固定输出 UTC 时间（gmtime_r），与 "UTC" 标签一致；
+        // 此前用 localtime_r 却硬编码 UTC 标签，TZ 非 UTC 时时间与标签矛盾
+        unsafe { libc::gmtime_r(&secs, &mut tm) };
         // 格式: Thu Aug  1 12:00:00 UTC 2024
         let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
         let months = [

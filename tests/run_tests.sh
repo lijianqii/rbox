@@ -153,6 +153,10 @@ OUT=$(timeout 400 bash -c '
   printf "mv /tmp/t1/g.txt /tmp/t1/h.txt\n"; sleep 0.5
   printf "ls /tmp/t1\n"; sleep 0.5
   printf "rm /tmp/t1/f.txt\n"; sleep 0.5
+  # rm -r 对目录符号链接只删链接本身（回归：曾误删链接目标内容）
+  printf "mkdir -p /tmp/symt/real/sub; echo precious > /tmp/symt/real/sub/data.txt; ln -s real /tmp/symt/link; rm -r /tmp/symt/link; cat /tmp/symt/real/sub/data.txt\n"; sleep 1
+  # cat - 读 stdin
+  printf "echo stdin_ok | cat -\n"; sleep 0.5
   # 管道与重定向
   printf "echo aaa > /tmp/a\n"; sleep 0.5
   printf "echo bbb > /tmp/b\n"; sleep 0.5
@@ -338,6 +342,8 @@ echo ""
 echo "[服务管理]"
 assert_contains "Environment= 注入 HELLO" "HELLO=world"
 assert_contains "Restart=on-failure 自动重启" "restarting restart-test"
+assert_contains "rm 符号链接只删链接" "precious"
+assert_contains "cat - 读 stdin" "stdin_ok"
 assert_contains "status 列出 console" "console-shell"
 assert_contains "status 列出重启服务" "restart-test"
 assert_contains "status 单服务查询" "hello "

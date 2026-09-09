@@ -39,6 +39,15 @@ impl Applet for Cat {
             ok = copy_reader(&mut stdin, &mut out);
         } else {
             for path in args {
+                if path == "-" {
+                    // `-` 表示 stdin（与 head/tail/wc/grep 一致）
+                    let mut stdin = io::stdin();
+                    if !copy_reader(&mut stdin, &mut out) {
+                        eprintln!("cat: -: write error");
+                        ok = false;
+                    }
+                    continue;
+                }
                 match File::open(path) {
                     Ok(mut f) => {
                         if !copy_reader(&mut f, &mut out) {

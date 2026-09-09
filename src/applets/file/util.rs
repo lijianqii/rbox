@@ -4,8 +4,13 @@ use std::io;
 use std::path::Path;
 
 /// 递归删除文件或目录（rm -r 与跨文件系统 mv 共用）。
+/// 用 symlink_metadata 判断（不跟随符号链接）：symlink 一律删除链接本身，
+/// 绝不触碰链接目标（fs::metadata 跟随 symlink 会把目录链接误当目录递归删除目标内容）。
 pub(crate) fn remove_recursive(path: &str) -> io::Result<()> {
-    let meta = fs::metadata(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(path);
+    }
     if meta.is_dir() {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
@@ -84,6 +89,26 @@ mod tests {
         fs::write(format!("{}/sub/b.txt", dir), "b").unwrap();
         remove_recursive(&format!("{}/sub", dir)).unwrap();
         assert!(!Path::new(&format!("{}/sub", dir)).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_symlink_to_dir_only_removes_link() {
+        // 回归：rm -r 对目录符号链接只删链接本身，绝不触碰链接目标内容
+        let dir = format!("/tmp/rbox_test_sym_{}", std::process::id());
+        let _ = fs::create_dir_all(&dir);
+        fs::create_dir_all(format!("{}/real/sub", dir)).unwrap();
+        fs::write(format!("{}/real/sub/data.txt", dir), "precious").unwrap();
+        let link = format!("{}/link", dir);
+        std::os::unix::fs::symlink("real", &link).unwrap();
+        remove_recursive(&link).unwrap();
+        // 链接本身消失
+        assert!(!Path::new(&link).exists());
+        // 链接目标内容完好
+        assert_eq!(
+            fs::read_to_string(format!("{}/real/sub/data.txt", dir)).unwrap(),
+            "precious"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
