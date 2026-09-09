@@ -32,11 +32,10 @@ impl Applet for Logkeeper {
         // 确保日志文件父目录存在（initramfs 无 /var/log，磁盘模式自动创建）
         if let Some(parent) = std::path::Path::new(file).parent()
             && !parent.as_os_str().is_empty()
+            && let Err(e) = std::fs::create_dir_all(parent)
         {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("logkeeper: cannot create {}: {}", parent.display(), e);
-                return ExitCode::FAILURE;
-            }
+            eprintln!("logkeeper: cannot create {}: {}", parent.display(), e);
+            return ExitCode::FAILURE;
         }
         let mut log = match std::fs::OpenOptions::new()
             .create(true)
