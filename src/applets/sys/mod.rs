@@ -2,6 +2,7 @@
 pub mod date;
 pub mod env;
 pub mod false_;
+pub mod logkeeper;
 pub mod meminfo;
 pub(crate) mod proc;
 pub mod processes;

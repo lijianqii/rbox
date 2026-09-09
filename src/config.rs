@@ -141,12 +141,18 @@ impl Default for LoginConfig {
 pub(crate) struct InitConfig {
     /// 默认 PATH（init 启动时设置，shell/服务子进程继承）
     pub(crate) default_path: String,
+    /// 硬件看门狗设备路径（打开失败则禁用喂狗，不影响启动）
+    pub(crate) watchdog_path: String,
+    /// 喂狗间隔秒（必须小于硬件看门狗超时；0 = 不启用喂狗）
+    pub(crate) watchdog_interval: u64,
 }
 
 impl Default for InitConfig {
     fn default() -> Self {
         Self {
             default_path: "/bin:/sbin:/usr/bin:/usr/sbin".to_string(),
+            watchdog_path: "/dev/watchdog".to_string(),
+            watchdog_interval: 10,
         }
     }
 }
@@ -202,6 +208,8 @@ mod tests {
         assert_eq!(cfg.login.password_timeout, 60);
         assert!(cfg.login.password_timeout_message.contains("daydreaming"));
         assert_eq!(cfg.init.default_path, "/bin:/sbin:/usr/bin:/usr/sbin");
+        assert_eq!(cfg.init.watchdog_path, "/dev/watchdog");
+        assert_eq!(cfg.init.watchdog_interval, 10);
         assert_eq!(cfg.paths.meminfo, "/proc/meminfo");
         assert_eq!(cfg.paths.proc, "/proc");
         assert_eq!(cfg.paths.iomem, "/proc/iomem");
@@ -240,6 +248,8 @@ password_timeout_message = "Password timed out, take your time next time"
 
 [init]
 default_path = "/bin:/sbin"
+watchdog_path = "/dev/watchdog"
+watchdog_interval = 30
 "#;
         let cfg: RboxConfig = toml::from_str(s).unwrap();
         assert_eq!(cfg.paths.default_target, "multi-user.target");
@@ -255,6 +265,8 @@ default_path = "/bin:/sbin"
             "Password timed out, take your time next time"
         );
         assert_eq!(cfg.init.default_path, "/bin:/sbin");
+        assert_eq!(cfg.init.watchdog_path, "/dev/watchdog");
+        assert_eq!(cfg.init.watchdog_interval, 30);
     }
 
     #[test]

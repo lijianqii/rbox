@@ -176,6 +176,9 @@ OUT=$(timeout 400 bash -c '
   printf "rservice reload console-shell\n"; sleep 0.5
   printf "rservice status console-shell\n"; sleep 0.5
   # Wants/Requisite 依赖语义
+  # 日志持久化：logkeeper 转发 kmsg 到 /var/log/messages
+  printf "rbox head -n 3 /var/log/messages\n"; sleep 0.5
+  printf "rbox status logkeeper\n"; sleep 0.5
   printf "rbox status req-test\n"; sleep 0.5
   printf "rbox status req-ok\n"; sleep 0.5
   printf "rbox status wants-test\n"; sleep 0.5
@@ -344,6 +347,9 @@ assert_contains "Environment= 注入 HELLO" "HELLO=world"
 assert_contains "Restart=on-failure 自动重启" "restarting restart-test"
 assert_contains "rm 符号链接只删链接" "precious"
 assert_contains "cat - 读 stdin" "stdin_ok"
+assert_contains "logkeeper 转发 kmsg" "rbox init"
+assert_contains "logkeeper 服务运行" "logkeeper running"
+assert_contains "watchdog 无设备静默禁用" "watchdog unavailable"
 assert_contains "status 列出 console" "console-shell"
 assert_contains "status 列出重启服务" "restart-test"
 assert_contains "status 单服务查询" "hello "

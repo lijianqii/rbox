@@ -495,6 +495,55 @@ fn boot_mode_from_words(words: &[&str]) -> BootMode {
     }
 }
 
+/// 打开硬件看门狗（打开即启动计数）。失败静默禁用（无设备环境不阻塞启动）。
+fn open_watchdog(path: &str) -> Option<i32> {
+    use std::ffi::CString;
+    let p = CString::new(path).ok()?;
+    let fd = unsafe { libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        log_at(
+            LogLevel::Warn,
+            &format!(
+                "rbox init: watchdog unavailable ({}): watchdog disabled",
+                path
+            ),
+        );
+        None
+    } else {
+        log(&format!("rbox init: watchdog enabled on {}", path));
+        Some(fd)
+    }
+}
+
+/// 喂狗：写入任意字节。成功返回 true；失败返回 false（调用方禁用喂狗）。
+fn feed_watchdog(fd: i32) -> bool {
+    unsafe { libc::write(fd, b"V".as_ptr() as *const libc::c_void, 1) == 1 }
+}
+
+/// poll 超时与喂狗截止取 min：空闲时也能定时醒来喂狗。
+/// `watchdog_active=false` 时原样返回（无喂狗约束）。
+fn watchdog_poll_timeout(
+    current_ms: i32,
+    last_feed: &std::time::Instant,
+    interval: &std::time::Duration,
+    watchdog_active: bool,
+) -> i32 {
+    if !watchdog_active {
+        return current_ms;
+    }
+    let since = last_feed.elapsed();
+    let remain = if since >= *interval {
+        0
+    } else {
+        (*interval - since).as_millis().min(i32::MAX as u128) as i32
+    };
+    if current_ms < 0 {
+        remain // 原无限等待：改为按喂狗间隔唤醒
+    } else {
+        current_ms.min(remain)
+    }
+}
+
 /// 应急/单用户 shell：跳过单元加载，循环 spawn root shell；
 /// shell 退出后重新拉起，期间响应关机标志（terminate shell 后进入关机流程）。
 /// `reason` 用于日志区分（no units / emergency / single）。
@@ -503,7 +552,29 @@ fn run_emergency_shell(reason: &str) -> ExitCode {
         LogLevel::Error,
         &format!("rbox init: {} mode, emergency shell", reason),
     );
+    // 应急/单用户模式也喂狗：避免诊断期间被硬件看门狗复位打断
+    let cfg = crate::config::load();
+    let watchdog_interval = std::time::Duration::from_secs(cfg.init.watchdog_interval);
+    let mut watchdog_fd = if cfg.init.watchdog_interval > 0 {
+        open_watchdog(&cfg.init.watchdog_path)
+    } else {
+        None
+    };
+    let mut last_feed = std::time::Instant::now();
     loop {
+        if let Some(fd) = watchdog_fd
+            && last_feed.elapsed() >= watchdog_interval
+        {
+            if feed_watchdog(fd) {
+                last_feed = std::time::Instant::now();
+            } else {
+                log_at(
+                    LogLevel::Warn,
+                    "rbox init: watchdog write failed, disabling",
+                );
+                watchdog_fd = None;
+            }
+        }
         if shutdown_requested() {
             return do_shutdown(&mut []);
         }
@@ -631,6 +702,17 @@ fn reap_with_shutdown(
     let (signal_pipe_read, signal_pipe_write) = create_signal_pipe();
     SIGNAL_PIPE_WRITE.store(signal_pipe_write, Ordering::SeqCst);
 
+    // 硬件看门狗：主循环存活期间周期喂狗（poll 定时唤醒），
+    // 主循环挂死（死锁/异常）即停止喂狗 -> 硬件超时复位整机
+    let cfg = crate::config::load();
+    let watchdog_interval = std::time::Duration::from_secs(cfg.init.watchdog_interval);
+    let mut watchdog_fd = if cfg.init.watchdog_interval > 0 {
+        open_watchdog(&cfg.init.watchdog_path)
+    } else {
+        None
+    };
+    let mut last_feed = std::time::Instant::now();
+
     loop {
         // 1. 回收已退出的服务进程 + forking daemon 化等待；
         //    Restart=on-failure/always 时安排重启（退避 + 上限）。
@@ -730,9 +812,30 @@ fn reap_with_shutdown(
             return do_shutdown(services);
         }
 
+        // 3.5 喂狗：主循环存活证明（poll 唤醒即喂）；设备失效则禁用
+        if let Some(fd) = watchdog_fd
+            && last_feed.elapsed() >= watchdog_interval
+        {
+            if feed_watchdog(fd) {
+                last_feed = std::time::Instant::now();
+            } else {
+                log_at(
+                    LogLevel::Warn,
+                    "rbox init: watchdog write failed, disabling",
+                );
+                watchdog_fd = None;
+            }
+        }
+
         // 4. 事件等待：poll 监听 self-pipe 与 status socket。
-        //    超时为最近的 restart 退避 / daemon 化超时（无定时则无限等待，纯事件驱动）。
-        let timeout = compute_next_timeout(services);
+        //    超时为最近的 restart 退避 / daemon 化超时 / 喂狗截止
+        //    （无定时则按喂狗间隔唤醒，保证空闲时也能定时喂狗）。
+        let timeout = watchdog_poll_timeout(
+            compute_next_timeout(services),
+            &last_feed,
+            &watchdog_interval,
+            watchdog_fd.is_some(),
+        );
         drop(services_guard); // poll 期间释放锁，控制线程可获锁执行请求
         let status_fd = status_listener.as_ref().map(|l| l.as_raw_fd());
         let mut fds = [
@@ -1062,6 +1165,43 @@ mod tests {
         let depths = compute_depths(&order, &units);
         assert_eq!(depths["dep.service"], 0);
         assert_eq!(depths["u.service"], 1); // 依赖在 order 后面也能正确传播
+    }
+
+    #[test]
+    #[test]
+    fn watchdog_poll_timeout_infinite_becomes_interval() {
+        // 原无限等待（-1）：有喂狗约束时改为按喂狗间隔唤醒
+        let last = std::time::Instant::now();
+        let iv = std::time::Duration::from_secs(10);
+        let t = watchdog_poll_timeout(-1, &last, &iv, true);
+        assert!((9000..=10000).contains(&t), "t={t}");
+    }
+
+    #[test]
+    fn watchdog_poll_timeout_min_with_existing() {
+        // 已有更短超时（如 restart 退避 1s）保持；更长超时被喂狗截止压缩
+        let last = std::time::Instant::now();
+        let iv = std::time::Duration::from_secs(10);
+        assert_eq!(watchdog_poll_timeout(500, &last, &iv, true), 500);
+        let t = watchdog_poll_timeout(30_000, &last, &iv, true);
+        assert!((9000..=10000).contains(&t), "t={t}");
+    }
+
+    #[test]
+    fn watchdog_poll_timeout_inactive_passthrough() {
+        // 未启用喂狗（无设备）：原超时原样返回，不影响事件驱动
+        let last = std::time::Instant::now();
+        let iv = std::time::Duration::from_secs(10);
+        assert_eq!(watchdog_poll_timeout(-1, &last, &iv, false), -1);
+        assert_eq!(watchdog_poll_timeout(200, &last, &iv, false), 200);
+    }
+
+    #[test]
+    fn watchdog_poll_timeout_due_now() {
+        // 已到喂狗时间：立即返回 0（poll 不等待，直接醒来喂狗）
+        let last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        let iv = std::time::Duration::from_secs(10);
+        assert_eq!(watchdog_poll_timeout(-1, &last, &iv, true), 0);
     }
 
     #[test]

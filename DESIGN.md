@@ -181,7 +181,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 33 个 applet：
+共 34 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -349,7 +349,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 34 个测试组、145 个断言（涵盖 33 个 applet、Shell 全功能、init 服务管理、Wants/Requisite 依赖、emergency/single 启动模式、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 35 个测试组、148 个断言（涵盖 34 个 applet、Shell 全功能、init 服务管理、Wants/Requisite 依赖、emergency/single 启动模式、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -542,7 +542,9 @@ RestartSec = 1
 | [login] | password_prompt | "Password: " | 密码提示（生产示例为极简 "passwd: "） |
 | [login] | password_timeout | 60（0 = 不超时） | rlogin 密码输入超时秒数 |
 | [login] | password_timeout_message | "Password timed out — daydreaming at the login prompt?" | 密码超时消息（俏皮默认，可自定义） |
-| [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | 默认 PATH |
+| [init] | default_path | /bin:/sbin:/usr/bin:/usr/sbin | init 启动时设置的默认 PATH |
+| [init] | watchdog_path | /dev/watchdog | 硬件看门狗设备（打开失败静默禁用） |
+| [init] | watchdog_interval | 10 | 喂狗间隔秒（须小于硬件超时；0 = 不启用） |
 | [shell] | default_ps1 | "> " | 未设置 $PS1 时的默认提示符 |
 
 生产 rootfs 内置一份带注释的 `/etc/rbox.conf` 作为示例。
@@ -748,7 +750,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 34 个测试组、145 个断言，覆盖全部 33 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 35 个测试组、148 个断言，覆盖全部 34 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -990,7 +992,7 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
 | ExecStartPre/Post 钩子 | 启动前/后执行额外命令 | TODO |
 | 内核 cmdline 解析 | single/emergency（跳过服务直接进 shell）、quiet | ✅ 部分实现（single/emergency；quiet TODO） |
 | 启动失败降级 | default.target 失败 → 自动进入 rescue | TODO |
-| 看门狗喂狗 | /dev/watchdog 周期性喂狗，挂死自动重启 | TODO |
+| 看门狗喂狗 | 主循环空闲时按 [init] watchdog_interval 定时喂狗（poll 与喂狗截止取 min），挂死即硬件复位；无设备静默禁用 | ✅ 已实现 |
 | 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
 | SIGCHLD 驱动回收 | self-pipe + poll 事件驱动，信号唤醒即 try_wait（无 200ms 轮询） | ✅ 已实现 |
 | ExecStop 超时 | ExecStop/ExecReload 命令超时限制（5s，超时按进程组 SIGKILL，见 run_command_with_timeout） | ✅ 已实现 |
