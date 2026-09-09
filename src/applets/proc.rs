@@ -153,6 +153,17 @@ pub(crate) fn parse_stat_cpu(content: &str) -> u64 {
     utime.saturating_add(stime)
 }
 
+/// 内存人类可读：KB -> K / M / G（status 进程树与 processes 树共用）。
+pub(crate) fn human_size(kb: u64) -> String {
+    if kb >= 1024 * 1024 {
+        format!("{:.1}G", kb as f64 / (1024.0 * 1024.0))
+    } else if kb >= 1024 {
+        format!("{:.1}M", kb as f64 / 1024.0)
+    } else {
+        format!("{}K", kb)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +199,14 @@ mod tests {
         assert_eq!(parse_stat_cpu(stat), 15);
         assert_eq!(parse_stat_cpu("1 (rbox) R 0 1 1\n"), 0);
         assert_eq!(parse_stat_cpu("no parens\n"), 0);
+    }
+
+    #[test]
+    fn human_size_adaptive() {
+        assert_eq!(human_size(512), "512K");
+        assert_eq!(human_size(1024), "1.0M");
+        assert_eq!(human_size(2528), "2.5M");
+        assert_eq!(human_size(1024 * 1024), "1.0G");
     }
 
     #[test]

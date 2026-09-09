@@ -112,7 +112,9 @@ rbox/
 │       │   └── rservice.rs # rservice（unix socket 管理 init 服务：start/stop/restart/reload）
 │       ├── file/           # 文件与目录操作：ls、cp、mv、rm、mkdir、touch、ln、cat（+ util.rs 递归删除）
 │       ├── text/           # 文本与字符串处理：head、tail、wc、grep、printf、echo、basename、dirname（+ util.rs 输入遍历）
-│       └── sys/            # 系统信息与进程工具：true、false、pwd、uname、date、sleep、env
+│       ├── sys/            # 系统信息与进程工具：true、false、pwd、uname、date、sleep、env、meminfo、processes、logkeeper
+│       └── proc.rs         # 跨模块共享工具：进程收集/解析（ProcMem）、human_size 单位格式化
+│           （core/init/server、sys/meminfo、sys/processes 共用；不挂在 applet 分组下）
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接
 │   ├── bin/

@@ -4,3 +4,6 @@ pub mod core;
 pub mod file;
 pub mod sys;
 pub mod text;
+
+/// 跨模块共享工具（进程信息收集 / 单位格式化）。
+pub(crate) mod proc;

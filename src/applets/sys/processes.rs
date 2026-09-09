@@ -7,7 +7,7 @@
 //! 连接符与 btop/tree 一致（`├──`/`└──`/`│`）。数据源路径可配置（[paths] proc）。
 
 use crate::applet::Applet;
-use crate::applets::sys::proc::{ProcMem, collect_processes, mem_total_kb};
+use crate::applets::proc::{ProcMem, collect_processes, mem_total_kb};
 use std::collections::HashMap;
 use std::process::ExitCode;
 
@@ -87,16 +87,6 @@ fn build_node(p: &ProcMem, procs: &[ProcMem]) -> ProcTree {
 }
 
 /// 自适应内存大小格式化：kB / MB / GB（一位小数）。
-fn format_size(kb: u64) -> String {
-    if kb >= 1024 * 1024 {
-        format!("{:.1}GB", kb as f64 / (1024.0 * 1024.0))
-    } else if kb >= 1024 {
-        format!("{:.1}MB", kb as f64 / 1024.0)
-    } else {
-        format!("{}kB", kb)
-    }
-}
-
 /// 节点行内容（不含树缩进）：
 /// `PID 名称(Command: 路径) State(S) RSS MEM: x%`，左对齐；无路径时省略 Command 部分。
 fn node_fields(node: &ProcTree, mem_total_kb: u64) -> String {
@@ -116,7 +106,7 @@ fn node_fields(node: &ProcTree, mem_total_kb: u64) -> String {
         node.name,
         cmd,
         node.state,
-        format_size(node.rss_kb),
+        crate::applets::proc::human_size(node.rss_kb),
         pct
     )
 }
@@ -214,14 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn format_size_adaptive() {
-        assert_eq!(format_size(512), "512kB");
-        assert_eq!(format_size(1024), "1.0MB");
-        assert_eq!(format_size(2528), "2.5MB");
-        assert_eq!(format_size(1024 * 1024), "1.0GB");
-    }
-
-    #[test]
     fn node_fields_columns() {
         let node = ProcTree {
             pid: 49,
@@ -237,7 +219,7 @@ mod tests {
         assert!(line.starts_with("49 rgetty"), "out: {}", line);
         assert!(line.contains("(Command: /bin/rbox)"), "out: {}", line);
         assert!(line.contains("State(S)"), "out: {}", line);
-        assert!(line.contains("2.5MB"), "out: {}", line);
+        assert!(line.contains("2.5M"), "out: {}", line); // human_size 统一标签
         assert!(line.contains("MEM: 2.8%"), "out: {}", line);
     }
 

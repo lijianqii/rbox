@@ -13,8 +13,8 @@
 //! 数据来源路径均可配置（/etc/rbox.conf [paths] proc/meminfo/iomem）。
 
 use crate::applet::Applet;
-use crate::applets::sys::proc::ProcMem;
-use crate::applets::sys::proc::{collect_processes, sort_processes};
+use crate::applets::proc::ProcMem;
+use crate::applets::proc::{collect_processes, sort_processes};
 use std::collections::HashMap;
 use std::process::ExitCode;
 

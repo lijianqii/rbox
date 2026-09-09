@@ -7,7 +7,7 @@ use crate::applets::core::init::services::{
 };
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;
-use crate::applets::sys::proc::{ProcMem, collect_processes};
+use crate::applets::proc::{ProcMem, collect_processes};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -291,7 +291,7 @@ fn format_status(
                         line.push_str(&format!(
                             " procs={} mem={} cpu={:.1}%",
                             count,
-                            human_kb(mem),
+                            crate::applets::proc::human_size(mem),
                             cpu
                         ));
                         line.push('\n');
@@ -317,7 +317,7 @@ fn format_status(
             out.push_str(&format!(
                 "    procs={} mem={} cpu={:.1}%\n",
                 count,
-                human_kb(mem),
+                crate::applets::proc::human_size(mem),
                 cpu
             ));
             render_status_node(&tree, pm, nm, interval, "    ", true, &mut out);
@@ -345,7 +345,11 @@ fn init_line(
         && let Some(p) = nm.get(&1)
     {
         let cpu = cpu_percent_for(1, pm, nm, interval).unwrap_or(0.0);
-        line = format!("init pid=1 cpu={:.1}% mem={}\n", cpu, human_kb(p.rss_kb));
+        line = format!(
+            "init pid=1 cpu={:.1}% mem={}\n",
+            cpu,
+            crate::applets::proc::human_size(p.rss_kb)
+        );
     }
     line
 }
@@ -420,7 +424,7 @@ fn render_status_node(
         node.name,
         node.state,
         cpu_str,
-        human_kb(node.rss_kb)
+        crate::applets::proc::human_size(node.rss_kb)
     ));
     let child_prefix = if is_last {
         format!("{}    ", prefix)
@@ -472,17 +476,6 @@ fn cpu_percent_for(
     let delta = after.saturating_sub(before) as f64;
     let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     Some(delta / (interval_secs * clk) * 100.0)
-}
-
-/// 内存人类可读：KB -> K / M / G。
-fn human_kb(kb: u64) -> String {
-    if kb >= 1024 * 1024 {
-        format!("{:.1}G", kb as f64 / (1024.0 * 1024.0))
-    } else if kb >= 1024 {
-        format!("{:.1}M", kb as f64 / 1024.0)
-    } else {
-        format!("{}K", kb)
-    }
 }
 
 #[cfg(test)]
@@ -662,14 +655,6 @@ mod tests {
             out
         );
         assert!(!out.contains("procs="), "out: {}", out);
-    }
-
-    #[test]
-    fn human_kb_formats_units() {
-        assert_eq!(human_kb(500), "500K");
-        assert_eq!(human_kb(1024), "1.0M");
-        assert_eq!(human_kb(2048), "2.0M");
-        assert_eq!(human_kb(1024 * 1024), "1.0G");
     }
 
     #[test]
