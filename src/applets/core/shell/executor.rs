@@ -502,17 +502,12 @@ pub(crate) fn apply_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectG
             }
         }
         if let Some(f) = rw_file {
+            // `<>`：以 O_RDWR 打开并仅复制到 stdin（POSIX 语义）
             let saved_in = libc::dup(libc::STDIN_FILENO);
-            let saved_out = libc::dup(libc::STDOUT_FILENO);
             if saved_in >= 0 && libc::dup2(f.as_raw_fd(), libc::STDIN_FILENO) >= 0 {
                 guard.saved_in = Some(saved_in);
             } else if saved_in >= 0 {
                 libc::close(saved_in);
-            }
-            if saved_out >= 0 && libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO) >= 0 {
-                guard.saved_out = Some(saved_out);
-            } else if saved_out >= 0 {
-                libc::close(saved_out);
             }
         }
         for (fd, f) in &extra_files {
@@ -771,15 +766,7 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
                 .truncate(false)
                 .open(f)
         {
-            match file.try_clone() {
-                Ok(f2) => {
-                    command.stdin(Stdio::from(file));
-                    command.stdout(Stdio::from(f2));
-                }
-                Err(_) => {
-                    command.stdin(Stdio::from(file));
-                }
-            }
+            command.stdin(Stdio::from(file));
         }
 
         if let Some(ref f) = cmd.stdin_file {
@@ -1059,7 +1046,18 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
             continue;
         }
 
-        let (program, extra_args) = resolve_command(&cmd.argv[0]);
+        let (program, extra_args) = if is_builtin(&cmd.argv[0]) {
+            // 管道各段在子 shell 中执行：内置命令经 `rbox --builtin` 分发
+            let rbox_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/bin/rbox".to_string());
+            (
+                rbox_path,
+                vec!["--builtin".to_string(), cmd.argv[0].clone()],
+            )
+        } else {
+            resolve_command(&cmd.argv[0])
+        };
 
         let mut command = Command::new(program);
         command.args(&extra_args);
@@ -1140,40 +1138,19 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
                 .truncate(false)
                 .open(f)
         {
-            match file.try_clone() {
-                Ok(f2) => {
-                    command.stdin(Stdio::from(file));
-                    command.stdout(Stdio::from(f2));
-                }
-                Err(_) => {
-                    command.stdin(Stdio::from(file));
-                }
-            }
+            command.stdin(Stdio::from(file));
         }
 
-        // `<>` 读写重定向
-        if let Some(ref f) = cmd.rw_file {
-            match std::fs::OpenOptions::new()
+        // `<>`：以 O_RDWR 打开并仅复制到 stdin（POSIX 语义）
+        if let Some(ref f) = cmd.rw_file
+            && let Ok(file) = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .open(f)
-            {
-                Ok(file) => match file.try_clone() {
-                    Ok(f2) => {
-                        command.stdin(Stdio::from(file));
-                        command.stdout(Stdio::from(f2));
-                    }
-                    Err(_) => {
-                        command.stdin(Stdio::from(file));
-                    }
-                },
-                Err(e) => {
-                    eprintln!("shell: {}: {}", f, e);
-                    return 1;
-                }
-            }
+        {
+            command.stdin(Stdio::from(file));
         }
 
         // stdin

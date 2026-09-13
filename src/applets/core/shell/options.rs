@@ -271,4 +271,26 @@ mod tests {
         assert_eq!(take_return(), Some(5));
         assert_eq!(take_return(), None);
     }
+
+    #[test]
+    fn option_string_and_named_options() {
+        let _g = crate::applets::core::shell::compound::tests::test_guard();
+        reset_for_test();
+        set_noclobber(true);
+        set_noglob(true);
+        let flags = option_string();
+        assert!(flags.contains('C'), "$- 应含 noclobber: {}", flags);
+        assert!(flags.contains('f'), "$- 应含 noglob: {}", flags);
+        assert!(set_named("pipefail", true));
+        assert!(pipefail());
+        assert!(named_options().iter().any(|(n, v)| *n == "pipefail" && *v));
+        assert!(named_options().iter().any(|(n, _)| *n == "noclobber"));
+        assert!(set_named("ignoreeof", true));
+        assert!(ignoreeof());
+        assert!(set_named("ignoreeof", false));
+        assert!(!set_named("bogus_option", true));
+        assert!(set_named("pipefail", false));
+        assert!(!pipefail());
+        reset_for_test();
+    }
 }

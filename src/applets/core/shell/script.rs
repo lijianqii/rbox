@@ -983,6 +983,16 @@ mod tests {
         v.iter().map(|x| x.to_string()).collect()
     }
 
+    /// 读取文件并过滤测试框架在重定向窗口内并发打印的行。
+    fn read_filtered(path: &str) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.starts_with("test ") && !l.contains(" ... "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn parse_args_modes() {
         options::reset_for_test();
@@ -1060,7 +1070,7 @@ mod tests {
         let src = format!("x=1\nif true; then\n echo ran > {}\nfi\n", path);
         let rc = run_source(&src, &[], &|_| {}, false);
         assert_eq!(rc, 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "ran");
+        assert_eq!(read_filtered(&path).trim(), "ran");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1099,7 +1109,7 @@ mod tests {
         );
         let rc = run_source(&src, &[], &|_| {}, false);
         assert_eq!(rc, 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "B");
+        assert_eq!(read_filtered(&path).trim(), "B");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1114,5 +1124,70 @@ mod tests {
         assert_eq!(rc, 0);
         assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "u");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_source_subshell_isolates_state() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_sub_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let src = format!("x=1\n( x=2; echo $x > {p} )\necho $x >> {p}\n");
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p), "2\n1");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn run_source_group_redirect_and_negate() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_grp_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let src = format!("{{ echo g1; echo g2; }} > {p}\n! false\necho neg=$? >> {p}\n");
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p), "g1\ng2\nneg=0");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn run_source_compound_after_semicolon() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_cmp2_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let src = format!("set -- p q; for a; do echo $a >> {p}; done\n");
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p), "p\nq");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn run_source_compound_trailing_redirect_keeps_var() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_done_{}", std::process::id());
+        let f = format!("/tmp/rbox_done_in_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&f, "l1\nl2\n").unwrap();
+        let src = format!("while read l; do c=$l; done < {f}\necho $c > {p}\n");
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p).trim(), "l2");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn run_source_compound_after_semicolon_if_while() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_cmp3_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let src = format!(
+            "true; if true; then echo IF >> {p}; fi\ni=0; while [ $i -lt 2 ]; do echo W$i >> {p}; i=$((i+1)); done\n"
+        );
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p), "IF\nW0\nW1");
+        let _ = std::fs::remove_file(&p);
     }
 }

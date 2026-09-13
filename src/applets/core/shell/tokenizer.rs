@@ -983,4 +983,94 @@ mod tests {
         let tokens = tokenize("  # comment only  ");
         assert!(tokens.is_empty());
     }
+
+    // ─── ash 对齐：任意 fd / 读写 / 强制覆盖 / 命令替换嵌套 ───
+    #[test]
+    fn arbitrary_fd_redirect_forms() {
+        assert_eq!(
+            tokenize("echo x 3> f"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("x".into()),
+                Token::RedirFdOut(3, false),
+                Token::Word("f".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize("echo x 3>> f"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("x".into()),
+                Token::RedirFdOut(3, true),
+                Token::Word("f".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize("cat 3< f"),
+            vec![
+                Token::Word("cat".into()),
+                Token::RedirFdIn(3),
+                Token::Word("f".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize("echo x 3>&1"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("x".into()),
+                Token::RedirDup(3, 1),
+            ]
+        );
+        assert_eq!(
+            tokenize("echo x 3>&-"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("x".into()),
+                Token::RedirClose(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn inout_and_force_redirect() {
+        assert_eq!(
+            tokenize("cat <> f"),
+            vec![
+                Token::Word("cat".into()),
+                Token::RedirInOut,
+                Token::Word("f".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize("echo x >| f"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("x".into()),
+                Token::RedirOutForce,
+                Token::Word("f".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_subst_operators_not_split() {
+        // $(...) 内部的 ; & | 不分词
+        assert_eq!(
+            tokenize("echo $(a; b & c | d)"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("$(a; b & c | d)".into()),
+            ]
+        );
+        // $((...)) 内部的 & 不分词
+        assert_eq!(
+            tokenize("echo $((5&3))"),
+            vec![Token::Word("echo".into()), Token::Word("$((5&3))".into()),]
+        );
+        // 反引号内部的 ; 不分词
+        assert_eq!(
+            tokenize("echo `a; b`"),
+            vec![Token::Word("echo".into()), Token::Word("`a; b`".into()),]
+        );
+    }
 }

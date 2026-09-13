@@ -1797,4 +1797,25 @@ mod tests {
         // 至少应包含 -e/-x 等字符或为空，不产生 `$` 字面
         assert!(!out.contains('$'));
     }
+
+    #[test]
+    fn param_substring_edges() {
+        // SAFETY: 单测使用唯一变量名
+        unsafe {
+            std::env::set_var("RBOX_T_SUB3", "abcdef");
+        }
+        assert_eq!(expand_vars("${RBOX_T_SUB3:1}", 0), "bcdef");
+        assert_eq!(expand_vars("${RBOX_T_SUB3: -2}", 0), "ef");
+        assert_eq!(expand_vars("${RBOX_T_SUB3:10}", 0), "");
+        assert_eq!(expand_vars("${RBOX_T_SUB3:0:0}", 0), "");
+    }
+
+    #[test]
+    fn random_expands_to_number() {
+        for _ in 0..5 {
+            let out = expand_vars("$RANDOM", 0);
+            let n: u32 = out.parse().expect("$RANDOM 应为数字");
+            assert!(n < 65536, "$RANDOM 越界: {}", n);
+        }
+    }
 }

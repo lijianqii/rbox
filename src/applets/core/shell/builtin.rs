@@ -1526,6 +1526,18 @@ mod tests {
         try_builtin(&make_cmd(&["getopts", "ab:", "opt"]), &mut rc, &[]);
         assert_eq!(std::env::var("opt").unwrap(), "b");
         assert_eq!(std::env::var("OPTARG").unwrap(), "val");
+        // 非法选项 → '?'（非静默模式）
+        try_builtin(&make_cmd(&["set", "--", "-z"]), &mut rc, &[]);
+        setenv("OPTIND", "1");
+        GETOPTS_POS.store(0, std::sync::atomic::Ordering::SeqCst);
+        try_builtin(&make_cmd(&["getopts", "ab:", "opt"]), &mut rc, &[]);
+        assert_eq!(std::env::var("opt").unwrap(), "?");
+        // `--` 终止解析
+        try_builtin(&make_cmd(&["set", "--", "--", "-a"]), &mut rc, &[]);
+        setenv("OPTIND", "1");
+        GETOPTS_POS.store(0, std::sync::atomic::Ordering::SeqCst);
+        try_builtin(&make_cmd(&["getopts", "ab:", "opt"]), &mut rc, &[]);
+        assert_eq!(rc, 1);
     }
 
     #[test]
@@ -1533,5 +1545,45 @@ mod tests {
         let mut rc = 0;
         try_builtin(&make_cmd(&["ulimit", "-n"]), &mut rc, &[]);
         assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn readonly_unset_is_protected() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["readonly", "RBOX_T_RO2=5"]), &mut rc, &[]);
+        assert!(is_readonly("RBOX_T_RO2"));
+        try_builtin(&make_cmd(&["unset", "RBOX_T_RO2"]), &mut rc, &[]);
+        assert!(is_readonly("RBOX_T_RO2"));
+        assert_eq!(std::env::var("RBOX_T_RO2").unwrap(), "5");
+    }
+
+    #[test]
+    fn ulimit_flags_succeed() {
+        for args in [
+            vec!["ulimit", "-n"],
+            vec!["ulimit", "-H", "-n"],
+            vec!["ulimit", "-S", "-n"],
+            vec!["ulimit", "-a"],
+            vec!["ulimit", "-c"],
+        ] {
+            let mut rc = 99;
+            try_builtin(&make_cmd(&args), &mut rc, &[]);
+            assert_eq!(rc, 0, "ulimit {:?} 应成功", args);
+        }
+    }
+
+    #[test]
+    fn kill_builtin_list_and_job_forms() {
+        let mut rc = 99;
+        try_builtin(&make_cmd(&["kill", "-l"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
+        try_builtin(&make_cmd(&["kill", "-l", "9"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
+        try_builtin(&make_cmd(&["kill", "-l", "KILL"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
+        // 不存在的 %job 应报错返回非零
+        let mut rc2 = 0;
+        try_builtin(&make_cmd(&["kill", "%99"]), &mut rc2, &[]);
+        assert_ne!(rc2, 0);
     }
 }

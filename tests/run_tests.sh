@@ -348,7 +348,24 @@ OUT=$(timeout 400 bash -c '
   printf "sv=abcdef; echo \"sub:\${sv:1:3}\"\n"; sleep 0.5
   printf "set -- p q; for a; do echo \"noin:\$a\"; done\n"; sleep 0.6
   printf "echo line1 > /tmp/cmp.txt; echo line2 >> /tmp/cmp.txt; while read l; do c=\$l; done < /tmp/cmp.txt; echo \"last:\$c\"\n"; sleep 0.7
-  printf "ulimit -n > /tmp/ul.txt; wc -l < /tmp/ul.txt\n"; sleep 0.5
+  printf "ulimit -n > /tmp/ul.txt\n"; sleep 0.5
+  printf "n=\$(cat /tmp/ul.txt); [ \"\$n\" -ge 0 ] && echo ulimit_num_ok\n"; sleep 0.5
+  # 10.11 覆盖补齐：noclobber/<>/fd/选项/环境/cd 路径/作业 kill
+  printf "set -C; echo a > /tmp/nc.txt; echo b >| /tmp/nc.txt; cat /tmp/nc.txt\n"; sleep 0.6
+  printf "echo c > /tmp/nc.txt 2>/dev/null || echo noclobber_blocked; set +C\n"; sleep 0.5
+  printf "printf \x27keep\\\\n\x27 > /tmp/rw2.txt; cat <> /tmp/rw2.txt > /tmp/rwout.txt\n"; sleep 0.6
+  printf "echo \"rwout:\$(cat /tmp/rwout.txt)\"\n"; sleep 0.5
+  printf "echo \"rwkeep:\$(cat /tmp/rw2.txt)\"\n"; sleep 0.5
+  printf "exec 3>/tmp/fd3.txt; echo fd3_ok >&3; exec 3>&-; cat /tmp/fd3.txt\n"; sleep 0.6
+  printf "set -f; echo /tmp/noglob*; echo \"dash:\$-\"\n"; sleep 0.5
+  printf "set +f; set -o > /tmp/opts.txt; grep noclobber /tmp/opts.txt\n"; sleep 0.5
+  printf "case \$RANDOM in \x27\x27|*[!0-9]*) echo rnd_bad;; *) echo rnd_ok;; esac\n"; sleep 0.5
+  printf "echo \$(echo m1; echo m2) | tr \x27\\\\n\x27 \x27,\x27; echo\n"; sleep 0.6
+  printf "mkdir -p /tmp/cdp/sub; cd /tmp; CDPATH=/tmp/cdp; cd sub; pwd; cd /\n"; sleep 0.8
+  printf "sleep 3 & kill %%+; sleep 1; echo killjob_ok\n"; sleep 1.2
+  printf "false; if true; then echo IF2_OK; fi\n"; sleep 0.6
+  printf "sv2=abcdef; echo \"negs:\${sv2: -2}\"\n"; sleep 0.5
+  printf "readonly RO2=5; unset RO2; echo \"ro2:\$RO2\"\n"; sleep 0.5
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -616,7 +633,23 @@ assert_line "算术位运算与三元" "ar:1:7:2"
 assert_line "参数子串 \${v:1:3}" "sub:bcd"
 assert_line "for 无 in 遍历位置参数" "noin:p"
 assert_line "复合命令重定向变量持久" "last:line2"
-assert_contains "ulimit -n 输出" "1"
+assert_line "ulimit -n 输出为数字" "ulimit_num_ok"
+assert_line "set -C 阻止覆盖" "noclobber_blocked"
+assert_line ">| 强制覆盖" "b"
+assert_line "<> 读取内容" "rwout:keep"
+assert_line "<> 不截断文件" "rwkeep:keep"
+assert_line "任意 fd 3> 与 3>&-" "fd3_ok"
+assert_line "set -f 通配不展开" "/tmp/noglob*"
+assert_line "\$- 含 f 标志" "dash:f"
+assert_line "set -o 名称列表含 noclobber" "noclobber"
+assert_line "\$RANDOM 为数字" "rnd_ok"
+assert_line "命令替换拼接多行输出" "m1,m2,"
+assert_contains "CDPATH 搜索相对路径" "/tmp/cdp/sub"
+assert_contains "kill %job 后 wait 返回" "killjob_ok"
+assert_line "分号后 if 复合命令" "IF2_OK"
+assert_line "子串负偏移" "negs:ef"
+assert_contains "readonly 阻止 unset" "read only"
+assert_line "readonly 值保留" "ro2:5"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

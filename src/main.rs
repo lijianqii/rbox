@@ -14,6 +14,22 @@ mod config;
 use crate::applet::Applet;
 use std::process::ExitCode;
 
+/// 隐藏模式 `rbox --builtin NAME ARGS...`：在子进程内执行 shell 内置命令。
+fn run_builtin_subprocess(args: &[String]) -> ExitCode {
+    use crate::applets::core::shell::builtin;
+    use crate::applets::core::shell::types::SimpleCmd;
+    if args.is_empty() {
+        return ExitCode::FAILURE;
+    }
+    let cmd = SimpleCmd {
+        argv: args.to_vec(),
+        ..Default::default()
+    };
+    let mut rc = 0;
+    let _ = builtin::try_builtin(&cmd, &mut rc, &[]);
+    ExitCode::from(rc as u8)
+}
+
 fn main() -> ExitCode {
     // PID 1 崩溃保护：panic → abort 会导致 PID 1 死亡（kernel panic），
     // 这里把 panic 信息写一行到 /dev/kmsg，便于事后从 dmesg/console 定位死因。
@@ -50,6 +66,8 @@ fn main() -> ExitCode {
             "--list" | "list" => return print_list(),
             "--help" | "-h" | "help" => return print_usage(true),
             "--version" | "-V" | "version" => return print_version(),
+            // 隐藏模式：管道/子 shell 中执行 shell 内置命令
+            "--builtin" => return run_builtin_subprocess(&raw_args[2..]),
             _ => {}
         }
         (sub.as_str(), &raw_args[2..])

@@ -41,7 +41,7 @@
     `break` `continue`
   - `PS2` 续行提示、`PS4` xtrace 前缀、`IFS` 词分割可配置；启动时 source `/etc/profile`
     与 `~/.profile`
-- **工程化**：Clippy（--all-targets）零警告、764 个单元测试、200 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
+- **工程化**：Clippy（--all-targets）零警告、787 个单元测试、231 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
 
 ## 快速开始
 

@@ -17,7 +17,7 @@
 //! - `~` 展开。
 
 mod alias;
-mod builtin;
+pub(crate) mod builtin;
 mod completion;
 mod compound;
 mod executor;
@@ -33,7 +33,7 @@ mod reader;
 mod script;
 mod tokenizer;
 mod trap;
-mod types;
+pub(crate) mod types;
 
 use crate::applet::Applet;
 use reader::{enable_raw_mode, make_continuation_prompt, make_prompt, redraw};
