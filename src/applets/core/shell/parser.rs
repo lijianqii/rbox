@@ -68,6 +68,28 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
             Token::RedirDup(from, to) => {
                 cur.dup_fds.push((*from, *to));
             }
+            Token::RedirClose(fd) => {
+                cur.close_fds.push(*fd);
+            }
+            Token::RedirOutBoth | Token::RedirOutBothAppend => {
+                let append = matches!(tok, Token::RedirOutBothAppend);
+                let f = next_word(&mut iter, if append { "&>>" } else { "&>" })?;
+                cur.stdout_file = Some(f.clone());
+                cur.stderr_file = Some(f);
+                cur.append = append;
+                cur.append_err = append;
+            }
+            Token::RedirHereString => {
+                let w = next_word(&mut iter, "<<<")?;
+                cur.here_string = Some(w);
+            }
+            Token::PipeBoth => {
+                if cur.is_empty() {
+                    return Err("syntax error: empty command before |&".to_string());
+                }
+                cur.stderr_to_pipe = true;
+                cur_cmds.push(std::mem::take(&mut cur));
+            }
             Token::Pipe => {
                 if cur.is_empty() {
                     return Err("syntax error: empty command before |".to_string());
@@ -301,6 +323,27 @@ mod tests {
     }
 
     // ─── 后台执行 ──────────────────────────────
+
+    #[test]
+    fn parse_redirect_both_and_herestring_and_pipeboth() {
+        let cl = build_command_list(&tokenize("cmd &> out")).unwrap();
+        let cmd = &cl.segments[0].pipeline.cmds[0];
+        assert_eq!(cmd.stdout_file.as_deref(), Some("out"));
+        assert_eq!(cmd.stderr_file.as_deref(), Some("out"));
+
+        let cl = build_command_list(&tokenize("cat <<< hi")).unwrap();
+        assert_eq!(
+            cl.segments[0].pipeline.cmds[0].here_string.as_deref(),
+            Some("hi")
+        );
+
+        let cl = build_command_list(&tokenize("a |& b")).unwrap();
+        assert_eq!(cl.segments[0].pipeline.cmds.len(), 2);
+        assert!(cl.segments[0].pipeline.cmds[0].stderr_to_pipe);
+
+        let cl = build_command_list(&tokenize("cmd >&-")).unwrap();
+        assert_eq!(cl.segments[0].pipeline.cmds[0].close_fds, vec![1]);
+    }
 
     #[test]
     fn parse_background() {

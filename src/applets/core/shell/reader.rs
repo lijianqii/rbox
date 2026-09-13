@@ -98,6 +98,14 @@ pub fn make_prompt(pending: &str) -> String {
     }
 }
 
+/// 续行提示符：`$PS2`（默认 "> "），支持 PS1 转义序列。
+pub fn make_continuation_prompt() -> String {
+    match std::env::var("PS2") {
+        Ok(p) if !p.is_empty() => expand_ps1(&p),
+        _ => "> ".to_string(),
+    }
+}
+
 /// 展开 PS1 转义序列。
 pub fn expand_ps1(ps1: &str) -> String {
     let mut result = String::new();

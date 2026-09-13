@@ -1,0 +1,150 @@
+//! Shell 选项与运行时状态：`set -e/-x/-u/-o pipefail`、退出请求、nounset 违规。
+//!
+//! 用全局原子量保存（shell 单线程执行；脚本/交互共用）。
+
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+static ERREXIT: AtomicBool = AtomicBool::new(false);
+static XTRACE: AtomicBool = AtomicBool::new(false);
+static NOUNSET: AtomicBool = AtomicBool::new(false);
+static PIPEFAIL: AtomicBool = AtomicBool::new(false);
+static NOCLOBBER: AtomicBool = AtomicBool::new(false);
+/// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
+static NOUNSET_VIOLATION: AtomicBool = AtomicBool::new(false);
+/// 退出请求（`exit` 之外的内部退出：set -e 触发等）；-1 表示无。
+static EXIT_REQUESTED: AtomicI32 = AtomicI32::new(-1);
+/// `return` 请求（source/函数帧消费）；-1 表示无。
+static RETURN_REQUESTED: AtomicI32 = AtomicI32::new(-1);
+
+pub(crate) fn errexit() -> bool {
+    ERREXIT.load(Ordering::SeqCst)
+}
+pub(crate) fn set_errexit(v: bool) {
+    ERREXIT.store(v, Ordering::SeqCst);
+}
+pub(crate) fn xtrace() -> bool {
+    XTRACE.load(Ordering::SeqCst)
+}
+pub(crate) fn set_xtrace(v: bool) {
+    XTRACE.store(v, Ordering::SeqCst);
+}
+pub(crate) fn nounset() -> bool {
+    NOUNSET.load(Ordering::SeqCst)
+}
+pub(crate) fn set_nounset(v: bool) {
+    NOUNSET.store(v, Ordering::SeqCst);
+}
+pub(crate) fn pipefail() -> bool {
+    PIPEFAIL.load(Ordering::SeqCst)
+}
+pub(crate) fn set_pipefail(v: bool) {
+    PIPEFAIL.store(v, Ordering::SeqCst);
+}
+pub(crate) fn noclobber() -> bool {
+    NOCLOBBER.load(Ordering::SeqCst)
+}
+pub(crate) fn set_noclobber(v: bool) {
+    NOCLOBBER.store(v, Ordering::SeqCst);
+}
+
+/// 记录 nounset 违规（未定义变量展开）。
+pub(crate) fn mark_nounset_violation() {
+    NOUNSET_VIOLATION.store(true, Ordering::SeqCst);
+}
+/// 是否有 nounset 违规（不消费）。
+pub(crate) fn nounset_violation() -> bool {
+    NOUNSET_VIOLATION.load(Ordering::SeqCst)
+}
+
+/// 取走并清除 nounset 违规标记。
+pub(crate) fn take_nounset_violation() -> bool {
+    NOUNSET_VIOLATION.swap(false, Ordering::SeqCst)
+}
+
+/// 请求退出（脚本模式下 set -e 等内部触发）。
+pub(crate) fn request_exit(code: i32) {
+    EXIT_REQUESTED.store(code, Ordering::SeqCst);
+}
+/// 取走退出请求。
+pub(crate) fn take_exit_request() -> Option<i32> {
+    let v = EXIT_REQUESTED.swap(-1, Ordering::SeqCst);
+    if v < 0 { None } else { Some(v) }
+}
+/// 请求 `return n`（source/函数帧消费）。
+pub(crate) fn request_return(code: i32) {
+    RETURN_REQUESTED.store(code, Ordering::SeqCst);
+}
+/// 取走 return 请求。
+pub(crate) fn take_return() -> Option<i32> {
+    let v = RETURN_REQUESTED.swap(-1, Ordering::SeqCst);
+    if v < 0 { None } else { Some(v) }
+}
+/// 是否有待处理的 return 请求（不消费）。
+pub(crate) fn return_requested() -> bool {
+    RETURN_REQUESTED.load(Ordering::SeqCst) >= 0
+}
+
+/// 重置全部选项与状态（测试用）。
+#[cfg(test)]
+pub(crate) fn reset_for_test() {
+    ERREXIT.store(false, Ordering::SeqCst);
+    XTRACE.store(false, Ordering::SeqCst);
+    NOUNSET.store(false, Ordering::SeqCst);
+    PIPEFAIL.store(false, Ordering::SeqCst);
+    NOCLOBBER.store(false, Ordering::SeqCst);
+    NOUNSET_VIOLATION.store(false, Ordering::SeqCst);
+    EXIT_REQUESTED.store(-1, Ordering::SeqCst);
+    RETURN_REQUESTED.store(-1, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn option_toggles() {
+        reset_for_test();
+        assert!(!errexit());
+        set_errexit(true);
+        assert!(errexit());
+        assert!(!xtrace());
+        set_xtrace(true);
+        assert!(xtrace());
+        assert!(!nounset());
+        set_nounset(true);
+        assert!(nounset());
+        assert!(!pipefail());
+        set_pipefail(true);
+        assert!(pipefail());
+        reset_for_test();
+        assert!(!errexit() && !xtrace() && !nounset() && !pipefail());
+    }
+
+    #[test]
+    fn nounset_violation_flag() {
+        reset_for_test();
+        assert!(!take_nounset_violation());
+        mark_nounset_violation();
+        assert!(take_nounset_violation());
+        assert!(!take_nounset_violation());
+    }
+
+    #[test]
+    fn exit_request() {
+        reset_for_test();
+        assert_eq!(take_exit_request(), None);
+        request_exit(3);
+        assert_eq!(take_exit_request(), Some(3));
+        assert_eq!(take_exit_request(), None);
+    }
+
+    #[test]
+    fn return_request() {
+        reset_for_test();
+        assert!(!return_requested());
+        request_return(5);
+        assert!(return_requested());
+        assert_eq!(take_return(), Some(5));
+        assert_eq!(take_return(), None);
+    }
+}

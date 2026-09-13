@@ -99,9 +99,11 @@ echo ""
 echo "[rgetty/rlogin 登录流程]"
 LOGIN_OUT=$(timeout 150 bash -c '
 {
-  sleep 28
+  sleep 32
   printf "root\n"; sleep 2
   printf "wrongpass\n"; sleep 2
+  printf "root\n"; sleep 2
+  printf "wrongpass2\n"; sleep 2
   printf "root\n"; sleep 2
   printf "root\n"; sleep 2
   printf "echo LOGIN_OK\n"; sleep 1
@@ -312,6 +314,28 @@ OUT=$(timeout 400 bash -c '
   printf "\x1a"; sleep 0.5
   printf "jobs\n"; sleep 0.4
   printf "bg\n"; sleep 0.4
+  # 10.9 脚本模式 / POSIX 展开 / 新重定向（新增）
+  printf "sh -c \x27echo C_MODE_OK\x27\n"; sleep 0.5
+  printf "cat > /tmp/scr.sh <<\x27EOF\x27\n"; sleep 0.3
+  printf "echo \"script:\$1:\$#\"\n"; sleep 0.3
+  printf "f() { echo \"func:\$1\"; return 3; }\n"; sleep 0.3
+  printf "f hi; echo \"rc=\$?\"\n"; sleep 0.3
+  printf "case x in x) echo CASE_OK;; esac\n"; sleep 0.3
+  printf "until false; do echo UNTIL_OK; break; done\n"; sleep 0.3
+  printf "for i in 1 2; do for j in a b; do echo \"loop:\$i\$j\"; break 2; done; done\n"; sleep 0.3
+  printf "echo \"\${UNSET_XYZ:-PARAM_OK}\"\n"; sleep 0.3
+  printf "V=\"a b\"; printf \"[%%s]\" \$V; echo\n"; sleep 0.3
+  printf "echo \"file:\$(</etc/hostname)\"\n"; sleep 0.3
+  printf "trap \x27echo EXIT_TRAP\x27 EXIT\n"; sleep 0.3
+  printf "EOF\n"; sleep 0.6
+  printf "sh /tmp/scr.sh arg1\n"; sleep 1.2
+  printf "sh -ec \x27false\x27; echo e_rc=\$?\n"; sleep 0.5
+  printf "ls /nonexistent_rbox &> /tmp/both.txt; cat /tmp/both.txt\n"; sleep 0.6
+  printf "cat <<< here_string_ok\n"; sleep 0.5
+  printf "ls /nonexistent_rbox |& grep -o \x27No such file\x27\n"; sleep 0.5
+  printf "p=/a/b/c.txt; echo \"\${p##*/} \${p%%/*} \${UNSET_X:-DEF}\"\n"; sleep 0.5
+  printf "echo \x27r1 r2\x27 > /tmp/rin.txt; read a b < /tmp/rin.txt; echo \"read:\$a:\$b\"\n"; sleep 0.5
+  printf "sleep 0.2 & wait \$!; echo wait_ok=\$?\n"; sleep 0.6
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -541,6 +565,27 @@ assert_contains "UTF-8 中文输入" "你好世界"
 echo ""
 echo "[Shell: 后台/前台退出码]"
 assert_contains "后台+前台并发退出码" "bg_true_rc=0"
+
+echo ""
+echo "[Shell: 脚本模式/POSIX 展开/新重定向]"
+assert_line "sh -c 模式" "C_MODE_OK"
+assert_line "脚本位置参数" "script:arg1:1"
+assert_line "函数定义与 return" "func:hi"
+assert_line "函数返回码" "rc=3"
+assert_line "case 语句" "CASE_OK"
+assert_line "until 循环" "UNTIL_OK"
+assert_line "嵌套 break 2" "loop:1a"
+assert_line "参数默认值" "PARAM_OK"
+assert_line "未加引号词分割" "[a][b]"
+assert_line "命令替换读文件" "file:rbox"
+assert_line "EXIT trap" "EXIT_TRAP"
+assert_line "set -e 退出码" "e_rc=1"
+assert_contains "&> 同时捕获 stderr" "No such file"
+assert_line "here-string" "here_string_ok"
+assert_contains "|& 管道 stderr" "No such file"
+assert_line "参数前后缀删除" "c.txt /a/b DEF"
+assert_line "read 变量拆分" "read:r1:r2"
+assert_line "wait 返回码" "wait_ok=0"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

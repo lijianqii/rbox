@@ -1,6 +1,7 @@
 //! 展开：变量展开、历史扩展、tilde 展开、通配符展开。
 
 use super::types::*;
+use super::types::{NO_SPLIT_ESCAPE, SPLIT_ESCAPE};
 use crate::applets::glob::glob_match;
 
 // ─── Pipeline 展开入口 ─────────────────────────────────
@@ -22,6 +23,13 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
             append: cmd.append,
             append_err: cmd.append_err,
             dup_fds: cmd.dup_fds.clone(),
+            env: cmd.env.clone(),
+            close_fds: cmd.close_fds.clone(),
+            here_string: cmd
+                .here_string
+                .as_ref()
+                .map(|h| expand_word(h, last_rc).join(" ")),
+            stderr_to_pipe: cmd.stderr_to_pipe,
         });
     }
     Ok(Pipeline {
@@ -30,19 +38,166 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
     })
 }
 
-/// 展开单个词：变量 → tilde → glob；无 glob 匹配时返回去保护的字面词。
+/// 展开单个词：花括号 → 变量 → tilde → glob → 词分割。
 /// 供 expand_pipeline 与复合命令（for 的词表）共用。
 pub fn expand_word(arg: &str, last_rc: i32) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in expand_braces(arg) {
+        out.extend(expand_word_single(&w, last_rc));
+    }
+    out
+}
+
+/// 单次展开（花括号展开后）。
+fn expand_word_single(arg: &str, last_rc: i32) -> Vec<String> {
+    // `"$@"` 特例：展开为多个位置参数（无参数时产生零个词）
+    let quoted_at = format!("{}$@", NO_SPLIT_ESCAPE);
+    if arg == quoted_at {
+        return super::params::all();
+    }
+    // 是否含未加引号的展开（决定是否做词分割）
+    let has_unquoted_expansion = arg.contains(SPLIT_ESCAPE);
     let expanded = expand_vars(arg, last_rc);
     let expanded = expand_tilde(&expanded);
     let globs = expand_glob(&expanded);
-    if globs.is_empty() {
-        // 无匹配（或引号保护下不含活跃通配符）：移除保护标记，
-        // 引号内的 * ? [ 变为字面字符
-        vec![unescape_glob(&expanded)]
-    } else {
-        globs
+    if !globs.is_empty() {
+        return globs;
     }
+    let literal = unescape_glob(&expanded);
+    if has_unquoted_expansion {
+        // POSIX 词分割：未加引号的展开按 IFS（默认空白）拆分
+        let ifs = std::env::var("IFS").unwrap_or_else(|_| " \t\n".to_string());
+        let fields = split_ifs(&literal, &ifs);
+        if fields.len() > 1 {
+            return fields;
+        }
+    }
+    vec![literal]
+}
+
+/// 按 IFS 拆分（IFS 全为空白时等价于 split_whitespace；否则按字符切分）。
+pub(crate) fn split_ifs(text: &str, ifs: &str) -> Vec<String> {
+    if ifs.chars().all(char::is_whitespace) {
+        return text.split_whitespace().map(str::to_string).collect();
+    }
+    text.split(|c| ifs.contains(c))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 花括号展开：`{a,b}`、`{1..5}`、`{a..e}`（引号内不展开）。
+fn expand_braces(word: &str) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    // 找第一个未保护且含 `,` 或 `..` 的 `{...}`
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == GLOB_ESCAPE {
+            i += 2;
+            continue;
+        }
+        if chars[i] == '{' {
+            // 找匹配的 `}`
+            let mut depth = 1;
+            let mut j = i + 1;
+            let mut parts: Vec<String> = Vec::new();
+            let mut cur = String::new();
+            while j < chars.len() && depth > 0 {
+                let c = chars[j];
+                if c == GLOB_ESCAPE {
+                    cur.push(c);
+                    if j + 1 < chars.len() {
+                        cur.push(chars[j + 1]);
+                    }
+                    j += 2;
+                    continue;
+                }
+                match c {
+                    '{' => {
+                        depth += 1;
+                        cur.push(c);
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            parts.push(cur.clone());
+                            break;
+                        }
+                        cur.push(c);
+                    }
+                    ',' if depth == 1 => {
+                        parts.push(std::mem::take(&mut cur));
+                    }
+                    _ => cur.push(c),
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                // 有逗号或多个部分 -> 展开
+                let expanded_parts: Vec<String> = if parts.len() > 1 {
+                    parts
+                } else {
+                    match expand_range(&parts[0]) {
+                        Some(r) => r,
+                        None => {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                };
+                let before: String = chars[..i].iter().collect();
+                let after: String = chars[j + 1..].iter().collect();
+                let mut out = Vec::new();
+                for p in expanded_parts {
+                    out.extend(expand_braces(&format!("{}{}{}", before, p, after)));
+                }
+                return out;
+            }
+        }
+        i += 1;
+    }
+    vec![word.to_string()]
+}
+
+/// `{1..5}` / `{a..e}` 范围展开。
+fn expand_range(spec: &str) -> Option<Vec<String>> {
+    let (a, b) = spec.split_once("..")?;
+    if let (Ok(x), Ok(y)) = (a.parse::<i64>(), b.parse::<i64>()) {
+        let mut out = Vec::new();
+        let step = if x <= y { 1 } else { -1 };
+        let mut v = x;
+        loop {
+            out.push(v.to_string());
+            if v == y {
+                break;
+            }
+            v += step;
+            if out.len() > 100000 {
+                break;
+            }
+        }
+        return Some(out);
+    }
+    let mut ac = a.chars();
+    let mut bc = b.chars();
+    let (x, y) = (ac.next()?, bc.next()?);
+    if ac.next().is_some() || bc.next().is_some() {
+        return None;
+    }
+    let mut out = Vec::new();
+    let step: i32 = if x <= y { 1 } else { -1 };
+    let mut v = x as i32;
+    loop {
+        out.push(char::from_u32(v as u32)?.to_string());
+        if v == y as i32 {
+            break;
+        }
+        v += step;
+        if out.len() > 100000 {
+            break;
+        }
+    }
+    Some(out)
 }
 
 // ─── 变量展开 ──────────────────────────────────────────
@@ -53,6 +208,10 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if c == NO_SPLIT_ESCAPE || c == SPLIT_ESCAPE {
+            // 引号/分割元数据标记：跳过，展开照常
+            continue;
+        }
         if c == GLOB_ESCAPE {
             // 保护标记：`$` 前的标记表示字面美元（单引号/转义），
             // 其余标记保留给 expand_glob / unescape_glob
@@ -77,7 +236,7 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                         name.push(nc);
                         chars.next();
                     }
-                    result.push_str(&lookup_var(&name, last_rc));
+                    result.push_str(&expand_braced(&name, last_rc));
                 }
                 Some('?') => {
                     chars.next();
@@ -86,6 +245,10 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                 Some('$') => {
                     chars.next();
                     result.push_str(&std::process::id().to_string());
+                }
+                Some('!') => {
+                    chars.next();
+                    result.push_str(&super::params::last_bg().to_string());
                 }
                 Some('#') => {
                     chars.next();
@@ -155,19 +318,161 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
     result
 }
 
+/// `${...}` 参数展开：支持 `:-` `:=` `:?` `:+`、`${#var}`、`#`/`##`/`%`/`%%` 模式删除、`/`/`//` 替换。
+fn expand_braced(spec: &str, last_rc: i32) -> String {
+    if let Some(name) = spec.strip_prefix('#') {
+        return lookup_var(name, last_rc).chars().count().to_string();
+    }
+    let valid_name = |n: &str| {
+        !n.is_empty()
+            && n.chars().all(|c| {
+                c.is_ascii_alphanumeric()
+                    || c == '_'
+                    || matches!(c, '@' | '*' | '?' | '$' | '!' | '#')
+            })
+    };
+    for op in [":-", ":=", ":?", ":+", "##", "#", "%%", "%", "/"] {
+        if let Some(pos) = spec.find(op) {
+            let name = &spec[..pos];
+            if !valid_name(name) {
+                continue;
+            }
+            let arg = &spec[pos + op.len()..];
+            let val = lookup_var(name, last_rc);
+            match op {
+                ":-" => {
+                    return if val.is_empty() {
+                        expand_vars(arg, last_rc)
+                    } else {
+                        val
+                    };
+                }
+                ":=" => {
+                    return if val.is_empty() {
+                        let v = expand_vars(arg, last_rc);
+                        // SAFETY: shell 单线程
+                        unsafe {
+                            std::env::set_var(name, &v);
+                        }
+                        v
+                    } else {
+                        val
+                    };
+                }
+                ":?" => {
+                    if val.is_empty() {
+                        eprintln!(
+                            "shell: {}: {}",
+                            name,
+                            if arg.is_empty() {
+                                "parameter null or not set"
+                            } else {
+                                arg
+                            }
+                        );
+                        super::options::mark_nounset_violation();
+                    }
+                    return val;
+                }
+                ":+" => {
+                    return if val.is_empty() {
+                        String::new()
+                    } else {
+                        expand_vars(arg, last_rc)
+                    };
+                }
+                "##" => return remove_prefix(&val, &unescape_glob(arg), true),
+                "#" => return remove_prefix(&val, &unescape_glob(arg), false),
+                "%%" => return remove_suffix(&val, &unescape_glob(arg), true),
+                "%" => return remove_suffix(&val, &unescape_glob(arg), false),
+                "/" => {
+                    let (pat, rep, all) = if let Some(rest) = arg.strip_prefix('/') {
+                        let (p, r) = rest.split_once('/').unwrap_or((rest, ""));
+                        (p, r, true)
+                    } else {
+                        let (p, r) = arg.split_once('/').unwrap_or((arg, ""));
+                        (p, r, false)
+                    };
+                    let rep = expand_vars(rep, last_rc);
+                    return if all {
+                        val.replace(pat, &rep)
+                    } else {
+                        val.replacen(pat, &rep, 1)
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+    lookup_var(spec, last_rc)
+}
+
+/// 最短/最长前缀删除（pattern 用 glob 匹配）。
+fn remove_prefix(val: &str, pat: &str, longest: bool) -> String {
+    let mut idxs: Vec<usize> = val.char_indices().map(|(i, _)| i).collect();
+    idxs.push(val.len());
+    let ordered: Vec<usize> = if longest {
+        idxs.into_iter().rev().collect()
+    } else {
+        idxs
+    };
+    for i in ordered {
+        if crate::applets::glob::glob_match(pat, &val[..i]) {
+            return val[i..].to_string();
+        }
+    }
+    val.to_string()
+}
+
+/// 最短/最长后缀删除（pattern 用 glob 匹配）。
+fn remove_suffix(val: &str, pat: &str, longest: bool) -> String {
+    let mut idxs: Vec<usize> = val.char_indices().map(|(i, _)| i).collect();
+    idxs.push(val.len());
+    let ordered: Vec<usize> = if longest {
+        idxs.into_iter().collect()
+    } else {
+        idxs.into_iter().rev().collect()
+    };
+    for i in ordered {
+        if crate::applets::glob::glob_match(pat, &val[i..]) {
+            return val[..i].to_string();
+        }
+    }
+    val.to_string()
+}
+
 fn lookup_var(name: &str, last_rc: i32) -> String {
     match name {
         "?" => return last_rc.to_string(),
         "$" => return std::process::id().to_string(),
+        "!" => return super::params::last_bg().to_string(),
         "#" => return super::params::count().to_string(),
         "@" | "*" => return super::params::all().join(" "),
-        "0" => return "sh".to_string(),
+        "0" => return super::params::get0(),
         _ => {}
     }
     if let Ok(n) = name.parse::<usize>() {
-        return super::params::get(n.saturating_sub(1)).unwrap_or_default();
+        return match super::params::get(n.saturating_sub(1)) {
+            Some(v) => v,
+            None => {
+                if super::options::nounset() {
+                    eprintln!("shell: ${}: unbound variable", name);
+                    super::options::mark_nounset_violation();
+                }
+                String::new()
+            }
+        };
     }
-    std::env::var(name).unwrap_or_default()
+    match std::env::var(name) {
+        Ok(v) => v,
+        Err(_) => {
+            if super::options::nounset() {
+                eprintln!("shell: {}: unbound variable", name);
+                super::options::mark_nounset_violation();
+            }
+            String::new()
+        }
+    }
 }
 
 // ─── 算术展开 $((...)) ─────────────────────────────────
@@ -208,8 +513,143 @@ impl ArithParser<'_> {
         self.s.get(self.pos).copied()
     }
 
-    /// expr := term (('+'|'-') term)*
+    /// expr := assignment | logical_or
     fn expr(&mut self) -> Option<i64> {
+        self.assignment()
+    }
+
+    /// assignment := IDENT ('='|'+='|'-='|'*='|'/'|'%=') assignment
+    fn assignment(&mut self) -> Option<i64> {
+        let save = self.pos;
+        self.ws();
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        let name_end = self.pos;
+        self.ws();
+        let op = if self.peek() == Some(b'=') && self.s.get(self.pos + 1) != Some(&b'=') {
+            Some('=')
+        } else if matches!(self.peek(), Some(b'+' | b'-' | b'*' | b'/' | b'%'))
+            && self.s.get(self.pos + 1) == Some(&b'=')
+        {
+            self.s.get(self.pos).map(|b| *b as char)
+        } else {
+            None
+        };
+        if name_end > start
+            && let Some(op) = op
+            && let Ok(name) = std::str::from_utf8(&self.s[start..name_end])
+        {
+            let name = name.to_string();
+            self.pos += if op == '=' { 1 } else { 2 };
+            let rhs = self.assignment()?;
+            let cur = std::env::var(&name)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let val = match op {
+                '=' => rhs,
+                '+' => cur.checked_add(rhs)?,
+                '-' => cur.checked_sub(rhs)?,
+                '*' => cur.checked_mul(rhs)?,
+                '/' => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    cur / rhs
+                }
+                '%' => {
+                    if rhs == 0 {
+                        return None;
+                    }
+                    cur % rhs
+                }
+                _ => rhs,
+            };
+            // SAFETY: shell 单线程
+            unsafe {
+                std::env::set_var(&name, val.to_string());
+            }
+            return Some(val);
+        }
+        self.pos = save;
+        self.logical_or()
+    }
+
+    /// logical_or := logical_and ('||' logical_and)*
+    fn logical_or(&mut self) -> Option<i64> {
+        let mut v = self.logical_and()?;
+        loop {
+            self.ws();
+            if self.s.get(self.pos..self.pos + 2) == Some(b"||") {
+                self.pos += 2;
+                let r = self.logical_and()?;
+                v = ((v != 0) || (r != 0)) as i64;
+            } else {
+                break;
+            }
+        }
+        Some(v)
+    }
+
+    /// logical_and := cmp ('&&' cmp)*
+    fn logical_and(&mut self) -> Option<i64> {
+        let mut v = self.cmp()?;
+        loop {
+            self.ws();
+            if self.s.get(self.pos..self.pos + 2) == Some(b"&&") {
+                self.pos += 2;
+                let r = self.cmp()?;
+                v = ((v != 0) && (r != 0)) as i64;
+            } else {
+                break;
+            }
+        }
+        Some(v)
+    }
+
+    /// cmp := add (('=='|'!='|'<='|'>='|'<'|'>') add)*
+    fn cmp(&mut self) -> Option<i64> {
+        let mut v = self.add()?;
+        loop {
+            self.ws();
+            let (op, len) = if self.s.get(self.pos..self.pos + 2) == Some(b"==") {
+                ("==", 2)
+            } else if self.s.get(self.pos..self.pos + 2) == Some(b"!=") {
+                ("!=", 2)
+            } else if self.s.get(self.pos..self.pos + 2) == Some(b"<=") {
+                ("<=", 2)
+            } else if self.s.get(self.pos..self.pos + 2) == Some(b">=") {
+                (">=", 2)
+            } else if self.peek() == Some(b'<') {
+                ("<", 1)
+            } else if self.peek() == Some(b'>') {
+                (">", 1)
+            } else {
+                break;
+            };
+            self.pos += len;
+            let r = self.add()?;
+            v = match op {
+                "==" => (v == r) as i64,
+                "!=" => (v != r) as i64,
+                "<=" => (v <= r) as i64,
+                ">=" => (v >= r) as i64,
+                "<" => (v < r) as i64,
+                ">" => (v > r) as i64,
+                _ => 0,
+            };
+        }
+        Some(v)
+    }
+
+    /// add := term (('+'|'-') term)*
+    fn add(&mut self) -> Option<i64> {
         let mut v = self.term()?;
         loop {
             self.ws();
@@ -260,7 +700,7 @@ impl ArithParser<'_> {
         Some(v)
     }
 
-    /// factor := ('+'|'-')? primary
+    /// factor := ('+'|'-'|'!')? primary
     fn factor(&mut self) -> Option<i64> {
         self.ws();
         match self.peek() {
@@ -271,6 +711,10 @@ impl ArithParser<'_> {
             Some(b'+') => {
                 self.pos += 1;
                 self.factor()
+            }
+            Some(b'!') if self.s.get(self.pos + 1) != Some(&b'=') => {
+                self.pos += 1;
+                Some((self.factor()? == 0) as i64)
             }
             _ => self.primary(),
         }
@@ -425,6 +869,10 @@ pub fn expand_tilde(s: &str) -> String {
 fn has_active_glob(s: &str) -> bool {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
+        if c == NO_SPLIT_ESCAPE || c == SPLIT_ESCAPE {
+            // 引号/分割元数据标记：跳过，展开照常
+            continue;
+        }
         if c == GLOB_ESCAPE {
             chars.next(); // 跳过被保护的字符
             continue;
@@ -441,6 +889,10 @@ pub fn unescape_glob(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
+        if c == NO_SPLIT_ESCAPE || c == SPLIT_ESCAPE {
+            // 引号/分割元数据标记：跳过，展开照常
+            continue;
+        }
         if c == GLOB_ESCAPE {
             if let Some(next) = chars.next() {
                 out.push(next);
@@ -967,6 +1419,121 @@ mod tests {
         let history = vec!["echo a".to_string()];
         // !x -> unknown, literal !
         assert_eq!(expand_history("!x", &history), "!x");
+    }
+
+    // ─── 参数展开运算符 ────────────────────────
+
+    #[test]
+    fn param_default_and_alternate() {
+        unsafe { std::env::remove_var("RBOX_P_EMPTY") };
+        unsafe { std::env::set_var("RBOX_P_SET", "val") };
+        assert_eq!(expand_vars("${RBOX_P_EMPTY:-def}", 0), "def");
+        assert_eq!(expand_vars("${RBOX_P_SET:-def}", 0), "val");
+        assert_eq!(expand_vars("${RBOX_P_SET:+alt}", 0), "alt");
+        assert_eq!(expand_vars("${RBOX_P_EMPTY:+alt}", 0), "");
+        assert_eq!(expand_vars("${RBOX_P_EMPTY:=assigned}", 0), "assigned");
+        assert_eq!(std::env::var("RBOX_P_EMPTY").unwrap(), "assigned");
+        unsafe { std::env::remove_var("RBOX_P_EMPTY") };
+        unsafe { std::env::remove_var("RBOX_P_SET") };
+    }
+
+    #[test]
+    fn param_length_and_question() {
+        unsafe { std::env::set_var("RBOX_P_LEN", "hello") };
+        assert_eq!(expand_vars("${#RBOX_P_LEN}", 0), "5");
+        unsafe { std::env::remove_var("RBOX_P_LEN") };
+        let _ = crate::applets::core::shell::options::take_nounset_violation();
+        assert_eq!(expand_vars("${RBOX_P_MISSING:?boom}", 0), "");
+        assert!(crate::applets::core::shell::options::take_nounset_violation());
+    }
+
+    #[test]
+    fn param_prefix_suffix_removal() {
+        unsafe { std::env::set_var("RBOX_P_PATH", "/usr/local/bin/file.txt") };
+        assert_eq!(
+            expand_vars("${RBOX_P_PATH#*/}", 0),
+            "usr/local/bin/file.txt"
+        );
+        assert_eq!(expand_vars("${RBOX_P_PATH##*/}", 0), "file.txt");
+        assert_eq!(expand_vars("${RBOX_P_PATH%/*}", 0), "/usr/local/bin");
+        assert_eq!(expand_vars("${RBOX_P_PATH%%/*}", 0), "");
+        unsafe { std::env::remove_var("RBOX_P_PATH") };
+    }
+
+    #[test]
+    fn param_pattern_with_quoted_star() {
+        unsafe { std::env::set_var("RBOX_P_Q", "/a/b/c.txt") };
+        // 模式中的 * 带引号保护标记（如 "${p##*/}"），应仍按 glob 匹配
+        let pat = format!("{}*/", GLOB_ESCAPE);
+        assert_eq!(expand_braced(&format!("RBOX_P_Q##{}", pat), 0), "c.txt");
+        let pat2 = format!("/{}*", GLOB_ESCAPE);
+        assert_eq!(expand_braced(&format!("RBOX_P_Q%{}", pat2), 0), "/a/b");
+        unsafe { std::env::remove_var("RBOX_P_Q") };
+    }
+
+    #[test]
+    fn param_replacement() {
+        unsafe { std::env::set_var("RBOX_P_REP", "a-b-c") };
+        assert_eq!(expand_vars("${RBOX_P_REP/-/_}", 0), "a_b-c");
+        assert_eq!(expand_vars("${RBOX_P_REP//-/_}", 0), "a_b_c");
+        unsafe { std::env::remove_var("RBOX_P_REP") };
+    }
+
+    // ─── 词分割与 "$@" ─────────────────────────
+
+    #[test]
+    fn word_splitting_unquoted() {
+        unsafe { std::env::set_var("RBOX_SPLIT", "a b  c") };
+        let words = expand_word(&format!("{}$RBOX_SPLIT", SPLIT_ESCAPE), 0);
+        assert_eq!(words, vec!["a", "b", "c"]);
+        unsafe { std::env::remove_var("RBOX_SPLIT") };
+    }
+
+    #[test]
+    fn quoted_expansion_not_split() {
+        unsafe { std::env::set_var("RBOX_SPLIT", "a b") };
+        let words = expand_word(&format!("{}${}", NO_SPLIT_ESCAPE, "RBOX_SPLIT"), 0);
+        assert_eq!(words, vec!["a b"]);
+        unsafe { std::env::remove_var("RBOX_SPLIT") };
+    }
+
+    #[test]
+    fn quoted_at_expands_multiple_words() {
+        super::super::params::set(vec!["one".into(), "two three".into()]);
+        let words = expand_word(&format!("{}$@", NO_SPLIT_ESCAPE), 0);
+        assert_eq!(words, vec!["one", "two three"]);
+        super::super::params::set(Vec::new());
+    }
+
+    // ─── 花括号展开 ────────────────────────────
+
+    #[test]
+    fn brace_expansion_list_and_range() {
+        assert_eq!(expand_word("a{b,c}d", 0), vec!["abd", "acd"]);
+        assert_eq!(expand_word("{1..3}", 0), vec!["1", "2", "3"]);
+        assert_eq!(expand_word("x{a..c}", 0), vec!["xa", "xb", "xc"]);
+        assert_eq!(expand_word("{3..1}", 0), vec!["3", "2", "1"]);
+        // 无逗号/范围：原样
+        assert_eq!(expand_word("{abc}", 0), vec!["{abc}"]);
+        // 引号保护的花括号不展开
+        let protected = format!("a{}{{b,c}}", GLOB_ESCAPE);
+        assert_eq!(expand_word(&protected, 0), vec!["a{b,c}"]);
+    }
+
+    // ─── 算术增强 ──────────────────────────────
+
+    #[test]
+    fn arithmetic_assignment_and_compare() {
+        unsafe { std::env::set_var("RBOX_A", "5") };
+        assert_eq!(eval_arith("RBOX_A + 3"), Some(8));
+        assert_eq!(eval_arith("RBOX_A = 7"), Some(7));
+        assert_eq!(std::env::var("RBOX_A").unwrap(), "7");
+        assert_eq!(eval_arith("RBOX_A += 2"), Some(9));
+        assert_eq!(eval_arith("RBOX_A == 9"), Some(1));
+        assert_eq!(eval_arith("RBOX_A > 100"), Some(0));
+        assert_eq!(eval_arith("RBOX_A < 100 && RBOX_A > 0"), Some(1));
+        assert_eq!(eval_arith("!(RBOX_A == 0)"), Some(1));
+        unsafe { std::env::remove_var("RBOX_A") };
     }
 
     // ─── expand_tilde 边界 ────────────────────

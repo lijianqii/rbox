@@ -12,6 +12,7 @@ use super::jobs;
 use super::parser::build_command_list;
 use super::tokenizer::tokenize;
 use super::types::*;
+use super::{compound, functions, params, script};
 use std::collections::VecDeque;
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -34,6 +35,9 @@ fn open_redirect(path: &str, append: bool) -> Option<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     let result = if append {
         opts.create(true).append(true).open(path)
+    } else if crate::applets::core::shell::options::noclobber() {
+        // set -C：不覆盖已存在文件
+        opts.create_new(true).write(true).open(path)
     } else {
         opts.create(true).write(true).truncate(true).open(path)
     };
@@ -69,10 +73,12 @@ pub fn install_sigint_handler() {
 }
 
 /// 执行一行命令。返回退出码。exit_fn 用于 `exit` 内置命令。
-pub fn execute_line<F>(line: &str, last_rc: &mut i32, history: &[String], exit_fn: F) -> i32
-where
-    F: Fn(i32),
-{
+pub fn execute_line(
+    line: &str,
+    last_rc: &mut i32,
+    history: &[String],
+    exit_fn: &dyn Fn(i32),
+) -> i32 {
     // 历史扩展：!! -> 上一条命令，!n -> 第 n 条，!$ -> 上一条命令的最后一个参数
     let expanded_line = expand_history(line, history);
     // 别名展开（命令位置首词）与命令替换 $(...)
@@ -90,7 +96,7 @@ where
         }
     };
 
-    for seg in &cmd_list.segments {
+    for (seg_idx, seg) in cmd_list.segments.iter().enumerate() {
         match seg.connector {
             Connector::Start | Connector::Sequential => {}
             Connector::AndIf => {
@@ -105,7 +111,7 @@ where
             }
         }
 
-        let expanded = match expand_pipeline(&seg.pipeline, *last_rc) {
+        let mut expanded = match expand_pipeline(&seg.pipeline, *last_rc) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("shell: {}", e);
@@ -118,6 +124,141 @@ where
             continue;
         }
 
+        // 拆分命令前导赋值（VAR=val cmd / 纯赋值 VAR=val）
+        split_assignments(&mut expanded.cmds, *last_rc);
+
+        // nounset 违规：展开阶段发现未定义变量（由脚本驱动决定退出）
+        if crate::applets::core::shell::options::nounset_violation() {
+            *last_rc = 1;
+            continue;
+        }
+
+        // xtrace：打印展开后的命令
+        if crate::applets::core::shell::options::xtrace() {
+            let mut parts: Vec<String> = expanded.cmds[0]
+                .env
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            parts.extend(expanded.cmds[0].argv.iter().cloned());
+            let ps4 = std::env::var("PS4").unwrap_or_else(|_| "+ ".to_string());
+            eprintln!("{}{}", ps4, parts.join(" "));
+        }
+
+        // 函数调用：函数优先于内置与外部命令
+        if expanded.cmds.len() == 1
+            && !expanded.background
+            && let Some(name) = expanded.cmds[0].argv.first()
+            && functions::is_function(name)
+        {
+            let fargs: Vec<String> = expanded.cmds[0].argv[1..].to_vec();
+            if let Some(rc) = functions::call(name, &fargs, history, &exit_fn) {
+                *last_rc = rc;
+                if let Some(f) = compound::take_flow() {
+                    return f;
+                }
+                continue;
+            }
+        }
+
+        // `eval` / `command` / `source` 需要递归执行，特殊处理（不进入内置分发）
+        if expanded.cmds.len() == 1 && !expanded.background {
+            let argv0 = expanded.cmds[0]
+                .argv
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
+            if argv0 == "source" || argv0 == "." {
+                let Some(path) = expanded.cmds[0].argv.get(1) else {
+                    eprintln!("source: filename argument required");
+                    *last_rc = 2;
+                    continue;
+                };
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("source: {}: {}", path, e);
+                        *last_rc = 1;
+                        continue;
+                    }
+                };
+                let with_args = expanded.cmds[0].argv.len() > 2;
+                let saved = params::all();
+                if with_args {
+                    params::set(expanded.cmds[0].argv[2..].to_vec());
+                }
+                *last_rc = script::run_source(&content, history, &exit_fn, false);
+                if with_args {
+                    params::set(saved);
+                }
+                continue;
+            }
+            if argv0 == "eval" {
+                let script = expanded.cmds[0].argv[1..].join(" ");
+                if !script.trim().is_empty() {
+                    *last_rc = execute_line(&script, last_rc, history, exit_fn);
+                } else {
+                    *last_rc = 0;
+                }
+                if crate::applets::core::shell::options::return_requested() {
+                    return *last_rc;
+                }
+                continue;
+            }
+            if argv0 == "command" {
+                let args = &expanded.cmds[0].argv[1..];
+                if args.is_empty() {
+                    *last_rc = 0;
+                    continue;
+                }
+                if args[0] == "-v" || args[0] == "-V" {
+                    let verbose = args[0] == "-V";
+                    let mut rc = 0;
+                    for name in &args[1..] {
+                        match command_path(name) {
+                            Some(p) => {
+                                if verbose {
+                                    println!("{} is {}", name, p);
+                                } else {
+                                    println!("{}", p);
+                                }
+                            }
+                            None => {
+                                if verbose {
+                                    println!("{}: not found", name);
+                                }
+                                rc = 1;
+                            }
+                        }
+                    }
+                    *last_rc = rc;
+                    continue;
+                }
+                let script = args.join(" ");
+                *last_rc = execute_line(&script, last_rc, history, exit_fn);
+                if crate::applets::core::shell::options::return_requested() {
+                    return *last_rc;
+                }
+                continue;
+            }
+        }
+
+        // 纯赋值（无命令）：写入 shell 环境，退出码 0
+        if expanded.cmds.len() == 1
+            && !expanded.background
+            && expanded.cmds[0].argv.is_empty()
+            && !expanded.cmds[0].env.is_empty()
+        {
+            for (k, v) in &expanded.cmds[0].env {
+                // SAFETY: shell 单线程
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
+            *last_rc = 0;
+            continue;
+        }
+
         if expanded.cmds.len() == 1 && !expanded.background {
             // 内置命令：应用重定向（pwd > file 等），与外部命令行为一致
             let argv0 = expanded.cmds[0]
@@ -125,6 +266,13 @@ where
                 .first()
                 .map(String::as_str)
                 .unwrap_or("");
+            // 内置命令的 VAR=val 前缀：临时写入环境
+            for (k, v) in &expanded.cmds[0].env {
+                // SAFETY: shell 单线程
+                unsafe {
+                    std::env::set_var(k, v);
+                }
+            }
             if is_builtin(argv0) {
                 match apply_builtin_redirects(&expanded.cmds[0]) {
                     Err(code) => {
@@ -136,6 +284,9 @@ where
                             exit_fn(*last_rc);
                         }
                         BuiltinResult::Done => {
+                            if let Some(f) = compound::take_flow() {
+                                return f;
+                            }
                             continue;
                         }
                         BuiltinResult::NotBuiltin => {}
@@ -145,6 +296,26 @@ where
         }
 
         *last_rc = execute_pipeline(&expanded, line);
+        // return 请求：向上传播（source/函数帧消费）
+        if crate::applets::core::shell::options::return_requested() {
+            return *last_rc;
+        }
+        // break/continue 内置在特殊路径（eval/command/source）中触发的哨兵
+        if let Some(f) = compound::take_flow() {
+            return f;
+        }
+        // -e：非条件链段失败即请求退出（&&/|| 链豁免）
+        if crate::applets::core::shell::options::errexit() && *last_rc != 0 {
+            let next_cond = matches!(
+                cmd_list.segments.get(seg_idx + 1).map(|s| s.connector),
+                Some(Connector::AndIf) | Some(Connector::OrIf)
+            );
+            let cur_cond = matches!(seg.connector, Connector::AndIf | Connector::OrIf);
+            if !next_cond && !cur_cond {
+                crate::applets::core::shell::options::request_exit(*last_rc);
+                return *last_rc;
+            }
+        }
     }
 
     *last_rc
@@ -157,6 +328,8 @@ struct BuiltinRedirectGuard {
     saved_err: Option<i32>,
     /// (保存的 fd, 被复制的目标 fd)：恢复时 dup2(saved, from)。
     saved_dups: Vec<(i32, i32)>,
+    /// 被关闭的 fd（恢复时 dup2(saved, fd)）。
+    saved_closes: Vec<(i32, i32)>,
 }
 
 impl Drop for BuiltinRedirectGuard {
@@ -165,12 +338,35 @@ impl Drop for BuiltinRedirectGuard {
         // 先把 Rust 侧缓冲写出，再恢复 fd，避免输出落到错误的目标
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
+        // `exec` 无参数时要求永久重定向：关闭保存的 fd 但不恢复
+        if PERSIST_REDIRECTS.swap(false, Ordering::SeqCst) {
+            unsafe {
+                for (saved, _) in self.saved_dups.drain(..) {
+                    libc::close(saved);
+                }
+                if let Some(fd) = self.saved_out.take() {
+                    libc::close(fd);
+                }
+                if let Some(fd) = self.saved_err.take() {
+                    libc::close(fd);
+                }
+                if let Some(fd) = self.saved_in.take() {
+                    libc::close(fd);
+                }
+            }
+            return;
+        }
         unsafe {
             for (saved, from) in self.saved_dups.iter().rev() {
                 libc::dup2(*saved, *from);
                 libc::close(*saved);
             }
             self.saved_dups.clear();
+            for (saved, fd) in self.saved_closes.iter().rev() {
+                libc::dup2(*saved, *fd);
+                libc::close(*saved);
+            }
+            self.saved_closes.clear();
             if let Some(fd) = self.saved_out.take() {
                 libc::dup2(fd, libc::STDOUT_FILENO);
                 libc::close(fd);
@@ -187,6 +383,14 @@ impl Drop for BuiltinRedirectGuard {
     }
 }
 
+/// `exec` 无参数时置位：让内置重定向 guard 不恢复（永久重定向）。
+static PERSIST_REDIRECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 请求持久化内置重定向（供 `exec` 使用）。
+pub(crate) fn persist_builtin_redirects() {
+    PERSIST_REDIRECTS.store(true, Ordering::SeqCst);
+}
+
 /// 为内置命令应用重定向：先把所有目标文件打开成功，再用 `dup2` 临时替换
 /// 标准流（单线程时刻执行，无并发读取）；失败返回错误码，不修改任何 fd。
 /// 返回的 guard 在 Drop 时恢复原始标准流。
@@ -195,6 +399,7 @@ fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuar
         && cmd.stdout_file.is_none()
         && cmd.stderr_file.is_none()
         && cmd.dup_fds.is_empty()
+        && cmd.close_fds.is_empty()
     {
         return Ok(None);
     }
@@ -232,6 +437,7 @@ fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuar
         saved_out: None,
         saved_err: None,
         saved_dups: Vec::new(),
+        saved_closes: Vec::new(),
     };
     unsafe {
         if let Some(f) = in_file {
@@ -254,6 +460,16 @@ fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuar
             let saved = libc::dup(libc::STDERR_FILENO);
             if saved >= 0 && libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO) >= 0 {
                 guard.saved_err = Some(saved);
+            } else if saved >= 0 {
+                libc::close(saved);
+            }
+        }
+        // 关闭 fd（`N>&-`）
+        for fd in &cmd.close_fds {
+            let fd = *fd as i32;
+            let saved = libc::dup(fd);
+            if saved >= 0 && libc::close(fd) == 0 {
+                guard.saved_closes.push((saved, fd));
             } else if saved >= 0 {
                 libc::close(saved);
             }
@@ -390,6 +606,13 @@ fn find_subst_end(line: &str, start: usize) -> Option<(String, usize)> {
 /// 仅支持外部命令/管道（内置命令需经 rbox applet 兼容路径）。
 pub fn capture_output(line: &str) -> Option<String> {
     let tokens = tokenize(line);
+    // `$(<file)`：读取文件内容（POSIX 特例）
+    if tokens.len() == 2
+        && matches!(tokens[0], Token::RedirIn)
+        && let Token::Word(f) = &tokens[1]
+    {
+        return std::fs::read_to_string(f).ok();
+    }
     let cmd_list = build_command_list(&tokens).ok()?;
     let mut last_rc = 0;
     let mut output = String::new();
@@ -423,16 +646,33 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
         let mut command = Command::new(program);
         command.args(&extra_args);
         command.args(&cmd.argv[1..]);
+        command.envs(cmd.env.iter().cloned());
 
-        let dups = cmd.dup_fds.clone();
-        if !dups.is_empty() {
+        let mut dups = cmd.dup_fds.clone();
+        if cmd.stderr_to_pipe {
+            dups.push((2, 1));
+        }
+        let closes = cmd.close_fds.clone();
+        if !dups.is_empty() || !closes.is_empty() {
             unsafe {
                 command.pre_exec(move || {
                     for (from, to) in &dups {
                         libc::dup2(*to as i32, *from as i32);
                     }
+                    for fd in &closes {
+                        libc::close(*fd as i32);
+                    }
                     Ok(())
                 });
+            }
+        }
+        if let Some(ref hs) = cmd.here_string {
+            let seq = HERESTR_SEQ.fetch_add(1, Ordering::SeqCst);
+            let path = format!("/tmp/rbox_herestr_{}_{}", std::process::id(), seq);
+            if std::fs::write(&path, format!("{}\n", hs)).is_ok()
+                && let Ok(file) = std::fs::File::open(&path)
+            {
+                command.stdin(Stdio::from(file));
             }
         }
 
@@ -574,6 +814,34 @@ fn wait_child_pid(pid: i32) -> (i32, bool) {
     }
 }
 
+/// 拆分命令前导赋值：`VAR=val cmd` -> env + argv；纯赋值时 argv 为空。
+/// 值会先做变量展开（与 bash 一致）。
+fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) {
+    for cmd in cmds.iter_mut() {
+        let mut assigns: Vec<(String, String)> = Vec::new();
+        while let Some(first) = cmd.argv.first() {
+            let Some((k, v)) = first.split_once('=') else {
+                break;
+            };
+            let valid = !k.is_empty()
+                && (k
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_'))
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                break;
+            }
+            let val = crate::applets::core::shell::expander::expand_vars(v, last_rc);
+            assigns.push((k.to_string(), val));
+            cmd.argv.remove(0);
+        }
+        if !assigns.is_empty() {
+            cmd.env = assigns;
+        }
+    }
+}
+
 /// 执行一条管道（可能含多条 SimpleCmd）。`cmdline` 为原始命令行（作业控制显示用）。
 fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
     if pipeline.cmds.is_empty() {
@@ -595,13 +863,19 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
         let mut command = Command::new(program);
         command.args(&extra_args);
         command.args(&cmd.argv[1..]);
+        // 命令级环境变量（VAR=val cmd）
+        command.envs(cmd.env.iter().cloned());
 
         // 所有子进程放入独立进程组（前后台统一）：
         // - 前台：便于 Ctrl-C/Ctrl-Z 按组转发信号；
         // - 后台：作业控制需要独立 pgid（fg/bg 按组 SIGCONT）。
         // `N>&M` 描述符复制在 stdio 设置完成后（pre_exec）应用，
         // 保证 `> file 2>&1` 中 stderr 指向已打开的文件。
-        let dups = cmd.dup_fds.clone();
+        let mut dups = cmd.dup_fds.clone();
+        if cmd.stderr_to_pipe {
+            dups.push((2, 1));
+        }
+        let closes = cmd.close_fds.clone();
         #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
@@ -612,8 +886,22 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
                 for (from, to) in &dups {
                     libc::dup2(*to as i32, *from as i32);
                 }
+                for fd in &closes {
+                    libc::close(*fd as i32);
+                }
                 Ok(())
             });
+        }
+
+        // here-string：写入临时文件作为 stdin
+        if let Some(ref hs) = cmd.here_string {
+            let seq = HERESTR_SEQ.fetch_add(1, Ordering::SeqCst);
+            let path = format!("/tmp/rbox_herestr_{}_{}", std::process::id(), seq);
+            if std::fs::write(&path, format!("{}\n", hs)).is_ok()
+                && let Ok(file) = std::fs::File::open(&path)
+            {
+                command.stdin(Stdio::from(file));
+            }
         }
 
         // stdin
@@ -674,6 +962,7 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
     if pipeline.background {
         if let Some(first) = children.first() {
             let pgid = first.id() as i32;
+            params::set_last_bg(pgid);
             let id = jobs::add_job(pgid, cmdline, jobs::JobState::Running);
             if id > 0 {
                 println!("[{}] {}", id, pgid);
@@ -682,10 +971,11 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
         return 0;
     }
 
-    // 设置前台进程组：用第一个子进程的 pid 作为 pgid
+    // 设置前台进程组：用第一个子进程的 pid 作为 pgid，并把终端前台组交给它
     if let Some(first) = children.first() {
         let pgid = first.id() as i32;
         FOREGROUND_PGID.store(pgid, Ordering::Relaxed);
+        tcsetpgrp_to(pgid);
     }
 
     // 前台等待期间：
@@ -745,10 +1035,14 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
 
     // 等待所有子进程，返回最后一个的退出码；检测到挂起则登记作业
     let mut last_code = 0;
+    let mut pipefail_code: Option<i32> = None;
     for child in &mut children {
         let pid = child.id() as i32;
         let (code, stopped) = wait_child_pid(pid);
         last_code = code;
+        if code != 0 {
+            pipefail_code = Some(code);
+        }
         if stopped {
             let id = jobs::add_job(pid, cmdline, jobs::JobState::Stopped);
             if id > 0 {
@@ -763,24 +1057,26 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
     let _ = monitor.join();
 
     // 收割等待期间累积的后台僵尸（SIGCHLD 被屏蔽，处理器未执行）
-    unsafe {
-        loop {
-            let pid = libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG);
-            if pid <= 0 {
-                break;
-            }
-        }
-    }
+    // 记录退出状态供 wait/jobs 使用
+    jobs::reap_children();
 
     // SIGCHLD 由 SigchldGuard 在函数返回时恢复
 
-    // 清除前台进程组标记
+    // 清除前台进程组标记，终端前台组归还 shell
     FOREGROUND_PGID.store(0, Ordering::Relaxed);
+    tcsetpgrp_to(shell_pgid());
 
     // 如果是被 SIGINT 中断的，打印换行使提示符对齐
     if last_code == 130 {
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
         let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+
+    // pipefail：任一管道成员非零时返回最右侧非零状态
+    if crate::applets::core::shell::options::pipefail()
+        && let Some(code) = pipefail_code
+    {
+        last_code = code;
     }
 
     last_code
@@ -815,22 +1111,53 @@ fn cleanup_spawned_children(children: &mut [Child]) {
     }
 }
 
-/// 注册 SIGCHLD 处理器：自动回收后台僵尸子进程。
-/// 前台命令等待期间主线程用 pthread_sigmask 屏蔽 SIGCHLD，此时处理器不执行，
-/// 前台子进程由 `wait_child_pid` 收割，后台僵尸在等待结束后统一回收。
+/// 注册 SIGCHLD 处理器：仅置位标志（async-signal-safe）；
+/// 实际回收由 [`jobs::reap_children`] 在安全点执行并记录退出状态（供 wait/jobs 使用）。
 pub fn install_sigchld_handler() {
-    extern "C" fn handle_sigchld(_sig: i32) {
-        // 非阻塞 waitpid 回收所有已终止的子进程
-        loop {
-            let pid = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
-            if pid <= 0 {
-                break;
+    unsafe {
+        libc::signal(libc::SIGCHLD, jobs::sigchld_handler as *const () as usize);
+    }
+}
+
+/// 终端前台进程组：shell 自身 pgid。
+fn shell_pgid() -> i32 {
+    unsafe { libc::getpgrp() }
+}
+
+/// 把终端前台进程组设为 pgid（非 tty 或失败时忽略）。
+fn tcsetpgrp_to(pgid: i32) {
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return;
+    }
+    unsafe {
+        libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+    }
+}
+
+/// here-string 临时文件序号。
+static HERESTR_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 命令是否存在（PATH 可执行文件或 rbox applet）：返回展示路径。
+pub(crate) fn command_path(name: &str) -> Option<String> {
+    if name.contains('/') {
+        return is_executable(name).then(|| name.to_string());
+    }
+    if let Ok(paths) = std::env::var("PATH") {
+        for dir in paths.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let full = format!("{}/{}", dir, name);
+            if is_executable(&full) {
+                return Some(full);
             }
         }
     }
-    unsafe {
-        libc::signal(libc::SIGCHLD, handle_sigchld as *const () as usize);
+    // rbox 内置 applet
+    if crate::applet::APPLETS.iter().any(|a| a.name() == name) {
+        return Some(format!("rbox applet: {}", name));
     }
+    None
 }
 
 /// 检查路径是否为可执行文件（`X_OK`）。
@@ -846,7 +1173,7 @@ fn is_executable(path: &str) -> bool {
 
 /// 命令查找：含 `/` 按字面路径，否则在 PATH 下查找。
 /// 查找失败时回退到 rbox 内置 applet（`rbox <cmd>`）。
-fn resolve_command(cmd: &str) -> (String, Vec<String>) {
+pub(crate) fn resolve_command(cmd: &str) -> (String, Vec<String>) {
     if cmd.contains('/') {
         return (cmd.to_string(), Vec::new());
     }

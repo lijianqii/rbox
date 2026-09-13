@@ -1,9 +1,7 @@
 //! 内置命令：cd、exit、export、unset、pwd、history。
 
-use super::alias;
-use super::jobs;
-use super::params;
 use super::types::SimpleCmd;
+use super::{alias, functions, jobs, options, params, trap};
 
 /// 内置命令执行结果。
 pub enum BuiltinResult {
@@ -34,6 +32,19 @@ pub fn is_builtin(name: &str) -> bool {
             | "read"
             | "set"
             | "shift"
+            | "exec"
+            | "wait"
+            | "disown"
+            | "return"
+            | "trap"
+            | "type"
+            | "hash"
+            | "umask"
+            | "let"
+            | "times"
+            | "local"
+            | "break"
+            | "continue"
     )
 }
 
@@ -58,44 +69,85 @@ fn next_input_byte() -> Option<u8> {
     }
 }
 
-/// 从 stdin 读一行（raw 模式下逐字节读，tty 时回显 + 退格）。
-/// 返回 (内容, 是否以换行结束)。
-fn read_line_from_stdin(raw: bool) -> (String, bool) {
+/// `read` 选项。
+#[derive(Debug, Default, Clone)]
+struct ReadOpts {
+    raw: bool,
+    silent: bool,
+    timeout: Option<u64>,
+    max_chars: Option<usize>,
+    delim: u8,
+    prompt: Option<String>,
+}
+
+/// 等待 stdin 可读（带超时）；返回 false 表示超时。
+fn wait_input(timeout: Option<u64>) -> bool {
+    let Some(secs) = timeout else {
+        return true;
+    };
+    let mut fds = [libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    }];
+    let n = unsafe {
+        libc::poll(
+            fds.as_mut_ptr(),
+            1,
+            (secs * 1000).min(i32::MAX as u64) as i32,
+        )
+    };
+    n > 0
+}
+
+/// 从 stdin 读一行（带选项）。返回 (内容, 是否正常结束)。
+fn read_line_from_stdin(opts: &ReadOpts) -> (String, bool) {
     let fd = libc::STDIN_FILENO;
     let tty = unsafe { libc::isatty(fd) } == 1;
+    if let Some(p) = &opts.prompt {
+        let _ = std::io::Write::write_all(&mut std::io::stdout(), p.as_bytes());
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    let echo = tty && !opts.silent;
     let mut bytes: Vec<u8> = Vec::new();
     let mut complete = false;
     while let Some(c) = next_input_byte() {
-        match c {
-            b'\n' => {
-                complete = true;
-                break;
+        if !wait_input(opts.timeout) {
+            break; // 超时：返回已读内容
+        }
+        if c == opts.delim {
+            complete = true;
+            break;
+        }
+        if c == b'\n' || c == b'\r' {
+            complete = true;
+            if echo {
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
             }
-            b'\r' => {
-                complete = true;
-                if tty {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
-                }
-                break;
+            break;
+        }
+        if c == 0x7f || c == 0x08 {
+            if bytes.pop().is_some() && echo {
+                let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x08 \x08");
             }
-            0x7f | 0x08 => {
-                if bytes.pop().is_some() && tty {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x08 \x08");
-                }
-            }
-            c => {
-                bytes.push(c);
-                if tty {
-                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &[c]);
-                }
-            }
+            continue;
+        }
+        bytes.push(c);
+        if echo {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), &[c]);
+        }
+        if let Some(max) = opts.max_chars
+            && bytes.len() >= max
+        {
+            complete = true;
+            break;
         }
     }
-    if tty {
+    if echo {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
     let mut line = String::from_utf8_lossy(&bytes).into_owned();
-    if !raw {
+    if !opts.raw {
         line = unescape_read(&line);
     }
     (line, complete)
@@ -117,7 +169,7 @@ fn unescape_read(s: &str) -> String {
     out
 }
 
-/// 按 IFS 空白拆分并赋值；最后一个变量取剩余部分；无变量时写 REPLY。
+/// 按 IFS 拆分并赋值；最后一个变量取剩余部分；无变量时写 REPLY。
 fn assign_read_vars(line: &str, names: &[String]) {
     if names.is_empty() {
         unsafe {
@@ -125,21 +177,26 @@ fn assign_read_vars(line: &str, names: &[String]) {
         }
         return;
     }
-    let mut rest = line.trim_start_matches([' ', '\t']);
+    let ifs = std::env::var("IFS").unwrap_or_else(|_| " \t\n".to_string());
+    let mut rest = line;
     for (i, name) in names.iter().enumerate() {
+        rest = rest.trim_start_matches(|c| ifs.contains(c));
         if i + 1 == names.len() {
-            let val = rest.trim_end_matches([' ', '\t']);
+            // 最后一个变量取剩余部分（去尾部 IFS，保留内部空白）
+            let val = rest.trim_end_matches(|c| ifs.contains(c));
+            // SAFETY: shell 单线程
             unsafe {
                 std::env::set_var(name, val);
             }
             break;
         }
-        let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+        let end = rest.find(|c| ifs.contains(c)).unwrap_or(rest.len());
         let (field, tail) = rest.split_at(end);
+        // SAFETY: shell 单线程
         unsafe {
             std::env::set_var(name, field);
         }
-        rest = tail.trim_start_matches([' ', '\t']);
+        rest = tail;
     }
 }
 
@@ -164,13 +221,39 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Exit
         }
         "cd" => {
-            let target = cmd
-                .argv
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+            let target = match cmd.argv.get(1).map(String::as_str) {
+                Some("-") => match std::env::var("OLDPWD") {
+                    Ok(p) => {
+                        println!("{}", p);
+                        p
+                    }
+                    Err(_) => {
+                        eprintln!("cd: OLDPWD not set");
+                        *last_rc = 1;
+                        return BuiltinResult::Done;
+                    }
+                },
+                Some(p) => p.to_string(),
+                None => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
+            };
+            let old = std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned());
             match std::env::set_current_dir(&target) {
-                Ok(()) => *last_rc = 0,
+                Ok(()) => {
+                    if let Ok(new) = std::env::current_dir() {
+                        // SAFETY: shell 单线程
+                        unsafe {
+                            std::env::set_var("PWD", new.to_string_lossy().as_ref());
+                        }
+                    }
+                    if let Some(o) = old {
+                        unsafe {
+                            std::env::set_var("OLDPWD", o);
+                        }
+                    }
+                    *last_rc = 0;
+                }
                 Err(e) => {
                     eprintln!("cd: {}: {}", target, e);
                     *last_rc = 1;
@@ -190,6 +273,14 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         }
         "export" => {
             for arg in &cmd.argv[1..] {
+                if arg == "-p" {
+                    let mut vars: Vec<(String, String)> = std::env::vars().collect();
+                    vars.sort();
+                    for (k, v) in vars {
+                        println!("export {}={}", k, v);
+                    }
+                    continue;
+                }
                 if let Some(eq) = arg.find('=') {
                     let (k, v) = arg.split_at(eq);
                     // SAFETY: single-threaded shell
@@ -197,25 +288,60 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                         std::env::set_var(k, &v[1..]);
                     }
                 }
+                // `export VAR`（无 =）：变量已在环境中即为导出，no-op
             }
             *last_rc = 0;
             BuiltinResult::Done
         }
         "unset" => {
+            let mut func_mode = false;
             for arg in &cmd.argv[1..] {
-                // SAFETY: single-threaded shell
-                unsafe {
-                    std::env::remove_var(arg);
+                if arg == "-f" {
+                    func_mode = true;
+                    continue;
+                }
+                if arg == "-v" {
+                    func_mode = false;
+                    continue;
+                }
+                if func_mode {
+                    functions::unset(arg);
+                } else {
+                    // SAFETY: single-threaded shell
+                    unsafe {
+                        std::env::remove_var(arg);
+                    }
                 }
             }
             *last_rc = 0;
             BuiltinResult::Done
         }
         "history" => {
-            for (i, h) in history.iter().enumerate() {
-                println!("  {}  {}", i + 1, h);
+            match cmd.argv.get(1).map(String::as_str) {
+                Some("-c") => {
+                    super::mark_history_clear();
+                    *last_rc = 0;
+                }
+                Some(n) => match n.parse::<usize>() {
+                    Ok(count) => {
+                        let start = history.len().saturating_sub(count);
+                        for (i, h) in history.iter().enumerate().skip(start) {
+                            println!("  {}  {}", i + 1, h);
+                        }
+                        *last_rc = 0;
+                    }
+                    Err(_) => {
+                        eprintln!("history: invalid count: {}", n);
+                        *last_rc = 2;
+                    }
+                },
+                None => {
+                    for (i, h) in history.iter().enumerate() {
+                        println!("  {}  {}", i + 1, h);
+                    }
+                    *last_rc = 0;
+                }
             }
-            *last_rc = 0;
             BuiltinResult::Done
         }
         "alias" => {
@@ -255,7 +381,8 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Done
         }
         "jobs" => {
-            for line in jobs::format_lines() {
+            let show_pid = cmd.argv.iter().skip(1).any(|a| a == "-l");
+            for line in jobs::format_lines(show_pid) {
                 println!("{}", line);
             }
             *last_rc = 0;
@@ -293,15 +420,73 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Done
         }
         "read" => {
-            let raw = cmd.argv.iter().skip(1).any(|a| a == "-r");
-            let names: Vec<String> = cmd.argv[1..]
-                .iter()
-                .filter(|a| !a.starts_with('-'))
-                .cloned()
-                .collect();
-            let (line, complete) = read_line_from_stdin(raw);
+            let mut opts = ReadOpts {
+                delim: b'\n',
+                ..Default::default()
+            };
+            let mut names: Vec<String> = Vec::new();
+            let args = &cmd.argv[1..];
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-r" => opts.raw = true,
+                    "-s" => opts.silent = true,
+                    "-t" => {
+                        i += 1;
+                        match args.get(i).and_then(|v| v.parse::<u64>().ok()) {
+                            Some(secs) => opts.timeout = Some(secs),
+                            None => {
+                                eprintln!("read: invalid timeout");
+                                *last_rc = 2;
+                                return BuiltinResult::Done;
+                            }
+                        }
+                    }
+                    "-n" => {
+                        i += 1;
+                        match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                            Some(n) => opts.max_chars = Some(n),
+                            None => {
+                                eprintln!("read: invalid count");
+                                *last_rc = 2;
+                                return BuiltinResult::Done;
+                            }
+                        }
+                    }
+                    "-d" => {
+                        i += 1;
+                        match args.get(i).and_then(|v| v.as_bytes().first().copied()) {
+                            Some(c) => opts.delim = c,
+                            None => {
+                                eprintln!("read: option -d requires an argument");
+                                *last_rc = 2;
+                                return BuiltinResult::Done;
+                            }
+                        }
+                    }
+                    "-p" => {
+                        i += 1;
+                        match args.get(i) {
+                            Some(p) => opts.prompt = Some(p.clone()),
+                            None => {
+                                eprintln!("read: option -p requires an argument");
+                                *last_rc = 2;
+                                return BuiltinResult::Done;
+                            }
+                        }
+                    }
+                    s if s.starts_with('-') && s.len() > 1 => {
+                        eprintln!("read: unknown option: {}", s);
+                        *last_rc = 2;
+                        return BuiltinResult::Done;
+                    }
+                    s => names.push(s.to_string()),
+                }
+                i += 1;
+            }
+            let (line, complete) = read_line_from_stdin(&opts);
             if !complete && line.is_empty() {
-                *last_rc = 1; // EOF
+                *last_rc = 1; // EOF / 超时
             } else {
                 assign_read_vars(&line, &names);
                 *last_rc = if complete { 0 } else { 1 };
@@ -311,7 +496,9 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         "set" => {
             let rest = &cmd.argv[1..];
             if rest.is_empty() {
-                for (k, v) in std::env::vars() {
+                let mut vars: Vec<(String, String)> = std::env::vars().collect();
+                vars.sort();
+                for (k, v) in vars {
                     println!("{}={}", k, v);
                 }
                 *last_rc = 0;
@@ -319,8 +506,53 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 params::set(rest[1..].to_vec());
                 *last_rc = 0;
             } else {
-                eprintln!("set: only 'set -- args...' is supported");
-                *last_rc = 2;
+                let mut rc = 0;
+                let mut i = 0;
+                while i < rest.len() {
+                    let a = rest[i].as_str();
+                    match a {
+                        "-o" | "+o" => {
+                            i += 1;
+                            let on = a.starts_with('-');
+                            match rest.get(i).map(String::as_str) {
+                                Some("pipefail") => options::set_pipefail(on),
+                                Some(other) => {
+                                    eprintln!("set: unknown option: {}", other);
+                                    rc = 2;
+                                }
+                                None => {
+                                    eprintln!("set: -o requires an argument");
+                                    rc = 2;
+                                }
+                            }
+                        }
+                        _ if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) => {
+                            let on = a.starts_with('-');
+                            for c in a[1..].chars() {
+                                match c {
+                                    'e' => options::set_errexit(on),
+                                    'x' => options::set_xtrace(on),
+                                    'u' => options::set_nounset(on),
+                                    'C' => options::set_noclobber(on),
+                                    other => {
+                                        eprintln!(
+                                            "set: unknown option: {}{}",
+                                            if on { "-" } else { "+" },
+                                            other
+                                        );
+                                        rc = 2;
+                                    }
+                                }
+                            }
+                        }
+                        other => {
+                            eprintln!("set: unknown option: {}", other);
+                            rc = 2;
+                        }
+                    }
+                    i += 1;
+                }
+                *last_rc = rc;
             }
             BuiltinResult::Done
         }
@@ -344,6 +576,231 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             }
             BuiltinResult::Done
         }
+        "exec" => {
+            let args = &cmd.argv[1..];
+            if args.is_empty() {
+                // 仅重定向：请求 guard 不恢复（永久生效）
+                if cmd.stdin_file.is_some()
+                    || cmd.stdout_file.is_some()
+                    || cmd.stderr_file.is_some()
+                    || !cmd.dup_fds.is_empty()
+                {
+                    super::executor::persist_builtin_redirects();
+                }
+                *last_rc = 0;
+                return BuiltinResult::Done;
+            }
+            let (program, extra) = super::executor::resolve_command(&args[0]);
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&program)
+                .args(&extra)
+                .args(&args[1..])
+                .exec();
+            eprintln!("exec: {}: {}", args[0], err);
+            *last_rc = 127;
+            options::request_exit(127);
+            BuiltinResult::Done
+        }
+        "wait" => {
+            jobs::reap_children();
+            let specs: Vec<String> = cmd.argv[1..].to_vec();
+            if specs.is_empty() {
+                *last_rc = jobs::wait_all();
+            } else {
+                let mut rc = 0;
+                for s in &specs {
+                    if s.starts_with('%') {
+                        match jobs::find(Some(s)) {
+                            Some(job) => rc = jobs::wait_pgid(job.pgid),
+                            None => {
+                                eprintln!("wait: {}: no such job", s);
+                                rc = 127;
+                            }
+                        }
+                    } else if let Ok(pid) = s.parse::<i32>() {
+                        rc = jobs::wait_pid(pid);
+                    } else {
+                        eprintln!("wait: {}: not a pid or job", s);
+                        rc = 1;
+                    }
+                }
+                *last_rc = rc;
+            }
+            BuiltinResult::Done
+        }
+        "disown" => {
+            let args = &cmd.argv[1..];
+            let mut rc = 0;
+            if args.is_empty() {
+                if !jobs::disown(None) {
+                    rc = 1;
+                }
+            } else {
+                for s in args {
+                    if s == "-a" || s == "--all" {
+                        while jobs::disown(None) {}
+                    } else if !jobs::disown(Some(s)) {
+                        eprintln!("disown: {}: no such job", s);
+                        rc = 1;
+                    }
+                }
+            }
+            *last_rc = rc;
+            BuiltinResult::Done
+        }
+        "return" => {
+            let code = cmd
+                .argv
+                .get(1)
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(*last_rc)
+                & 0xff;
+            *last_rc = code;
+            options::request_return(code);
+            BuiltinResult::Done
+        }
+        "trap" => {
+            let args = &cmd.argv[1..];
+            if args.is_empty() {
+                for (sig, c) in trap::list() {
+                    println!("trap -- '{}' {}", c, trap::signal_name(sig));
+                }
+                *last_rc = 0;
+            } else if args[0] == "-l" {
+                let names: Vec<String> = crate::applets::sys::kill::signal_names()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                println!("{}", names.join(" "));
+                *last_rc = 0;
+            } else {
+                let cmdline = args[0].clone();
+                let mut rc = 0;
+                for sig_name in &args[1..] {
+                    match trap::signal_number(sig_name) {
+                        Some(n) => {
+                            if cmdline == "-" {
+                                trap::clear(n);
+                            } else {
+                                trap::set(n, &cmdline);
+                                if n != 0 {
+                                    trap::install_handlers();
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("trap: {}: invalid signal specification", sig_name);
+                            rc = 1;
+                        }
+                    }
+                }
+                *last_rc = rc;
+            }
+            BuiltinResult::Done
+        }
+        "type" => {
+            let mut rc = 0;
+            for name in &cmd.argv[1..] {
+                if let Some(v) = alias::get_alias(name) {
+                    println!("{} is aliased to `{}'", name, v);
+                } else if is_builtin(name) {
+                    println!("{} is a shell builtin", name);
+                } else if functions::is_function(name) {
+                    println!("{} is a function", name);
+                } else if let Some(p) = super::executor::command_path(name) {
+                    println!("{} is {}", name, p);
+                } else {
+                    println!("{}: not found", name);
+                    rc = 1;
+                }
+            }
+            *last_rc = rc;
+            BuiltinResult::Done
+        }
+        "hash" => {
+            // 未实现命令哈希缓存：-r 清空为空操作
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "umask" => {
+            let old = unsafe { libc::umask(0) };
+            unsafe { libc::umask(old) };
+            if let Some(m) = cmd.argv.get(1) {
+                match u32::from_str_radix(m, 8) {
+                    Ok(v) => {
+                        unsafe { libc::umask(v) };
+                        *last_rc = 0;
+                    }
+                    Err(_) => {
+                        eprintln!("umask: invalid mode: {}", m);
+                        *last_rc = 1;
+                    }
+                }
+            } else {
+                println!("{:04o}", old);
+                *last_rc = 0;
+            }
+            BuiltinResult::Done
+        }
+        "let" => {
+            let mut rc = 0;
+            for expr in &cmd.argv[1..] {
+                rc = if super::expander::eval_arith(expr).unwrap_or(0) != 0 {
+                    0
+                } else {
+                    1
+                };
+            }
+            *last_rc = rc;
+            BuiltinResult::Done
+        }
+        "times" => {
+            let mut t: libc::tms = unsafe { std::mem::zeroed() };
+            unsafe { libc::times(&mut t) };
+            let clk = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+            let f = |v: libc::clock_t| format!("{:.3}", v as f64 / clk);
+            println!("{} {}", f(t.tms_utime), f(t.tms_stime));
+            println!("{} {}", f(t.tms_cutime), f(t.tms_cstime));
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "break" => {
+            let n = cmd
+                .argv
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            super::compound::request_break(n);
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "continue" => {
+            let n = cmd
+                .argv
+                .get(1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            super::compound::request_continue(n);
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "local" => {
+            for arg in &cmd.argv[1..] {
+                let (k, v) = match arg.split_once('=') {
+                    Some((k, v)) => (k, Some(v)),
+                    None => (arg.as_str(), None),
+                };
+                functions::push_local(k);
+                if let Some(v) = v {
+                    // SAFETY: shell 单线程
+                    unsafe {
+                        std::env::set_var(k, v);
+                    }
+                }
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
         _ => BuiltinResult::NotBuiltin,
     }
 }
@@ -351,6 +808,12 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cwd 是进程全局状态，cd 测试串行化。
+    fn cwd_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn make_cmd(args: &[&str]) -> SimpleCmd {
         SimpleCmd {
@@ -413,6 +876,7 @@ mod tests {
 
     #[test]
     fn cd_sets_cwd() {
+        let _g = cwd_guard();
         let mut rc = 0;
         let result = try_builtin(&make_cmd(&["cd", "/tmp"]), &mut rc, &[]);
         assert!(matches!(result, BuiltinResult::Done));
@@ -422,6 +886,7 @@ mod tests {
 
     #[test]
     fn cd_nonexistent_fails() {
+        let _g = cwd_guard();
         let mut rc = 0;
         let result = try_builtin(&make_cmd(&["cd", "/nonexistent_xyz"]), &mut rc, &[]);
         assert!(matches!(result, BuiltinResult::Done));
@@ -484,6 +949,7 @@ mod tests {
 
     #[test]
     fn cd_to_root() {
+        let _g = cwd_guard();
         let mut rc = 0;
         try_builtin(&make_cmd(&["cd", "/"]), &mut rc, &[]);
         assert_eq!(rc, 0);
@@ -491,6 +957,7 @@ mod tests {
 
     #[test]
     fn cd_no_arg_goes_home() {
+        let _g = cwd_guard();
         unsafe {
             std::env::set_var("HOME", "/tmp");
         }

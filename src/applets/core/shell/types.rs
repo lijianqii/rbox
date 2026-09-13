@@ -3,6 +3,12 @@
 /// glob 保护标记（定义见共享工具 [`crate::applets::glob`]）。
 pub(crate) use crate::applets::glob::GLOB_ESCAPE;
 
+/// 双引号内 `$` 的标记：变量展开结果不做词分割（"$VAR" 语义）。
+pub const NO_SPLIT_ESCAPE: char = '\u{2}';
+
+/// 未加引号 `$` 的标记：变量展开结果参与词分割（$VAR 语义）。
+pub const SPLIT_ESCAPE: char = '\u{3}';
+
 /// 分词器产生的 Token。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -22,8 +28,18 @@ pub enum Token {
     RedirErrAppend,
     /// `N>&M` 文件描述符复制（from -> to）。
     RedirDup(u8, u8),
+    /// `N>&-` 关闭文件描述符。
+    RedirClose(u8),
+    /// `&>` stdout+stderr 重定向（覆盖）。
+    RedirOutBoth,
+    /// `&>>` stdout+stderr 重定向（追加）。
+    RedirOutBothAppend,
+    /// `<<<` here-string。
+    RedirHereString,
     /// `|` 管道。
     Pipe,
+    /// `|&` 管道（stdout+stderr 都进入管道）。
+    PipeBoth,
     /// `;` 命令分隔。
     Semicolon,
     /// `&&` 条件与。
@@ -47,6 +63,14 @@ pub struct SimpleCmd {
     pub append_err: bool,
     /// `N>&M` 描述符复制（按出现顺序应用，pre_exec 中 dup2）。
     pub dup_fds: Vec<(u8, u8)>,
+    /// 命令级环境变量（`VAR=val cmd` 的前导赋值）。
+    pub env: Vec<(String, String)>,
+    /// 需要关闭的 fd（`N>&-`）。
+    pub close_fds: Vec<u8>,
+    /// here-string 内容（`<<< word`）。
+    pub here_string: Option<String>,
+    /// `|&`：stderr 也接入管道。
+    pub stderr_to_pipe: bool,
 }
 
 impl SimpleCmd {
@@ -104,6 +128,10 @@ mod tests {
         assert!(!cmd.append);
         assert!(!cmd.append_err);
         assert!(cmd.dup_fds.is_empty());
+        assert!(cmd.env.is_empty());
+        assert!(cmd.close_fds.is_empty());
+        assert!(cmd.here_string.is_none());
+        assert!(!cmd.stderr_to_pipe);
     }
 
     #[test]

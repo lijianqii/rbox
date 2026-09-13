@@ -19,11 +19,51 @@ impl Applet for Printf {
         }
         let format = &args[0];
         let format_args = &args[1..];
-        print!("{}", printf_format(format, format_args));
+        // POSIX：参数多于格式说明符时循环复用格式
+        let mut result = String::new();
+        let specs = count_format_specs(format);
+        let mut idx = 0;
+        loop {
+            result.push_str(&printf_format(format, &format_args[idx..]));
+            if specs == 0 || idx + specs >= format_args.len() {
+                break;
+            }
+            idx += specs;
+        }
+        print!("{}", result);
         use std::io::Write;
         let _ = std::io::stdout().flush();
         ExitCode::SUCCESS
     }
+}
+
+/// 统计格式串中的参数说明符数量（`%%` 不算）。
+fn count_format_specs(format: &str) -> usize {
+    let mut n = 0;
+    let mut chars = format.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+            continue;
+        }
+        if c == '%' {
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                continue;
+            }
+            while let Some(&c2) = chars.peek() {
+                if c2.is_ascii_digit() || matches!(c2, '-' | '+' | ' ' | '#' | '.' | '0') {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if chars.next().is_some() {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// 格式化输出：处理 `%s` `%d` `%x` `%c` `%%` 和 `\n` `\t` `\\` 等转义。

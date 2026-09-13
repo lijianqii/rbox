@@ -62,6 +62,11 @@ const SIGNAL_NAMES: &[&str] = &[
     "USR2", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU",
 ];
 
+/// 信号名列表（`kill -l` / `trap -l`）。
+pub(crate) fn signal_names() -> &'static [&'static str] {
+    SIGNAL_NAMES
+}
+
 /// 信号号 -> 信号名（不带 SIG 前缀）。
 pub(crate) fn signal_name(n: i32) -> Option<&'static str> {
     SIGNAL_NAMES

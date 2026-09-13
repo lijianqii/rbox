@@ -2,6 +2,27 @@
 
 use std::sync::{Mutex, OnceLock};
 
+/// `$0`（脚本名/命令名）。
+fn arg0() -> &'static Mutex<String> {
+    static ARG0: OnceLock<Mutex<String>> = OnceLock::new();
+    ARG0.get_or_init(|| Mutex::new("sh".to_string()))
+}
+
+/// 设置 `$0`。
+pub(crate) fn set0(name: &str) {
+    if let Ok(mut a) = arg0().lock() {
+        *a = name.to_string();
+    }
+}
+
+/// 取 `$0`（默认 "sh"）。
+pub(crate) fn get0() -> String {
+    arg0()
+        .lock()
+        .map(|a| a.clone())
+        .unwrap_or_else(|_| "sh".to_string())
+}
+
 fn params() -> &'static Mutex<Vec<String>> {
     static PARAMS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
     PARAMS.get_or_init(|| Mutex::new(Vec::new()))
@@ -17,6 +38,19 @@ pub(crate) fn set(args: Vec<String>) {
 /// 取第 index 个位置参数（0 = `$1`）。
 pub(crate) fn get(index: usize) -> Option<String> {
     params().lock().ok()?.get(index).cloned()
+}
+
+/// 最近一个后台作业的 pid（`$!`）。
+static LAST_BG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// 记录最近的后台进程组（`$!`）。
+pub(crate) fn set_last_bg(pid: i32) {
+    LAST_BG.store(pid, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `$!`：最近后台 pid（无则 0）。
+pub(crate) fn last_bg() -> i32 {
+    LAST_BG.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// `$#`。

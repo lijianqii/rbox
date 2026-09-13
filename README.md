@@ -15,20 +15,33 @@
 - **终端登录**：`rgetty` 登录提示（常驻 fork/wait，失败/超时原地重试，`-L`/`-t` 选项，TTY 直接作为 rgetty 参数写在 ExecStart 完整命令中，`/etc/issue` 横幅）+ `rlogin` 密码校验（/etc/passwd + /etc/shadow、crypt 哈希、降权、MOTD）
 - **全局配置**：`/etc/rbox.conf`（TOML）集中管理路径/提示/超时/缺省 shell 等，全部可覆盖
 - **持久化 rootfs**：`make disk` 生成 ext4 镜像，init 支持 `root=` 内核参数 switch_root（脱离 initramfs）
-- **交互式 shell**：
-  - 管道 `|`、重定向 `>` `>>` `<`、后台 `&`
-  - 控制操作符 `;` `&&` `||`
-  - 环境变量 `export VAR=val`、变量展开 `$VAR` `${VAR}` `$?` `$$`
-  - 命令历史（上下键浏览）、`!!` `!n` `!-n` 历史展开
-  - 行编辑：左右键移动光标、Ctrl-A/E/U/W/L、Home/End
-  - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
-  - 通配符 `*` `?` `[...]`（引号内不展开）、引号 `'...'` `"..."`、注释 `#`、续行 `\`
-  - 复合命令 `if/elif/else/fi`、`for ... in ... do ... done`、`while ... do ... done`（含 `break`/`continue`）
-  - 命令替换 `$(...)`、算术 `$(( ))`、别名 `alias`/`unalias`
-  - 位置参数 `$1..$9` `$#` `$@` + `set --` / `shift`，内置 `read`/`test`/`[`
-  - 作业控制：`jobs` / `fg %n` / `bg %n`，`&` 后台任务与 Ctrl-Z 挂起/恢复
-  - 内置命令：`cd` `exit` `export` `unset` `pwd` `history` `alias` `unalias` `jobs` `fg` `bg` `read` `set` `shift`
-- **工程化**：Clippy（--all-targets）零警告、727 个单元测试、182 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
+- **交互式 shell（可作为 /bin/sh 运行脚本）**：
+  - **脚本模式**：`sh script.sh args...`、`sh -c 'cmd' name args...`、`#!` 脚本、
+    stdin 脚本；选项 `-e`（errexit）/`-x`（xtrace）/`-u`（nounset）/`-o pipefail`
+  - **函数**：`f() { ... }` / `function f { ... }`，`local`、`return N`；`case`/`until`、
+    `break N`/`continue N`
+  - 管道 `|`、`|&`、重定向 `>` `>>` `<` `2>` `2>&1` `>&N` `&>` `<<<` `>&-`（`set -C` 防覆盖）
+  - 控制操作符 `;` `&&` `||`、后台 `&`
+  - 展开：`$VAR` `"$VAR"`（词分割语义）、`$?` `$$` `$!` `$#` `$1..$9` `"$@"`、
+    `${VAR:-def}` `${VAR:=def}` `${VAR:?err}` `${VAR:+alt}` `${#VAR}`、
+    `${VAR#pat}` `${VAR##pat}` `${VAR%pat}` `${VAR%%pat}` `${VAR/old/new}`、
+    `$(( ))`（含赋值/比较/逻辑）、`$( )`、`$(<file)`、`$'\n'`、`{a,b}` `{1..5}`
+  - 变量赋值 `VAR=val`、`VAR=val cmd`；命令历史（上下键、`!!` `!n` `!-n` `!$`、`history [-c|N]`、
+    `HISTFILE`/`HISTSIZE`）
+  - 行编辑：左右键移动光标、Ctrl-A/E/U/W/L、Home/End；Tab 补全（命令 + 文件/路径）
+  - 通配符 `*` `?` `[...]`（引号内不展开）、引号 `'...'` `"..."`、注释 `#`、续行 `\`、
+    here-doc（支持变量/命令展开、`<<-`、`<<'EOF'`、脚本模式）
+  - 别名 `alias`/`unalias`；`source`/`.`；`eval`；`command -v/-V`；`type`；`umask`；`let`；`times`
+  - 作业控制：`jobs [-l]` / `fg` / `bg` / `wait [pid|%job]` / `disown`，
+    `%+`/`%-`/`%?str` 作业规格，`kill %1`，Ctrl-Z 挂起/恢复，终端前台进程组交接
+  - 信号：`trap 'cmd' EXIT/INT/TERM/...`；`exec`（替换进程 + 永久重定向）
+  - 内置命令：`cd`（含 `cd -`、`PWD`/`OLDPWD`）`exit` `export` `unset` `pwd` `history`
+    `alias` `unalias` `jobs` `fg` `bg` `read`（`-r -s -t -n -d -p`）`set` `shift`
+    `exec` `wait` `disown` `return` `trap` `type` `hash` `umask` `let` `times` `local`
+    `break` `continue`
+  - `PS2` 续行提示、`PS4` xtrace 前缀、`IFS` 词分割可配置；启动时 source `/etc/profile`
+    与 `~/.profile`
+- **工程化**：Clippy（--all-targets）零警告、764 个单元测试、200 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
 
 ## 快速开始
 

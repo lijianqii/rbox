@@ -325,6 +325,23 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 作业控制 jobs | jobs | 已实现（后台 & 与 Ctrl-Z 挂起） |
 | 作业控制 fg/bg | fg [%n] / bg [%n] | 已实现（SIGCONT + 等待/继续） |
 | Ctrl-Z | 挂起前台进程组 | 已实现（jobs 显示 Stopped） |
+| 脚本模式 | sh script.sh args / sh -c 'cmd' name args | 已实现（$0/$1..、shebang） |
+| 选项 | sh -e/-x/-u/-o pipefail | 已实现（set -e/-x/-u/-C/-o pipefail 同源） |
+| 函数 | f() { ... } / function f { ... } | 已实现（local/return，参数独立作用域） |
+| case/until | case x in ... esac / until ... done | 已实现 |
+| break N/continue N | 多层循环跳出 | 已实现 |
+| 参数展开运算符 | ${VAR:-def} ${#VAR} ${VAR#pat} ${VAR/old/new} | 已实现 |
+| 词分割 | 未引号 `$VAR` 按 IFS 拆分；`"$VAR"` 不拆；`"$@"` 多参数 | 已实现 |
+| ANSI-C 引用 | $'\n' $'\x41' $'\u4e2d' | 已实现 |
+| 花括号展开 | {a,b} / {1..5} / {a..e} | 已实现（引号内不展开） |
+| 算术增强 | 赋值/自增/比较/逻辑：$((x+=1)) $((a>b)) | 已实现 |
+| $(<file) | 读取文件内容 | 已实现 |
+| 新重定向 | &> &>> \|& <<< >&- N<&M、set -C | 已实现 |
+| exec | 替换进程 + 永久重定向 | 已实现 |
+| wait/disown/作业规格 | wait pid\|%job、disown、%+ %- %?str、kill %1 | 已实现 |
+| trap | EXIT/INT/TERM/... 陷阱 | 已实现（脚本与交互） |
+| read 选项 | -r -s -t -n -d -p | 已实现 |
+| 交互配置 | PS2/PS4/IFS/HISTFILE/HISTSIZE、~/.profile、cd -、umask/let/times | 已实现 |
 
 ### 实现细节
 
@@ -409,7 +426,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 36 个测试组、182 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 37 个测试组、200 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -447,18 +464,21 @@ enum Token {
 | Shell: 引号保护 glob / 内置重定向 | 双引号 * 不展开、内置 pwd 重定向 | 3 |
 | 新增 applet | chmod/chown/find/kill/dmesg/mount/umount | 16 |
 | Shell: 复合命令/别名/命令替换/作业控制 | if/for/while、alias、$()、jobs、Ctrl-Z | 8 |
+| Shell: 脚本模式/POSIX 展开/新重定向 | sh 脚本/-c/-e、函数/case/until/break N、参数展开、词分割、$'...'、&>/<<</\|&、read/wait | 18 |
 | rescue 启动降级 | target Requires 失败 → 停止服务进 rescue shell | 4 |
 | 持久盘模式 | switch_root、写入、重启后数据保留 | 3 |
-| **合计** | | **182** |
+| **合计** | | **200** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
 **已知限制**：
 - Ctrl-A 被 QEMU `-nographic` 截获，自动化测试无法覆盖
-- 不支持子 shell `()`（命令替换 `$()` 已支持，但输出不做二次语法解析）
-- 不支持 `case`/`until`/函数定义；`break`/`continue` 仅支持单层（无 `break N`）
-- here-doc 仅在交互式 tty 模式下可用（管道模式无法多行输入）
+- 不支持子 shell `()`、进程替换 `<()`、命令分组 `{ ...; }`
+- 算术无位运算/三元/逗号运算符；无数组、无 `declare`/`readonly`/`set -a`
+- 词分割为近似实现：混合引号与未引号展开的同一词按保守策略不拆分
+- 交互体验：无 Ctrl-R 历史搜索、kill ring/撤销；补全无变量/选项补全
 - 命令替换内为子进程语义：内置命令（cd/export 等）不生效
+- 无 `$ENV` 启动文件（支持 `/etc/profile` 与 `~/.profile`）
 
 ### 终端模式（Tab 补全的前提）
 
@@ -821,7 +841,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 36 个测试组、182 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 37 个测试组、200 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -843,35 +863,39 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行/glob 保护标记/2>&1） | 38 |
-| shell/parser | parse（逻辑段/语法错误/后台执行/管道/fd 复制） | 30 |
-| shell/expander | expand_vars（含位置参数/算术）、expand_history、expand_tilde、expand_glob、expand_word | 45 |
+| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行/保护标记/新重定向） | 39 |
+| shell/parser | parse（逻辑段/语法错误/后台/管道/fd 复制/新重定向） | 31 |
+| shell/expander | 变量/位置参数/算术/历史/tilde/glob/词分割/花括号/参数展开运算符 | 54 |
 | shell/completion | find_last_word_start、complete_command、complete_file、common_prefix | 29 |
-| shell/builtin | cd/exit/export/unset/pwd/history/alias/unalias/jobs/fg/bg/read/set/shift | 21 |
-| shell/reader | make_prompt（PS1 展开）、display_width、set_isig | 16 |
-| shell/executor | 重定向（含 fd 复制）、命令解析回退、命令替换、X_OK、SIGCHLD 清理 | 13 |
+| shell/builtin | 内置命令（含 exec/wait/trap/type/read 选项等） | 21 |
+| shell/reader | make_prompt（PS1）、continuation prompt（PS2）、display_width、set_isig | 16 |
+| shell/executor | 重定向、命令替换、X_OK、SIGCHLD、fd 复制/关闭、here-string | 13 |
 | shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 8 |
-| shell/mod | read_utf8_char、here-doc、续行、source 历史隔离、~ 路径展开 | 14 |
-| shell/alias | 别名定义/查询/展开（命令位置、引号内不展开、链式/自引用上限） | 7 |
-| shell/compound | if/elif/else、for、while、break/continue、规范化、语法错误 | 14 |
-| shell/jobs | 作业登记/列表/取出/存活清理/输出格式 | 5 |
-| shell/params | 位置参数 set/get/count/shift | 3 |
-| shell/fuzz | 随机化健壮性（tokenizer/parser/expander/glob/fstab/算术） | 4 |
+| shell/mod | read_utf8_char、here-doc、续行、source、~ 路径展开、heredoc 检测 | 15 |
+| shell/alias | 别名定义/查询/展开 | 7 |
+| shell/compound | if/for/while/until/case、break N、规范化、语法错误 | 15 |
+| shell/jobs | 作业表/状态/规格/回收标志 | 8 |
+| shell/params | 位置参数 set/get/count/shift、$0/$! | 3 |
+| shell/options | set -e/-x/-u/-C/-o pipefail 状态 | 4 |
+| shell/trap | 信号陷阱设置/查询/待处理信号 | 4 |
+| shell/functions | 函数表与局部变量 | 3 |
+| shell/script | 脚本驱动：参数、函数定义、here-doc、case/until、-e、return | 10 |
+| shell/fuzz | 随机化健壮性 | 4 |
 | init/units | parse_cmdline、compute_start_order（Before）、单元字段、fstab 解析 | 18 |
 | init/server | 控制协议处理、status 渲染 | 17 |
 | init/services | 服务生命周期、schedule_restart、EnvironmentFile、KillMode | 13 |
 | init/mount | fstab 挂载、mount_line_matches 匹配 | 7 |
 | init/mod | failed_required_dep、compute_depths、root 规格解析、秒退检测 | 14 |
 | init/boot | cmdline 启动模式解析 | 1 |
-| init/watchdog | 喂狗超时压缩（无限/取 min/禁用/到期） | 4 |
-| config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
+| init/watchdog | 喂狗超时压缩 | 4 |
+| config | /etc/rbox.conf 解析 | 4 |
 | text/* | grep 14、printf 12、util 9、echo 7、basename 7、tr 6、sort 6、head 6、cut 6、tail 6、wc 5、uniq 5、dirname 5、tee 4 | 98 |
 | file/* | ls 14、find 11、chmod 10、util 8、chown 8、tar 7、cp 7、stat 5、rm 5、mv 5、mktemp 5、mkdir 5、touch 4、realpath 4、ln 4、df 4、dd 4、cat 4 | 122 |
 | sys/* | meminfo 20、mount 12、kill 10、test 8、umount 7、processes 7、dmesg 7、sleep 6、env 6、uname 5、timeout 5、pgrep 5、passwd 5、id 4、logkeeper 3、hostname 3、uptime 3、date 2、su 2、true/false/pwd 各 1 | 123 |
 | core/* | rservice 3、status 2、log 4、shutdown 1、reboot 1、control 3、rgetty 11、rlogin 12 | 37 |
 | proc / glob / fstab（共享工具） | 进程信息收集/单位格式化；glob 匹配；fstab 解析 | 15 |
 | main | applet 注册表唯一性/查找/--help 处理 | 7 |
-| **合计** | | **727** |
+| **合计** | | **764** |
 
 测试结果示例：
 
@@ -898,7 +922,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 182 通过, 0 失败
+结果: 200 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局

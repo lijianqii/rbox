@@ -22,17 +22,21 @@ mod completion;
 mod compound;
 mod executor;
 mod expander;
+mod functions;
 #[cfg(test)]
 mod fuzz;
 mod jobs;
+mod options;
 mod params;
 mod parser;
 mod reader;
+mod script;
 mod tokenizer;
+mod trap;
 mod types;
 
 use crate::applet::Applet;
-use reader::{enable_raw_mode, make_prompt, redraw};
+use reader::{enable_raw_mode, make_continuation_prompt, make_prompt, redraw};
 use std::io::{self, Read, Write};
 
 /// 无缓冲 stdin：直接 `read(2)`。Rust 的 `Stdin` 会预读缓冲，导致 `read`
@@ -86,17 +90,24 @@ fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
         None => return line.to_string(),
     };
 
-    // 提取 delimiter（<< 后面的第一个词）
-    let after = &line[idx + 2..];
-    let delim = after.split_whitespace().next().unwrap_or("");
+    // 解析 delimiter：支持 `<<-`（去 tab）与引号 delimiter（不展开）
+    let after = line[idx + 2..].trim_start();
+    let (strip_tabs, delim_raw) = match after.strip_prefix('-') {
+        Some(r) => (true, r.trim_start()),
+        None => (false, after),
+    };
+    let delim = delim_raw.split_whitespace().next().unwrap_or("");
     if delim.is_empty() {
         return line.to_string();
     }
+    let quoted = (delim.starts_with('\'') && delim.ends_with('\''))
+        || (delim.starts_with('"') && delim.ends_with('"'));
+    let delim_clean = delim.trim_matches(|c| c == '\'' || c == '"');
 
     // 读取 here-doc 内容（按行读取，保留 UTF-8）
     let mut content = String::new();
     loop {
-        let _ = write!(io::stdout(), "> ");
+        let _ = write!(io::stdout(), "{}", make_continuation_prompt());
         let _ = io::stdout().flush();
         let mut line_buf = read_line_raw(input);
         if line_buf.is_empty() {
@@ -109,17 +120,26 @@ fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
                 line_buf.pop();
             }
         }
-        let line_content = String::from_utf8_lossy(&line_buf).trim().to_string();
-        if line_content == delim {
+        let text = String::from_utf8_lossy(&line_buf).into_owned();
+        let candidate = if strip_tabs {
+            text.trim_start_matches('\t').to_string()
+        } else {
+            text
+        };
+        if candidate == delim_clean {
             break;
         }
-        content.push_str(&line_content);
+        content.push_str(&candidate);
         content.push('\n');
     }
 
-    // 写入临时文件
-    let tmpfile = format!("/tmp/heredoc_{}", std::process::id());
-    if std::fs::write(&tmpfile, &content).is_err() {
+    // 未加引号的 delimiter 展开变量与命令替换
+    let expanded = script::expand_heredoc_body(&content, !quoted);
+
+    // 写入临时文件（序号避免同进程内多次 heredoc 冲突）
+    let seq = HEREDOC_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let tmpfile = format!("/tmp/rbox_heredoc_{}_{}", std::process::id(), seq);
+    if std::fs::write(&tmpfile, &expanded).is_err() {
         return line.to_string();
     }
 
@@ -127,6 +147,9 @@ fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
     let before = &line[..idx];
     format!("{} < {}", before.trim_end(), tmpfile)
 }
+
+/// here-doc 临时文件序号。
+static HEREDOC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 读取一个完整 UTF-8 字符（首字节已读入为 `first`），返回该字符的字符串形式。
 /// 多字节序列按首字节判断长度；无效/不完整序列按已读字节用 U+FFFD 替换。
@@ -149,7 +172,7 @@ fn read_utf8_char<R: Read>(first: u8, input: &mut R) -> String {
 }
 
 /// 查找行中真正的 `<<` 操作符位置（跳过单/双引号内与反斜杠转义）。
-fn find_heredoc_operator(line: &str) -> Option<usize> {
+pub(crate) fn find_heredoc_operator(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut in_squote = false;
@@ -176,7 +199,14 @@ fn find_heredoc_operator(line: &str) -> Option<usize> {
             b'\'' => in_squote = true,
             b'"' => in_dquote = true,
             b'\\' => i += 1, // 跳过转义字符
-            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => return Some(i),
+            // `<<` 是 here-doc；`<<<` 是 here-string（不收集后续行）
+            b'<' if (i == 0 || bytes[i - 1] != b'<')
+                && i + 2 < bytes.len()
+                && bytes[i + 1] == b'<'
+                && bytes[i + 2] != b'<' =>
+            {
+                return Some(i);
+            }
             _ => {}
         }
         i += 1;
@@ -186,7 +216,7 @@ fn find_heredoc_operator(line: &str) -> Option<usize> {
 
 /// 判断行是否以"续行反斜杠"结尾（单引号内反斜杠不续行；双引号/引号外的
 /// 行尾反斜杠续行，被转义的反斜杠不续行）。
-fn needs_continuation(line: &str) -> bool {
+pub(crate) fn needs_continuation(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
     let mut in_squote = false;
@@ -246,9 +276,26 @@ fn abort_line(
     let _ = io::stdout().flush();
 }
 
-/// 历史文件路径：配置了 [paths] history_file 则用它（支持 `~` 前缀）；
-/// 未配置时保持默认 $HOME/.rbox_history（HOME 未设置用 /tmp/.rbox_history）。
+/// 清空历史请求（`history -c` 由内置设置，REPL 消费）。
+static HISTORY_CLEAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 请求清空历史。
+pub(crate) fn mark_history_clear() {
+    HISTORY_CLEAR.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 消费清空历史请求。
+pub(crate) fn take_history_clear() -> bool {
+    HISTORY_CLEAR.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 历史文件路径：`$HISTFILE` > 配置 [paths] history_file > `$HOME/.rbox_history`。
 fn history_file() -> String {
+    if let Ok(hf) = std::env::var("HISTFILE")
+        && !hf.is_empty()
+    {
+        return hf;
+    }
     let configured = &crate::config::load().paths.history_file;
     if !configured.is_empty() {
         return expand_tilde_path(configured);
@@ -276,8 +323,18 @@ fn expand_tilde_path(path: &str) -> String {
 /// 加载历史文件。
 fn load_history() -> Vec<String> {
     let path = history_file();
+    let size = std::env::var("HISTSIZE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(500);
     match std::fs::read_to_string(&path) {
-        Ok(content) => content.lines().map(|l| l.to_string()).collect(),
+        Ok(content) => {
+            let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+            if lines.len() > size {
+                lines.drain(..lines.len() - size);
+            }
+            lines
+        }
         Err(_) => Vec::new(),
     }
 }
@@ -309,7 +366,7 @@ fn source_file(path: &str, last_rc: &mut i32, history: &mut [String]) -> i32 {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        *last_rc = executor::execute_line(line, last_rc, history, |_rc: i32| {
+        *last_rc = executor::execute_line(line, last_rc, history, &|_rc: i32| {
             // source 中不支持 exit
         });
         // 注意：source 的行不应进入交互式历史（与 bash 一致），
@@ -331,10 +388,33 @@ impl Applet for Shell {
         "rbox shell - minimalist interactive shell"
     }
 
-    fn run(&self, _args: &[String]) -> std::process::ExitCode {
-        match Shell::run_shell() {
-            Ok(code) => std::process::ExitCode::from(code),
-            Err(_) => std::process::ExitCode::from(1),
+    fn run(&self, args: &[String]) -> std::process::ExitCode {
+        let parsed = match script::parse_shell_args(args) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("sh: {}", e);
+                return std::process::ExitCode::from(2);
+            }
+        };
+        if let Some(cmd) = parsed.command {
+            return std::process::ExitCode::from(
+                (script::run_command_string(&cmd, parsed.args) & 0xff) as u8,
+            );
+        }
+        if let Some(path) = parsed.script {
+            return std::process::ExitCode::from(
+                (script::run_script_file(&path, parsed.args) & 0xff) as u8,
+            );
+        }
+        // 无脚本：tty（或 -i）进交互模式，否则把 stdin 当脚本执行
+        let stdin_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        if parsed.interactive || stdin_tty {
+            match Shell::run_shell() {
+                Ok(code) => std::process::ExitCode::from(code),
+                Err(_) => std::process::ExitCode::from(1),
+            }
+        } else {
+            std::process::ExitCode::from((script::run_stdin() & 0xff) as u8)
         }
     }
 }
@@ -344,8 +424,32 @@ impl Shell {
         // 注册 SIGINT handler（管道模式后备）
         executor::install_sigint_handler();
 
-        // 注册 SIGCHLD handler：自动回收后台僵尸子进程
+        // 注册 SIGCHLD handler：置位标志，由主循环回收并记录状态
         executor::install_sigchld_handler();
+
+        // 注册信号 trap 处理器（INT/TERM/HUP 记录待处理信号）
+        trap::install_handlers();
+
+        // 作业控制：忽略 SIGTTIN/SIGTTOU（后台读终端不停止 shell），
+        // 并确保 shell 处于自己的进程组、终端前台组指向 shell
+        unsafe {
+            libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            if libc::isatty(libc::STDIN_FILENO) == 1 {
+                libc::setpgid(0, 0);
+                libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp());
+            }
+        }
+
+        // 初始化 PWD（若未设置）
+        if std::env::var("PWD").is_err()
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            // SAFETY: shell 单线程
+            unsafe {
+                std::env::set_var("PWD", cwd.to_string_lossy().as_ref());
+            }
+        }
 
         // 加载 profile（路径可配置；默认 /etc/profile）
         let profile_path = &crate::config::load().paths.profile;
@@ -353,6 +457,13 @@ impl Shell {
         let mut boot_history: Vec<String> = Vec::new();
         if std::path::Path::new(profile_path).exists() {
             source_file(profile_path, &mut boot_rc, &mut boot_history);
+        }
+        // 交互式启动文件：$HOME/.profile（若存在且与 /etc/profile 不同）
+        if let Ok(home) = std::env::var("HOME") {
+            let user_profile = format!("{}/.profile", home);
+            if user_profile != *profile_path && std::path::Path::new(&user_profile).exists() {
+                source_file(&user_profile, &mut boot_rc, &mut boot_history);
+            }
         }
 
         let mut input = RawStdin;
@@ -378,6 +489,17 @@ impl Shell {
         let mut cursor: usize = 0;
 
         loop {
+            // 后台作业回收（SIGCHLD 置位）与信号 trap
+            if jobs::sigchld_pending() {
+                jobs::reap_children();
+            }
+            if let Some(sig) = trap::take_pending()
+                && let Some(cmdline) = trap::get(sig)
+            {
+                let mut rc = last_rc;
+                executor::execute_line(&cmdline, &mut rc, &history, &|_| {});
+                last_rc = rc;
+            }
             let mut byte = [0u8; 1];
             // 前台命令等待期间被 Ctrl-C 监控线程缓存的标准输入，优先消费
             // （保序队列，避免并发读 stdin 丢失/错位）
@@ -391,6 +513,14 @@ impl Shell {
             let n = match n {
                 Ok(n) => n,
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {
+                    if let Some(sig) = trap::take_pending()
+                        && let Some(cmdline) = trap::get(sig)
+                    {
+                        let mut rc = last_rc;
+                        executor::execute_line(&cmdline, &mut rc, &history, &|_| {});
+                        last_rc = rc;
+                        continue;
+                    }
                     abort_line(&mut line, &mut cursor, &mut pending_line, &mut hist_idx);
                     continue;
                 }
@@ -411,7 +541,7 @@ impl Shell {
                     // 续行检查（感知引号：单引号内反斜杠不续行）
                     if needs_continuation(&full_line) {
                         pending_line = full_line.trim_end_matches('\\').to_string();
-                        let _ = write!(io::stdout(), "> ");
+                        let _ = write!(io::stdout(), "{}", make_continuation_prompt());
                         let _ = io::stdout().flush();
                         continue;
                     } else if !pending_line.is_empty() {
@@ -433,7 +563,7 @@ impl Shell {
                         block_depth += compound::nesting_delta(&full_line);
                         block_lines.push(full_line.clone());
                         if block_depth > 0 {
-                            let _ = write!(io::stdout(), "> ");
+                            let _ = write!(io::stdout(), "{}", make_continuation_prompt());
                             let _ = io::stdout().flush();
                             continue;
                         }
@@ -444,22 +574,13 @@ impl Shell {
                             compound::execute_block(&block, &mut last_rc, &history, &|rc: i32| {
                                 let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                                 let _ = io::stdout().flush();
+                                run_exit_trap(&history, rc);
                                 std::process::exit(rc);
                             });
                         if history.last() != Some(&block) {
                             history.push(block.clone());
                             append_history(&block);
                         }
-                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
-                        let _ = io::stdout().flush();
-                        continue;
-                    }
-
-                    // source 命令特殊处理
-                    let trimmed = full_line.trim();
-                    if trimmed.starts_with("source ") || trimmed.starts_with(". ") {
-                        let file = trimmed.split_whitespace().nth(1).unwrap_or("");
-                        source_file(file, &mut last_rc, &mut history);
                         let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                         let _ = io::stdout().flush();
                         continue;
@@ -472,11 +593,18 @@ impl Shell {
 
                     // 执行行（历史扩展在 execute_line 内部完成）
                     last_rc =
-                        executor::execute_line(&full_line, &mut last_rc, &history, |rc: i32| {
+                        executor::execute_line(&full_line, &mut last_rc, &history, &|rc: i32| {
                             let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                             let _ = io::stdout().flush();
+                            run_exit_trap(&history, rc);
                             std::process::exit(rc);
                         });
+
+                    // history -c：清空内存与历史文件
+                    if take_history_clear() {
+                        history.clear();
+                        let _ = std::fs::write(history_file(), "");
+                    }
 
                     // 存入历史（非空且与最后一条不同）
                     if !full_line.trim().is_empty() && history.last() != Some(&full_line) {
@@ -702,8 +830,14 @@ impl Shell {
             }
         }
 
+        run_exit_trap(&history, last_rc);
         Ok(last_rc as u8)
     }
+}
+
+/// 运行 EXIT trap（`trap 'cmd' EXIT`）；无 trap 时无操作。
+fn run_exit_trap(history: &[String], last_rc: i32) {
+    script::run_exit_trap(history, last_rc);
 }
 
 #[cfg(test)]
@@ -735,6 +869,13 @@ mod tests {
         // 'é' = C3 A9（两字节）
         let mut input = &b"\xa9"[..];
         assert_eq!(read_utf8_char(0xc3, &mut input), "é");
+    }
+
+    #[test]
+    fn heredoc_operator_skips_here_string() {
+        assert_eq!(find_heredoc_operator("cat <<< hi"), None);
+        assert_eq!(find_heredoc_operator("cat <<EOF"), Some(4));
+        assert_eq!(find_heredoc_operator("cat <<-EOF"), Some(4));
     }
 
     // ─── here-doc 操作符检测（引号感知）─────────

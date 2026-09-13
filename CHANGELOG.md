@@ -21,8 +21,18 @@
   `su`/`passwd`
 - 65 个 applet：文件/文本/进程/系统工具（含 tar/dd/sort/cut/tr/test/find/mount 等）
 
+### Shell 脚本化（v0.1.0 内后续迭代）
+- 脚本模式：`sh script.sh args`、`sh -c`、shebang、stdin 脚本；`-e/-x/-u/-o pipefail`
+- 函数（`local`/`return`）、`case`、`until`、`break N`/`continue N`
+- 参数展开运算符、词分割与 `"$@"`、`$'...'`、花括号展开、算术赋值/比较/逻辑、`$(<file)`
+- 重定向补齐：`&>`/`&>>`/`|&`/`<<<`/`>&-`/`N<&M`、here-doc 展开与 `<<-`、`set -C`
+- 内置：`exec`/`wait`/`trap`/`eval`/`command`/`type`/`umask`/`let`/`times`/`local`/`disown`，
+  `read` 选项（`-r -s -t -n -d -p`）、`history -c`/`N`、`HISTFILE`/`HISTSIZE`
+- 作业控制：终端前台进程组交接（tcsetpgrp）、`%+`/`%-`/`%?str` 规格、`$!`
+- 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
+
 ### 工程
-- 单测 727 个、QEMU 集成断言 182 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 765 个、QEMU 集成断言 200 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
