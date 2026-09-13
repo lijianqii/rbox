@@ -45,6 +45,11 @@ pub fn is_builtin(name: &str) -> bool {
             | "local"
             | "break"
             | "continue"
+            | ":"
+            | "readonly"
+            | "getopts"
+            | "ulimit"
+            | "kill"
     )
 }
 
@@ -200,6 +205,47 @@ fn assign_read_vars(line: &str, names: &[String]) {
     }
 }
 
+/// 只读变量集合（`readonly`）。
+fn readonly_set() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 是否为只读变量。
+pub(crate) fn is_readonly(name: &str) -> bool {
+    readonly_set()
+        .lock()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
+
+/// 标记只读。
+fn mark_readonly(name: &str) {
+    if let Ok(mut s) = readonly_set().lock() {
+        s.insert(name.to_string());
+    }
+}
+
+/// 设置环境变量（shell 单线程）。
+fn setenv(k: &str, v: impl AsRef<std::ffi::OsStr>) {
+    // SAFETY: shell 单线程
+    unsafe {
+        std::env::set_var(k, v);
+    }
+}
+
+/// 删除环境变量。
+fn unsetenv(k: &str) {
+    // SAFETY: shell 单线程
+    unsafe {
+        std::env::remove_var(k);
+    }
+}
+
+/// getopts 解析位置（当前参数簇内下标；0 = 未开始）。
+static GETOPTS_POS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// 尝试执行内置命令。
 pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> BuiltinResult {
     if cmd.argv.is_empty() {
@@ -221,7 +267,36 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Exit
         }
         "cd" => {
-            let target = match cmd.argv.get(1).map(String::as_str) {
+            let positional: Vec<&str> = cmd.argv[1..]
+                .iter()
+                .map(String::as_str)
+                .filter(|a| *a != "-P" && *a != "-L" && *a != "-e")
+                .collect();
+            // CDPATH：相对路径且非 . / .. 时搜索
+            if let Some(rel) = positional.first()
+                && !rel.starts_with('/')
+                && !rel.starts_with('.')
+                && !rel.starts_with('~')
+                && let Ok(cdpath) = std::env::var("CDPATH")
+            {
+                for dir in cdpath.split(':') {
+                    if dir.is_empty() {
+                        continue;
+                    }
+                    let cand = format!("{}/{}", dir, rel);
+                    if std::path::Path::new(&cand).is_dir()
+                        && std::env::set_current_dir(&cand).is_ok()
+                    {
+                        println!("{}", cand);
+                        if let Ok(new) = std::env::current_dir() {
+                            setenv("PWD", new.to_string_lossy().as_ref());
+                        }
+                        *last_rc = 0;
+                        return BuiltinResult::Done;
+                    }
+                }
+            }
+            let target = match positional.first().copied() {
                 Some("-") => match std::env::var("OLDPWD") {
                     Ok(p) => {
                         println!("{}", p);
@@ -262,6 +337,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Done
         }
         "pwd" => {
+            // 接受并忽略 -P/-L（getcwd 已解析符号链接）
             match std::env::current_dir() {
                 Ok(p) => println!("{}", p.display()),
                 Err(e) => {
@@ -306,6 +382,8 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 }
                 if func_mode {
                     functions::unset(arg);
+                } else if is_readonly(arg) {
+                    eprintln!("unset: {}: is read only", arg);
                 } else {
                     // SAFETY: single-threaded shell
                     unsafe {
@@ -512,34 +590,46 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                     let a = rest[i].as_str();
                     match a {
                         "-o" | "+o" => {
-                            i += 1;
                             let on = a.starts_with('-');
-                            match rest.get(i).map(String::as_str) {
-                                Some("pipefail") => options::set_pipefail(on),
-                                Some(other) => {
-                                    eprintln!("set: unknown option: {}", other);
-                                    rc = 2;
+                            match rest.get(i + 1).map(String::as_str) {
+                                Some(name) => {
+                                    i += 1;
+                                    if !options::set_named(name, on) {
+                                        eprintln!("set: unknown option: {}", name);
+                                        rc = 2;
+                                    }
                                 }
                                 None => {
-                                    eprintln!("set: -o requires an argument");
-                                    rc = 2;
+                                    // 列出选项（+o 为可重置形式）
+                                    for (name, value) in options::named_options() {
+                                        if on {
+                                            println!("{}", name);
+                                        } else if value {
+                                            println!("set -o {}", name);
+                                        } else {
+                                            println!("set +o {}", name);
+                                        }
+                                    }
                                 }
                             }
                         }
                         _ if a.len() > 1 && (a.starts_with('-') || a.starts_with('+')) => {
                             let on = a.starts_with('-');
+                            let sign = if on { "-" } else { "+" };
                             for c in a[1..].chars() {
                                 match c {
-                                    'e' => options::set_errexit(on),
-                                    'x' => options::set_xtrace(on),
-                                    'u' => options::set_nounset(on),
+                                    'a' => options::set_allexport(on),
+                                    'b' => options::set_notify(on),
                                     'C' => options::set_noclobber(on),
+                                    'e' => options::set_errexit(on),
+                                    'f' => options::set_noglob(on),
+                                    'm' => options::set_monitor(on),
+                                    'n' => options::set_noexec(on),
+                                    'u' => options::set_nounset(on),
+                                    'v' => options::set_verbose(on),
+                                    'x' => options::set_xtrace(on),
                                     other => {
-                                        eprintln!(
-                                            "set: unknown option: {}{}",
-                                            if on { "-" } else { "+" },
-                                            other
-                                        );
+                                        eprintln!("set: unknown option: {}{}", sign, other);
                                         rc = 2;
                                     }
                                 }
@@ -801,8 +891,391 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             *last_rc = 0;
             BuiltinResult::Done
         }
+        ":" => {
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "readonly" => {
+            let mut rc = 0;
+            let mut list = false;
+            for arg in &cmd.argv[1..] {
+                if arg == "-p" {
+                    list = true;
+                    continue;
+                }
+                if let Some((k, v)) = arg.split_once('=') {
+                    mark_readonly(k);
+                    // SAFETY: shell 单线程
+                    unsafe {
+                        std::env::set_var(k, v);
+                    }
+                } else {
+                    mark_readonly(arg);
+                }
+            }
+            if (list || cmd.argv.len() == 1)
+                && let Ok(set) = readonly_set().lock()
+            {
+                let mut names: Vec<&String> = set.iter().collect();
+                names.sort();
+                for name in names {
+                    let val = std::env::var(name).unwrap_or_default();
+                    println!("readonly {}={}", name, val);
+                }
+            }
+            *last_rc = rc;
+            rc = 0;
+            let _ = rc;
+            BuiltinResult::Done
+        }
+        "getopts" => {
+            *last_rc = run_getopts(cmd);
+            BuiltinResult::Done
+        }
+        "ulimit" => {
+            *last_rc = run_ulimit(cmd);
+            BuiltinResult::Done
+        }
+        "kill" => {
+            *last_rc = run_kill_builtin(cmd);
+            BuiltinResult::Done
+        }
         _ => BuiltinResult::NotBuiltin,
     }
+}
+
+/// `getopts optstring name [args...]`（POSIX）。返回 0 表示解析到选项，1 表示结束。
+fn run_getopts(cmd: &SimpleCmd) -> i32 {
+    let args: Vec<String> = cmd.argv[1..].to_vec();
+    if args.len() < 2 {
+        eprintln!("getopts: usage: getopts optstring name [arg...]");
+        return 2;
+    }
+    let optstring = &args[0];
+    let name = &args[1];
+    let positional: Vec<String> = if args.len() > 2 {
+        args[2..].to_vec()
+    } else {
+        params::all()
+    };
+    let silent = optstring.starts_with(':');
+    let spec = optstring.trim_start_matches(':');
+    let mut optind: usize = std::env::var("OPTIND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let mut pos = GETOPTS_POS.load(std::sync::atomic::Ordering::SeqCst);
+    let cluster: String = if pos == 0 {
+        if optind > positional.len() {
+            return 1;
+        }
+        let arg = positional[optind - 1].clone();
+        if arg == "--" {
+            setenv("OPTIND", (optind + 1).to_string());
+            return 1;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            return 1;
+        }
+        arg[1..].to_string()
+    } else {
+        // 继续上一簇：从环境恢复（存于 GETOPTS_CLUSTER 不可行，改用 OPTIND 指向当前参数）
+        let arg = positional.get(optind - 1).cloned().unwrap_or_default();
+        arg.trim_start_matches('-').to_string()
+    };
+    if cluster.is_empty() || pos >= cluster.len() {
+        GETOPTS_POS.store(0, std::sync::atomic::Ordering::SeqCst);
+        return 1;
+    }
+    let ch = cluster.as_bytes()[pos] as char;
+    pos += 1;
+    if pos >= cluster.len() {
+        optind += 1;
+        pos = 0;
+    }
+    GETOPTS_POS.store(pos, std::sync::atomic::Ordering::SeqCst);
+    let mut optarg: Option<String> = None;
+    let idx = spec.find(ch);
+    match idx {
+        Some(i) if spec.as_bytes().get(i + 1) == Some(&b':') => {
+            // 需要参数
+            let mut next_optind = optind;
+            let rest = if pos > 0 {
+                cluster[pos..].to_string()
+            } else {
+                String::new()
+            };
+            if !rest.is_empty() {
+                optarg = Some(rest);
+            } else {
+                if next_optind > positional.len() {
+                    if silent {
+                        setenv(name, ":");
+                        if let Some(ch) = Some(ch) {
+                            setenv("OPTARG", ch.to_string());
+                        }
+                        setenv("OPTIND", next_optind.to_string());
+                        return 0;
+                    }
+                    eprintln!("getopts: option requires an argument -- {}", ch);
+                    setenv(name, "?");
+                    setenv("OPTIND", next_optind.to_string());
+                    return 0;
+                }
+                optarg = Some(positional[next_optind - 1].clone());
+                next_optind += 1;
+            }
+            optind = next_optind;
+            GETOPTS_POS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        Some(_) => {}
+        None => {
+            if silent {
+                setenv(name, "?");
+                setenv("OPTARG", ch.to_string());
+                setenv("OPTIND", optind.to_string());
+                return 0;
+            }
+            eprintln!("getopts: illegal option -- {}", ch);
+            setenv(name, "?");
+            setenv("OPTIND", optind.to_string());
+            return 0;
+        }
+    }
+    setenv(name, ch.to_string());
+    match optarg {
+        Some(v) => {
+            setenv("OPTARG", v);
+        }
+        None => {
+            unsetenv("OPTARG");
+        }
+    }
+    setenv("OPTIND", optind.to_string());
+    0
+}
+
+/// rlimit 资源类型（glibc 与 musl 签名不同）。
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
+/// `ulimit`：软/硬资源限制查看与设置。
+fn run_ulimit(cmd: &SimpleCmd) -> i32 {
+    fn fmt(v: u64) -> String {
+        if v == libc::RLIM_INFINITY {
+            "unlimited".to_string()
+        } else {
+            v.to_string()
+        }
+    }
+    fn resource(opt: char) -> Option<RlimitResource> {
+        Some(match opt {
+            'c' => libc::RLIMIT_CORE,
+            'd' => libc::RLIMIT_DATA,
+            'f' => libc::RLIMIT_FSIZE,
+            'n' => libc::RLIMIT_NOFILE,
+            's' => libc::RLIMIT_STACK,
+            't' => libc::RLIMIT_CPU,
+            'v' => libc::RLIMIT_AS,
+            'm' => libc::RLIMIT_RSS,
+            'u' => libc::RLIMIT_NPROC,
+            _ => return None,
+        })
+    }
+    let args = &cmd.argv[1..];
+    let mut hard = false;
+    let mut soft = false;
+    let mut all = false;
+    let mut which: Option<char> = None;
+    let mut value: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-H" {
+            hard = true;
+        } else if a == "-S" {
+            soft = true;
+        } else if a == "-a" {
+            all = true;
+        } else if let Some(opt) = a.strip_prefix('-') {
+            if let Some(c) = opt.chars().next() {
+                which = Some(c);
+            }
+        } else if let Ok(v) = a.parse::<u64>() {
+            value = Some(v);
+        } else if a == "unlimited" {
+            value = Some(libc::RLIM_INFINITY);
+        } else {
+            eprintln!("ulimit: invalid argument: {}", a);
+            return 1;
+        }
+        i += 1;
+    }
+    if !hard && !soft {
+        soft = true;
+    }
+    let read = |r: RlimitResource, hard: bool| -> String {
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrlimit(r, &mut lim) };
+        fmt(if hard { lim.rlim_max } else { lim.rlim_cur })
+    };
+    let list = |r: RlimitResource| {
+        println!(
+            "{:<16} (-{}) {}",
+            "limit",
+            match r {
+                libc::RLIMIT_CORE => "c",
+                libc::RLIMIT_DATA => "d",
+                libc::RLIMIT_FSIZE => "f",
+                libc::RLIMIT_NOFILE => "n",
+                libc::RLIMIT_STACK => "s",
+                libc::RLIMIT_CPU => "t",
+                libc::RLIMIT_AS => "v",
+                libc::RLIMIT_RSS => "m",
+                libc::RLIMIT_NPROC => "u",
+                _ => "?",
+            },
+            read(r, hard)
+        );
+    };
+    if all {
+        for r in [
+            libc::RLIMIT_CORE,
+            libc::RLIMIT_DATA,
+            libc::RLIMIT_FSIZE,
+            libc::RLIMIT_NOFILE,
+            libc::RLIMIT_STACK,
+            libc::RLIMIT_CPU,
+            libc::RLIMIT_AS,
+            libc::RLIMIT_NPROC,
+        ] {
+            list(r);
+        }
+        return 0;
+    }
+    let opt = which.unwrap_or('f');
+    let Some(r) = resource(opt) else {
+        eprintln!("ulimit: invalid option: -{}", opt);
+        return 2;
+    };
+    match value {
+        None => {
+            println!("{}", read(r, hard));
+            0
+        }
+        Some(v) => {
+            let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrlimit(r, &mut lim) };
+            // 字节类限制按 KB 输入
+            let scaled = match opt {
+                'c' | 'd' | 'f' | 's' | 'v' | 'm' => {
+                    if v == libc::RLIM_INFINITY {
+                        v
+                    } else {
+                        v.saturating_mul(1024)
+                    }
+                }
+                _ => v,
+            };
+            if soft || !hard {
+                lim.rlim_cur = scaled;
+            }
+            if hard {
+                lim.rlim_max = scaled;
+            }
+            if unsafe { libc::setrlimit(r, &lim) } != 0 {
+                eprintln!("ulimit: {}", std::io::Error::last_os_error());
+                return 1;
+            }
+            0
+        }
+    }
+}
+
+/// `kill` 内置：支持 `%job` 作业规格（其余与 kill applet 相同）。
+fn run_kill_builtin(cmd: &SimpleCmd) -> i32 {
+    use crate::applets::sys::kill::{parse_signal, signal_name, signal_number};
+    let mut sig = libc::SIGTERM;
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    let args = &cmd.argv[1..];
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "-l" || a == "--list" {
+            // `kill -l [sig]`：数字→名称，名称→数字，无参→全部名称
+            if let Some(arg) = args.get(i + 1) {
+                if let Ok(n) = arg.parse::<i32>() {
+                    if let Some(name) = signal_name(n) {
+                        println!("{}", name);
+                        return 0;
+                    }
+                } else if let Some(n) = signal_number(arg) {
+                    println!("{}", n);
+                    return 0;
+                }
+            }
+            println!("{}", crate::applets::sys::kill::signal_names().join(" "));
+            return 0;
+        }
+        if a == "-s" || a == "--signal" {
+            i += 1;
+            let Some(name) = args.get(i) else {
+                eprintln!("kill: option -s requires an argument");
+                return 1;
+            };
+            match signal_number(name) {
+                Some(n) => sig = n,
+                None => {
+                    eprintln!("kill: invalid signal '{}'", name);
+                    return 1;
+                }
+            }
+        } else if a.starts_with('-') && a.len() > 1 {
+            match parse_signal(a) {
+                Some(n) => sig = n,
+                None => {
+                    eprintln!("kill: invalid signal '{}'", a);
+                    return 1;
+                }
+            }
+        } else {
+            targets.push(a.to_string());
+        }
+        i += 1;
+    }
+    if targets.is_empty() {
+        eprintln!("kill: usage: kill [-SIGNAL] pid | %job ...");
+        return 1;
+    }
+    let mut rc = 0;
+    for t in targets {
+        if let Some(spec) = t.strip_prefix('%') {
+            let spec = format!("%{}", spec);
+            match jobs::find(Some(&spec)) {
+                Some(job) => {
+                    if unsafe { libc::kill(-job.pgid, sig) } != 0 {
+                        eprintln!("kill: {}: {}", t, std::io::Error::last_os_error());
+                        rc = 1;
+                    }
+                }
+                None => {
+                    eprintln!("kill: {}: no such job", t);
+                    rc = 1;
+                }
+            }
+        } else if let Ok(pid) = t.parse::<i32>() {
+            if unsafe { libc::kill(pid, sig) } != 0 {
+                eprintln!("kill: {}: {}", pid, std::io::Error::last_os_error());
+                rc = 1;
+            }
+        } else {
+            eprintln!("kill: invalid pid: {}", t);
+            rc = 1;
+        }
+    }
+    rc
 }
 
 #[cfg(test)]
@@ -1019,5 +1492,46 @@ mod tests {
         let mut rc = 0;
         try_builtin(&make_cmd(&["exit", "-1"]), &mut rc, &[]);
         assert_eq!(rc, 255);
+    }
+
+    // ─── ash 对齐：: / readonly / getopts / ulimit ───────────
+    #[test]
+    fn colon_is_builtin() {
+        assert!(is_builtin(":"));
+        let mut rc = 9;
+        let r = try_builtin(&make_cmd(&[":", "ignored"]), &mut rc, &[]);
+        assert!(matches!(r, BuiltinResult::Done));
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn readonly_protects_assignment() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["readonly", "RBOX_T_RO=1"]), &mut rc, &[]);
+        assert!(is_readonly("RBOX_T_RO"));
+        assert_eq!(std::env::var("RBOX_T_RO").unwrap(), "1");
+    }
+
+    #[test]
+    fn getopts_parses_flags() {
+        let mut rc = 0;
+        try_builtin(
+            &make_cmd(&["set", "--", "-a", "-b", "val", "x"]),
+            &mut rc,
+            &[],
+        );
+        try_builtin(&make_cmd(&["getopts", "ab:", "opt"]), &mut rc, &[]);
+        assert_eq!(std::env::var("opt").unwrap(), "a");
+        assert_eq!(std::env::var("OPTIND").unwrap(), "2");
+        try_builtin(&make_cmd(&["getopts", "ab:", "opt"]), &mut rc, &[]);
+        assert_eq!(std::env::var("opt").unwrap(), "b");
+        assert_eq!(std::env::var("OPTARG").unwrap(), "val");
+    }
+
+    #[test]
+    fn ulimit_shows_number() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["ulimit", "-n"]), &mut rc, &[]);
+        assert_eq!(rc, 0);
     }
 }

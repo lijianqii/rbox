@@ -83,6 +83,36 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
                 let w = next_word(&mut iter, "<<<")?;
                 cur.here_string = Some(w);
             }
+            Token::RedirInOut => {
+                let f = next_word(&mut iter, "<>")?;
+                cur.rw_file = Some(f);
+            }
+            Token::RedirOutForce => {
+                let f = next_word(&mut iter, ">|")?;
+                cur.stdout_file = Some(f);
+                cur.append = false;
+                cur.force = true;
+            }
+            Token::RedirFdOut(fd, append) => {
+                let f = next_word(&mut iter, "N>")?;
+                cur.fd_redirects
+                    .push(crate::applets::core::shell::types::FdRedirect {
+                        fd: *fd,
+                        path: f,
+                        append: *append,
+                        input: false,
+                    });
+            }
+            Token::RedirFdIn(fd) => {
+                let f = next_word(&mut iter, "N<")?;
+                cur.fd_redirects
+                    .push(crate::applets::core::shell::types::FdRedirect {
+                        fd: *fd,
+                        path: f,
+                        append: false,
+                        input: true,
+                    });
+            }
             Token::PipeBoth => {
                 if cur.is_empty() {
                     return Err("syntax error: empty command before |&".to_string());

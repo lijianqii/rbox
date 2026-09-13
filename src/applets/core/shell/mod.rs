@@ -458,6 +458,14 @@ impl Shell {
         if std::path::Path::new(profile_path).exists() {
             source_file(profile_path, &mut boot_rc, &mut boot_history);
         }
+        // $ENV：POSIX 交互式 shell 启动文件
+        if let Ok(env_file) = std::env::var("ENV")
+            && !env_file.is_empty()
+            && std::path::Path::new(&env_file).exists()
+        {
+            source_file(&env_file, &mut boot_rc, &mut boot_history);
+        }
+
         // 交互式启动文件：$HOME/.profile（若存在且与 /etc/profile 不同）
         if let Ok(home) = std::env::var("HOME") {
             let user_profile = format!("{}/.profile", home);
@@ -568,15 +576,19 @@ impl Shell {
                             continue;
                         }
                         let block = block_lines.join("\n");
-                        block_lines.clear();
-                        block_depth = 0;
-                        last_rc =
-                            compound::execute_block(&block, &mut last_rc, &history, &|rc: i32| {
+                        last_rc = script::run_compound_lines(
+                            &mut block_lines,
+                            last_rc,
+                            &history,
+                            &|rc: i32| {
                                 let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                                 let _ = io::stdout().flush();
                                 run_exit_trap(&history, rc);
                                 std::process::exit(rc);
-                            });
+                            },
+                        );
+                        block_lines.clear();
+                        block_depth = 0;
                         if history.last() != Some(&block) {
                             history.push(block.clone());
                             append_history(&block);
@@ -593,7 +605,7 @@ impl Shell {
 
                     // 执行行（历史扩展在 execute_line 内部完成）
                     last_rc =
-                        executor::execute_line(&full_line, &mut last_rc, &history, &|rc: i32| {
+                        script::run_interactive_line(&full_line, last_rc, &history, &|rc: i32| {
                             let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                             let _ = io::stdout().flush();
                             run_exit_trap(&history, rc);
@@ -643,8 +655,12 @@ impl Shell {
                 }
 
                 0x04 => {
-                    // Ctrl-D：空行时退出
+                    // Ctrl-D：空行时退出（set -o ignoreeof 时忽略）
                     if line.is_empty() {
+                        if options::ignoreeof() {
+                            let _ = writeln!(io::stdout(), "Use \"exit\" to leave the shell.");
+                            continue;
+                        }
                         let _ = writeln!(io::stdout());
                         break;
                     }

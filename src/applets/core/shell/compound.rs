@@ -454,13 +454,15 @@ fn exec_if(slice: &[String], last_rc: &mut i32, history: &[String], exit_fn: &dy
 /// 执行 for 块（slice 以 for 行开始、done 行结束）。
 fn exec_for(slice: &[String], last_rc: &mut i32, history: &[String], exit_fn: &dyn Fn(i32)) -> i32 {
     let header = strip_keyword(&slice[0], "for").unwrap_or("");
-    let (name, words_part) = match header.split_once(char::is_whitespace) {
+    let (name, words_part, has_in) = match header.split_once(char::is_whitespace) {
         Some((n, rest)) => {
             let rest = rest.trim();
-            let words = rest.strip_prefix("in").map(str::trim).unwrap_or("");
-            (n.to_string(), words.to_string())
+            match rest.strip_prefix("in") {
+                Some(w) => (n.to_string(), w.trim().to_string(), true),
+                None => (n.to_string(), String::new(), false),
+            }
         }
-        None => (header.to_string(), String::new()),
+        None => (header.to_string(), String::new(), false),
     };
     if name.is_empty() {
         eprintln!("shell: syntax error: for requires a variable name");
@@ -480,10 +482,15 @@ fn exec_for(slice: &[String], last_rc: &mut i32, history: &[String], exit_fn: &d
     i += 1;
     let body: Vec<String> = slice[i..slice.len().saturating_sub(1)].to_vec();
 
-    let words: Vec<String> = words_part
-        .split_whitespace()
-        .flat_map(|w| expand_word(w, *last_rc))
-        .collect();
+    let words: Vec<String> = if has_in {
+        words_part
+            .split_whitespace()
+            .flat_map(|w| expand_word(w, *last_rc))
+            .collect()
+    } else {
+        // `for i; do`：遍历位置参数（POSIX）
+        super::params::all()
+    };
     if words.is_empty() {
         *last_rc = 0;
         return 0;

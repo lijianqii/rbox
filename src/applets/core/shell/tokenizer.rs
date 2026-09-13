@@ -87,6 +87,65 @@ pub fn tokenize(line: &str) -> Vec<Token> {
 
         match c {
             '#' if !in_token => break,
+            '$' if chars.peek() == Some(&'(') => {
+                // $(...) / $((...))：整体复制（内部 ; & | < > 不是分隔符）
+                cur.push('$');
+                let mut depth = 0;
+                let mut in_dq = false;
+                let mut in_sq = false;
+                while let Some(nc) = chars.next() {
+                    cur.push(nc);
+                    if in_sq {
+                        if nc == '\'' {
+                            in_sq = false;
+                        }
+                        continue;
+                    }
+                    if in_dq {
+                        if nc == '\\' {
+                            if let Some(n2) = chars.next() {
+                                cur.push(n2);
+                            }
+                        } else if nc == '"' {
+                            in_dq = false;
+                        }
+                        continue;
+                    }
+                    match nc {
+                        '\'' => in_sq = true,
+                        '"' => in_dq = true,
+                        '\\' => {
+                            if let Some(n2) = chars.next() {
+                                cur.push(n2);
+                            }
+                        }
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                in_token = true;
+            }
+            '`' => {
+                // 反引号命令替换：整体复制
+                cur.push('`');
+                while let Some(nc) = chars.next() {
+                    cur.push(nc);
+                    if nc == '\\' {
+                        if let Some(n2) = chars.next() {
+                            cur.push(n2);
+                        }
+                    } else if nc == '`' {
+                        break;
+                    }
+                }
+                in_token = true;
+            }
             '$' if chars.peek() == Some(&'\'') => {
                 // $'...' ANSI-C 引用
                 chars.next(); // consume opening quote
@@ -130,10 +189,16 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 in_dquote = true;
                 in_token = true;
             }
-            '0'..='9' if chars.peek() == Some(&'<') => {
-                // N<&M / N<&-（输入侧 fd 复制/关闭；N<file 按 stdin 处理）
-                let from = c.to_digit(10).unwrap_or(0) as u8;
-                chars.next(); // consume '<'
+            '0'..='9' if matches!(chars.peek(), Some(&'<') | Some(&'>')) => {
+                // N<file / N<&M / N<&- / N>file / N>>file（任意 fd）
+                let mut fd: u32 = c.to_digit(10).unwrap_or(0);
+                while let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                    fd = fd * 10 + d;
+                    chars.next();
+                }
+                let from = if fd <= 255 { fd as u8 } else { 255 };
+                let is_input = chars.peek() == Some(&'<');
+                chars.next(); // consume '<' or '>'
                 flush_word(&mut tokens, &mut cur, &mut in_token);
                 if chars.peek() == Some(&'&') {
                     chars.next();
@@ -143,11 +208,33 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                     } else {
                         match read_fd(&mut chars) {
                             Some(target) => tokens.push(Token::RedirDup(from, target)),
-                            None => tokens.push(Token::RedirIn),
+                            None => tokens.push(if is_input {
+                                Token::RedirFdIn(from)
+                            } else {
+                                Token::RedirFdOut(from, false)
+                            }),
                         }
                     }
+                } else if !is_input && chars.peek() == Some(&'>') {
+                    chars.next();
+                    // fd 1/2 保持专用 token（解析/测试兼容）
+                    tokens.push(match from {
+                        1 => Token::RedirAppend,
+                        2 => Token::RedirErrAppend,
+                        _ => Token::RedirFdOut(from, true),
+                    });
+                } else if is_input {
+                    if from == 0 {
+                        tokens.push(Token::RedirIn);
+                    } else {
+                        tokens.push(Token::RedirFdIn(from));
+                    }
+                } else if from == 1 {
+                    tokens.push(Token::RedirOut);
+                } else if from == 2 {
+                    tokens.push(Token::RedirErr);
                 } else {
-                    tokens.push(Token::RedirIn);
+                    tokens.push(Token::RedirFdOut(from, false));
                 }
             }
             '1' | '2' if chars.peek() == Some(&'>') => {
@@ -205,6 +292,9 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 } else if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::RedirAppend);
+                } else if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::RedirOutForce);
                 } else {
                     tokens.push(Token::RedirOut);
                 }
@@ -219,6 +309,10 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                     } else {
                         tokens.push(Token::RedirHereDoc);
                     }
+                } else if chars.peek() == Some(&'>') {
+                    // `<>` 读写重定向
+                    chars.next();
+                    tokens.push(Token::RedirInOut);
                 } else if chars.peek() == Some(&'&') {
                     chars.next();
                     if chars.peek() == Some(&'-') {

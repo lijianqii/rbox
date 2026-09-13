@@ -14,12 +14,21 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
         for arg in &cmd.argv {
             new_argv.extend(expand_word(arg, last_rc));
         }
+        // 重定向目标路径也做展开（`> $file`）
+        let expand_path = |p: &Option<String>| -> Option<String> {
+            p.as_ref().map(|path| {
+                expand_word(path, last_rc)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| path.clone())
+            })
+        };
         new_cmds.push(SimpleCmd {
             argv: new_argv,
-            stdin_file: cmd.stdin_file.clone(),
+            stdin_file: expand_path(&cmd.stdin_file),
             heredoc: cmd.heredoc.clone(),
-            stdout_file: cmd.stdout_file.clone(),
-            stderr_file: cmd.stderr_file.clone(),
+            stdout_file: expand_path(&cmd.stdout_file),
+            stderr_file: expand_path(&cmd.stderr_file),
             append: cmd.append,
             append_err: cmd.append_err,
             dup_fds: cmd.dup_fds.clone(),
@@ -30,6 +39,21 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
                 .as_ref()
                 .map(|h| expand_word(h, last_rc).join(" ")),
             stderr_to_pipe: cmd.stderr_to_pipe,
+            rw_file: expand_path(&cmd.rw_file),
+            force: cmd.force,
+            fd_redirects: cmd
+                .fd_redirects
+                .iter()
+                .map(|r| crate::applets::core::shell::types::FdRedirect {
+                    fd: r.fd,
+                    path: expand_word(&r.path, last_rc)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| r.path.clone()),
+                    append: r.append,
+                    input: r.input,
+                })
+                .collect(),
         });
     }
     Ok(Pipeline {
@@ -59,9 +83,11 @@ fn expand_word_single(arg: &str, last_rc: i32) -> Vec<String> {
     let has_unquoted_expansion = arg.contains(SPLIT_ESCAPE);
     let expanded = expand_vars(arg, last_rc);
     let expanded = expand_tilde(&expanded);
-    let globs = expand_glob(&expanded);
-    if !globs.is_empty() {
-        return globs;
+    if !super::options::noglob() {
+        let globs = expand_glob(&expanded);
+        if !globs.is_empty() {
+            return globs;
+        }
     }
     let literal = unescape_glob(&expanded);
     if has_unquoted_expansion {
@@ -250,6 +276,10 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                     chars.next();
                     result.push_str(&super::params::last_bg().to_string());
                 }
+                Some('-') => {
+                    chars.next();
+                    result.push_str(&super::options::option_string());
+                }
                 Some('#') => {
                     chars.next();
                     result.push_str(&super::params::count().to_string());
@@ -320,6 +350,9 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
 
 /// `${...}` 参数展开：支持 `:-` `:=` `:?` `:+`、`${#var}`、`#`/`##`/`%`/`%%` 模式删除、`/`/`//` 替换。
 fn expand_braced(spec: &str, last_rc: i32) -> String {
+    // 去除引号保护标记（如 `${p:1:3}` 中 `}` 前的标记）
+    let spec_clean = spec.replace(GLOB_ESCAPE, "");
+    let spec = spec_clean.as_str();
     if let Some(name) = spec.strip_prefix('#') {
         return lookup_var(name, last_rc).chars().count().to_string();
     }
@@ -331,6 +364,39 @@ fn expand_braced(spec: &str, last_rc: i32) -> String {
                     || matches!(c, '@' | '*' | '?' | '$' | '!' | '#')
             })
     };
+    // ${var:offset[:length]} 子串（在 :- := :? :+ 之后检查）
+    if let Some(pos) = spec.find(':')
+        && pos > 0
+        && !matches!(
+            spec.as_bytes().get(pos + 1),
+            Some(b'-') | Some(b'=') | Some(b'?') | Some(b'+')
+        )
+    {
+        let name = &spec[..pos];
+        if valid_name(name) {
+            let rest = &spec[pos + 1..];
+            let (off_s, len_s) = match rest.split_once(':') {
+                Some((a, b)) => (a, Some(b)),
+                None => (rest, None),
+            };
+            if let Ok(off) = off_s.trim().parse::<i64>() {
+                let val = lookup_var(name, last_rc);
+                let chars: Vec<char> = val.chars().collect();
+                let n = chars.len() as i64;
+                let start = if off < 0 {
+                    (n + off).max(0)
+                } else {
+                    off.min(n)
+                } as usize;
+                let end = match len_s.and_then(|l| l.trim().parse::<i64>().ok()) {
+                    Some(l) if l >= 0 => (start as i64 + l).min(n) as usize,
+                    Some(l) => (n + l).max(start as i64) as usize,
+                    None => n as usize,
+                };
+                return chars[start..end.min(chars.len())].iter().collect();
+            }
+        }
+    }
     for op in [":-", ":=", ":?", ":+", "##", "#", "%%", "%", "/"] {
         if let Some(pos) = spec.find(op) {
             let name = &spec[..pos];
@@ -446,6 +512,8 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
         "?" => return last_rc.to_string(),
         "$" => return std::process::id().to_string(),
         "!" => return super::params::last_bg().to_string(),
+        "-" => return super::options::option_string(),
+        "RANDOM" => return (random_u32() % 32768).to_string(),
         "#" => return super::params::count().to_string(),
         "@" | "*" => return super::params::all().join(" "),
         "0" => return super::params::get0(),
@@ -477,6 +545,23 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
 
 // ─── 算术展开 $((...)) ─────────────────────────────────
 
+/// `$RANDOM`：简单 LCG（种子来自 pid+时间）。
+fn random_u32() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static STATE: AtomicU32 = AtomicU32::new(0);
+    let mut x = STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::process::id().wrapping_mul(2654435761)
+            ^ std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(12345);
+    }
+    x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+    STATE.store(x, Ordering::Relaxed);
+    x
+}
+
 /// 求值算术表达式（整数：+ - * / % 与括号，标识符取环境变量）。
 /// 非法表达式或除零返回 None（调用方按 0 处理并告警）。
 pub(crate) fn eval_arith(expr: &str) -> Option<i64> {
@@ -490,6 +575,22 @@ pub(crate) fn eval_arith(expr: &str) -> Option<i64> {
         return None;
     }
     Some(v)
+}
+
+/// 读取整数型变量值（未设置/非数字按 0）。
+fn var_i64(name: &str) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// 写入整数型变量值。
+fn set_var_i64(name: &str, val: i64) {
+    // SAFETY: shell 单线程
+    unsafe {
+        std::env::set_var(name, val.to_string());
+    }
 }
 
 struct ArithParser<'a> {
@@ -513,9 +614,38 @@ impl ArithParser<'_> {
         self.s.get(self.pos).copied()
     }
 
-    /// expr := assignment | logical_or
+    /// expr := assignment (',' assignment)*（返回最后一个）
     fn expr(&mut self) -> Option<i64> {
-        self.assignment()
+        let mut v = self.assignment()?;
+        loop {
+            self.ws();
+            if self.peek() == Some(b',') {
+                self.pos += 1;
+                v = self.assignment()?;
+            } else {
+                break;
+            }
+        }
+        Some(v)
+    }
+
+    /// 读取标识符。
+    fn read_ident(&mut self) -> Option<String> {
+        self.ws();
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if start == self.pos {
+            return None;
+        }
+        std::str::from_utf8(&self.s[start..self.pos])
+            .ok()
+            .map(str::to_string)
     }
 
     /// assignment := IDENT ('='|'+='|'-='|'*='|'/'|'%=') assignment
@@ -578,7 +708,70 @@ impl ArithParser<'_> {
             return Some(val);
         }
         self.pos = save;
-        self.logical_or()
+        self.ternary()
+    }
+
+    /// ternary := logical_or ('?' ternary ':' ternary)?
+    fn ternary(&mut self) -> Option<i64> {
+        let cond = self.logical_or()?;
+        self.ws();
+        if self.peek() == Some(b'?') {
+            self.pos += 1;
+            let a = self.ternary()?;
+            self.ws();
+            if self.peek() != Some(b':') {
+                return None;
+            }
+            self.pos += 1;
+            let b = self.ternary()?;
+            return Some(if cond != 0 { a } else { b });
+        }
+        Some(cond)
+    }
+
+    /// bit_or := bit_xor ('|' bit_xor)*（不吞 '||'）
+    fn bit_or(&mut self) -> Option<i64> {
+        let mut v = self.bit_xor()?;
+        loop {
+            self.ws();
+            if self.peek() == Some(b'|') && self.s.get(self.pos + 1) != Some(&b'|') {
+                self.pos += 1;
+                v |= self.bit_xor()?;
+            } else {
+                break;
+            }
+        }
+        Some(v)
+    }
+
+    /// bit_xor := bit_and ('^' bit_and)*
+    fn bit_xor(&mut self) -> Option<i64> {
+        let mut v = self.bit_and()?;
+        loop {
+            self.ws();
+            if self.peek() == Some(b'^') {
+                self.pos += 1;
+                v ^= self.bit_and()?;
+            } else {
+                break;
+            }
+        }
+        Some(v)
+    }
+
+    /// bit_and := cmp ('&' cmp)*（不吞 '&&'）
+    fn bit_and(&mut self) -> Option<i64> {
+        let mut v = self.cmp()?;
+        loop {
+            self.ws();
+            if self.peek() == Some(b'&') && self.s.get(self.pos + 1) != Some(&b'&') {
+                self.pos += 1;
+                v &= self.cmp()?;
+            } else {
+                break;
+            }
+        }
+        Some(v)
     }
 
     /// logical_or := logical_and ('||' logical_and)*
@@ -597,14 +790,14 @@ impl ArithParser<'_> {
         Some(v)
     }
 
-    /// logical_and := cmp ('&&' cmp)*
+    /// logical_and := bit_or ('&&' bit_or)*
     fn logical_and(&mut self) -> Option<i64> {
-        let mut v = self.cmp()?;
+        let mut v = self.bit_or()?;
         loop {
             self.ws();
             if self.s.get(self.pos..self.pos + 2) == Some(b"&&") {
                 self.pos += 2;
-                let r = self.cmp()?;
+                let r = self.bit_or()?;
                 v = ((v != 0) && (r != 0)) as i64;
             } else {
                 break;
@@ -704,17 +897,35 @@ impl ArithParser<'_> {
     fn factor(&mut self) -> Option<i64> {
         self.ws();
         match self.peek() {
-            Some(b'-') => {
+            Some(b'-') if self.s.get(self.pos + 1) != Some(&b'-') => {
                 self.pos += 1;
                 Some(-self.factor()?)
             }
-            Some(b'+') => {
+            Some(b'+') if self.s.get(self.pos + 1) != Some(&b'+') => {
                 self.pos += 1;
                 self.factor()
             }
             Some(b'!') if self.s.get(self.pos + 1) != Some(&b'=') => {
                 self.pos += 1;
                 Some((self.factor()? == 0) as i64)
+            }
+            Some(b'~') => {
+                self.pos += 1;
+                Some(!self.factor()?)
+            }
+            Some(b'+') if self.s.get(self.pos + 1) == Some(&b'+') => {
+                self.pos += 2;
+                let name = self.read_ident()?;
+                let val = var_i64(&name) + 1;
+                set_var_i64(&name, val);
+                Some(val)
+            }
+            Some(b'-') if self.s.get(self.pos + 1) == Some(&b'-') => {
+                self.pos += 2;
+                let name = self.read_ident()?;
+                let val = var_i64(&name) - 1;
+                set_var_i64(&name, val);
+                Some(val)
             }
             _ => self.primary(),
         }
@@ -752,12 +963,19 @@ impl ArithParser<'_> {
             return Some(n);
         }
         // 标识符：环境变量值按整数解析，未设置/非数字按 0
-        Some(
-            std::env::var(tok)
-                .ok()
-                .and_then(|v| v.trim().parse::<i64>().ok())
-                .unwrap_or(0),
-        )
+        let val = var_i64(tok);
+        // 后缀 ++/--
+        if self.s.get(self.pos..self.pos + 2) == Some(b"++") {
+            self.pos += 2;
+            set_var_i64(tok, val + 1);
+            return Some(val);
+        }
+        if self.s.get(self.pos..self.pos + 2) == Some(b"--") {
+            self.pos += 2;
+            set_var_i64(tok, val - 1);
+            return Some(val);
+        }
+        Some(val)
     }
 }
 
@@ -1538,4 +1756,45 @@ mod tests {
 
     // ─── expand_tilde 边界 ────────────────────
     //（tilde_no_home_var / tilde_with_home_set 已并入 tilde_expansion，避免共享 HOME 竞争）
+
+    // ─── ash 对齐：算术位运算/三元/自增、子串、$- ────────────
+    #[test]
+    fn arith_bitwise_ternary() {
+        assert_eq!(expand_vars("$((5&3))", 0), "1");
+        assert_eq!(expand_vars("$((5|2))", 0), "7");
+        assert_eq!(expand_vars("$((5^1))", 0), "4");
+        assert_eq!(expand_vars("$((~0))", 0), "-1");
+        assert_eq!(expand_vars("$((1?2:3))", 0), "2");
+        assert_eq!(expand_vars("$((0?2:3))", 0), "3");
+        assert_eq!(expand_vars("$((1,2,3))", 0), "3");
+    }
+
+    #[test]
+    fn arith_incdec() {
+        // SAFETY: 单测串行（cargo test 单线程默认并发，使用唯一变量名避免竞争）
+        unsafe {
+            std::env::set_var("RBOX_T_INC_A", "5");
+        }
+        assert_eq!(expand_vars("$((RBOX_T_INC_A++))", 0), "5");
+        assert_eq!(std::env::var("RBOX_T_INC_A").unwrap(), "6");
+        assert_eq!(expand_vars("$((++RBOX_T_INC_A))", 0), "7");
+        assert_eq!(std::env::var("RBOX_T_INC_A").unwrap(), "7");
+    }
+
+    #[test]
+    fn param_substring() {
+        // SAFETY: 单测使用唯一变量名
+        unsafe {
+            std::env::set_var("RBOX_T_SUB", "abcdef");
+        }
+        assert_eq!(expand_vars("${RBOX_T_SUB:1:3}", 0), "bcd");
+        assert_eq!(expand_vars("${RBOX_T_SUB:2}", 0), "cdef");
+    }
+
+    #[test]
+    fn dollar_dash_options() {
+        let out = expand_vars("$-", 0);
+        // 至少应包含 -e/-x 等字符或为空，不产生 `$` 字面
+        assert!(!out.contains('$'));
+    }
 }

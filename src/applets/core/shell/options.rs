@@ -9,6 +9,13 @@ static XTRACE: AtomicBool = AtomicBool::new(false);
 static NOUNSET: AtomicBool = AtomicBool::new(false);
 static PIPEFAIL: AtomicBool = AtomicBool::new(false);
 static NOCLOBBER: AtomicBool = AtomicBool::new(false);
+static NOGLOB: AtomicBool = AtomicBool::new(false);
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+static NOEXEC: AtomicBool = AtomicBool::new(false);
+static ALLEXPORT: AtomicBool = AtomicBool::new(false);
+static MONITOR: AtomicBool = AtomicBool::new(false);
+static NOTIFY: AtomicBool = AtomicBool::new(false);
+static IGNOREEOF: AtomicBool = AtomicBool::new(false);
 /// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
 static NOUNSET_VIOLATION: AtomicBool = AtomicBool::new(false);
 /// 退出请求（`exit` 之外的内部退出：set -e 触发等）；-1 表示无。
@@ -45,6 +52,123 @@ pub(crate) fn noclobber() -> bool {
 }
 pub(crate) fn set_noclobber(v: bool) {
     NOCLOBBER.store(v, Ordering::SeqCst);
+}
+pub(crate) fn noglob() -> bool {
+    NOGLOB.load(Ordering::SeqCst)
+}
+pub(crate) fn set_noglob(v: bool) {
+    NOGLOB.store(v, Ordering::SeqCst);
+}
+pub(crate) fn verbose() -> bool {
+    VERBOSE.load(Ordering::SeqCst)
+}
+pub(crate) fn set_verbose(v: bool) {
+    VERBOSE.store(v, Ordering::SeqCst);
+}
+pub(crate) fn noexec() -> bool {
+    NOEXEC.load(Ordering::SeqCst)
+}
+pub(crate) fn set_noexec(v: bool) {
+    NOEXEC.store(v, Ordering::SeqCst);
+}
+pub(crate) fn allexport() -> bool {
+    ALLEXPORT.load(Ordering::SeqCst)
+}
+pub(crate) fn set_allexport(v: bool) {
+    ALLEXPORT.store(v, Ordering::SeqCst);
+}
+pub(crate) fn monitor() -> bool {
+    MONITOR.load(Ordering::SeqCst)
+}
+pub(crate) fn set_monitor(v: bool) {
+    MONITOR.store(v, Ordering::SeqCst);
+}
+pub(crate) fn notify() -> bool {
+    NOTIFY.load(Ordering::SeqCst)
+}
+pub(crate) fn set_notify(v: bool) {
+    NOTIFY.store(v, Ordering::SeqCst);
+}
+pub(crate) fn ignoreeof() -> bool {
+    IGNOREEOF.load(Ordering::SeqCst)
+}
+pub(crate) fn set_ignoreeof(v: bool) {
+    IGNOREEOF.store(v, Ordering::SeqCst);
+}
+
+/// `$-`：当前选项字母（ash 风格：a b C e f m n u v x）。
+pub(crate) fn option_string() -> String {
+    let mut out = String::new();
+    if allexport() {
+        out.push('a');
+    }
+    if noclobber() {
+        out.push('C');
+    }
+    if errexit() {
+        out.push('e');
+    }
+    if noglob() {
+        out.push('f');
+    }
+    if monitor() {
+        out.push('m');
+    }
+    if noexec() {
+        out.push('n');
+    }
+    if nounset() {
+        out.push('u');
+    }
+    if verbose() {
+        out.push('v');
+    }
+    if xtrace() {
+        out.push('x');
+    }
+    out
+}
+
+/// `set -o` 可设置选项名 -> 当前值。
+pub(crate) fn named_options() -> Vec<(&'static str, bool)> {
+    vec![
+        ("allexport", allexport()),
+        ("errexit", errexit()),
+        ("ignoreeof", ignoreeof()),
+        ("monitor", monitor()),
+        ("noclobber", noclobber()),
+        ("noexec", noexec()),
+        ("noglob", noglob()),
+        ("nolog", false),
+        ("notify", notify()),
+        ("nounset", nounset()),
+        ("pipefail", pipefail()),
+        ("verbose", verbose()),
+        ("vi", false),
+        ("xtrace", xtrace()),
+    ]
+}
+
+/// 设置命名选项；返回是否成功。
+pub(crate) fn set_named(name: &str, on: bool) -> bool {
+    match name {
+        "allexport" => set_allexport(on),
+        "errexit" => set_errexit(on),
+        "ignoreeof" => set_ignoreeof(on),
+        "monitor" => set_monitor(on),
+        "noclobber" => set_noclobber(on),
+        "noexec" => set_noexec(on),
+        "noglob" => set_noglob(on),
+        "nolog" => {}
+        "notify" => set_notify(on),
+        "nounset" => set_nounset(on),
+        "pipefail" => set_pipefail(on),
+        "verbose" => set_verbose(on),
+        "vi" => {}
+        "xtrace" => set_xtrace(on),
+        _ => return false,
+    }
+    true
 }
 
 /// 记录 nounset 违规（未定义变量展开）。

@@ -31,11 +31,11 @@ pub(crate) fn pending_stdin() -> &'static Mutex<VecDeque<u8>> {
 }
 
 /// 以覆盖或追加方式打开文件用于重定向。
-fn open_redirect(path: &str, append: bool) -> Option<std::fs::File> {
+fn open_redirect(path: &str, append: bool, force: bool) -> Option<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     let result = if append {
         opts.create(true).append(true).open(path)
-    } else if crate::applets::core::shell::options::noclobber() {
+    } else if !force && crate::applets::core::shell::options::noclobber() {
         // set -C：不覆盖已存在文件
         opts.create_new(true).write(true).open(path)
     } else {
@@ -81,8 +81,9 @@ pub fn execute_line(
 ) -> i32 {
     // 历史扩展：!! -> 上一条命令，!n -> 第 n 条，!$ -> 上一条命令的最后一个参数
     let expanded_line = expand_history(line, history);
-    // 别名展开（命令位置首词）与命令替换 $(...)
+    // 别名展开（命令位置首词）、反引号与 $(...) 命令替换
     let expanded_line = alias::expand_alias(&expanded_line);
+    let expanded_line = expand_backticks(&expanded_line);
     let expanded_line = expand_command_subst(&expanded_line);
     let line = expanded_line.as_str();
 
@@ -125,7 +126,10 @@ pub fn execute_line(
         }
 
         // 拆分命令前导赋值（VAR=val cmd / 纯赋值 VAR=val）
-        split_assignments(&mut expanded.cmds, *last_rc);
+        if !split_assignments(&mut expanded.cmds, *last_rc) {
+            *last_rc = 1;
+            continue;
+        }
 
         // nounset 违规：展开阶段发现未定义变量（由脚本驱动决定退出）
         if crate::applets::core::shell::options::nounset_violation() {
@@ -274,7 +278,7 @@ pub fn execute_line(
                 }
             }
             if is_builtin(argv0) {
-                match apply_builtin_redirects(&expanded.cmds[0]) {
+                match apply_redirects(&expanded.cmds[0]) {
                     Err(code) => {
                         *last_rc = code;
                         continue;
@@ -322,7 +326,7 @@ pub fn execute_line(
 }
 
 /// 内置命令重定向的恢复句柄：Drop 时恢复原标准流并关闭保存的 fd。
-struct BuiltinRedirectGuard {
+pub(crate) struct BuiltinRedirectGuard {
     saved_in: Option<i32>,
     saved_out: Option<i32>,
     saved_err: Option<i32>,
@@ -394,12 +398,14 @@ pub(crate) fn persist_builtin_redirects() {
 /// 为内置命令应用重定向：先把所有目标文件打开成功，再用 `dup2` 临时替换
 /// 标准流（单线程时刻执行，无并发读取）；失败返回错误码，不修改任何 fd。
 /// 返回的 guard 在 Drop 时恢复原始标准流。
-fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuard>, i32> {
+pub(crate) fn apply_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuard>, i32> {
     if cmd.stdin_file.is_none()
         && cmd.stdout_file.is_none()
         && cmd.stderr_file.is_none()
         && cmd.dup_fds.is_empty()
         && cmd.close_fds.is_empty()
+        && cmd.rw_file.is_none()
+        && cmd.fd_redirects.is_empty()
     {
         return Ok(None);
     }
@@ -418,19 +424,50 @@ fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuar
         None => None,
     };
     let out_file = match &cmd.stdout_file {
-        Some(f) => match open_redirect(f, cmd.append) {
+        Some(f) => match open_redirect(f, cmd.append, cmd.force) {
             Some(f) => Some(f),
             None => return Err(1),
         },
         None => None,
     };
     let err_file = match &cmd.stderr_file {
-        Some(f) => match open_redirect(f, cmd.append_err) {
+        Some(f) => match open_redirect(f, cmd.append_err, cmd.force) {
             Some(f) => Some(f),
             None => return Err(1),
         },
         None => None,
     };
+    let rw_file = match &cmd.rw_file {
+        Some(f) => match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(f)
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("shell: {}: {}", f, e);
+                return Err(1);
+            }
+        },
+        None => None,
+    };
+    let mut extra_files: Vec<(u8, std::fs::File)> = Vec::new();
+    for r in &cmd.fd_redirects {
+        let f = if r.input {
+            std::fs::File::open(&r.path).ok()
+        } else {
+            open_redirect(&r.path, r.append, cmd.force)
+        };
+        match f {
+            Some(f) => extra_files.push((r.fd, f)),
+            None => {
+                eprintln!("shell: {}: cannot open", r.path);
+                return Err(1);
+            }
+        }
+    }
 
     let mut guard = BuiltinRedirectGuard {
         saved_in: None,
@@ -460,6 +497,29 @@ fn apply_builtin_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectGuar
             let saved = libc::dup(libc::STDERR_FILENO);
             if saved >= 0 && libc::dup2(f.as_raw_fd(), libc::STDERR_FILENO) >= 0 {
                 guard.saved_err = Some(saved);
+            } else if saved >= 0 {
+                libc::close(saved);
+            }
+        }
+        if let Some(f) = rw_file {
+            let saved_in = libc::dup(libc::STDIN_FILENO);
+            let saved_out = libc::dup(libc::STDOUT_FILENO);
+            if saved_in >= 0 && libc::dup2(f.as_raw_fd(), libc::STDIN_FILENO) >= 0 {
+                guard.saved_in = Some(saved_in);
+            } else if saved_in >= 0 {
+                libc::close(saved_in);
+            }
+            if saved_out >= 0 && libc::dup2(f.as_raw_fd(), libc::STDOUT_FILENO) >= 0 {
+                guard.saved_out = Some(saved_out);
+            } else if saved_out >= 0 {
+                libc::close(saved_out);
+            }
+        }
+        for (fd, f) in &extra_files {
+            let fd = *fd as i32;
+            let saved = libc::dup(fd);
+            if saved >= 0 && libc::dup2(f.as_raw_fd(), fd) >= 0 {
+                guard.saved_dups.push((saved, fd));
             } else if saved >= 0 {
                 libc::close(saved);
             }
@@ -628,7 +688,7 @@ pub fn capture_output(line: &str) -> Option<String> {
         }
         let (rc, out) = capture_pipeline(&expanded)?;
         last_rc = rc;
-        output = out;
+        output.push_str(&out);
     }
     Some(output)
 }
@@ -653,11 +713,38 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
             dups.push((2, 1));
         }
         let closes = cmd.close_fds.clone();
-        if !dups.is_empty() || !closes.is_empty() {
+        let mut fd_files: Vec<std::fs::File> = Vec::new();
+        let mut fd_dups: Vec<(i32, i32)> = Vec::new();
+        for r in &cmd.fd_redirects {
+            let file = if r.input {
+                std::fs::File::open(&r.path).ok()
+            } else {
+                open_redirect(&r.path, r.append, cmd.force)
+            };
+            match file {
+                Some(f) => {
+                    let raw = f.as_raw_fd();
+                    unsafe {
+                        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                    fd_dups.push((raw, r.fd as i32));
+                    fd_files.push(f);
+                }
+                None => {
+                    eprintln!("shell: {}: cannot open", r.path);
+                    cleanup_spawned_children(&mut children);
+                    return None;
+                }
+            }
+        }
+        if !dups.is_empty() || !closes.is_empty() || !fd_dups.is_empty() {
             unsafe {
                 command.pre_exec(move || {
                     for (from, to) in &dups {
                         libc::dup2(*to as i32, *from as i32);
+                    }
+                    for (src, dst) in &fd_dups {
+                        libc::dup2(*src, *dst);
                     }
                     for fd in &closes {
                         libc::close(*fd as i32);
@@ -666,6 +753,7 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
                 });
             }
         }
+        let _ = &fd_files;
         if let Some(ref hs) = cmd.here_string {
             let seq = HERESTR_SEQ.fetch_add(1, Ordering::SeqCst);
             let path = format!("/tmp/rbox_herestr_{}_{}", std::process::id(), seq);
@@ -673,6 +761,24 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
                 && let Ok(file) = std::fs::File::open(&path)
             {
                 command.stdin(Stdio::from(file));
+            }
+        }
+        if let Some(ref f) = cmd.rw_file
+            && let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(f)
+        {
+            match file.try_clone() {
+                Ok(f2) => {
+                    command.stdin(Stdio::from(file));
+                    command.stdout(Stdio::from(f2));
+                }
+                Err(_) => {
+                    command.stdin(Stdio::from(file));
+                }
             }
         }
 
@@ -689,7 +795,7 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
             }
         }
         match &cmd.stdout_file {
-            Some(f) => match open_redirect(f, cmd.append) {
+            Some(f) => match open_redirect(f, cmd.append, cmd.force) {
                 Some(file) => {
                     command.stdout(Stdio::from(file));
                 }
@@ -703,7 +809,7 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
             }
         }
         if let Some(ref f) = cmd.stderr_file {
-            match open_redirect(f, cmd.append_err) {
+            match open_redirect(f, cmd.append_err, cmd.force) {
                 Some(file) => {
                     command.stderr(Stdio::from(file));
                 }
@@ -816,7 +922,8 @@ fn wait_child_pid(pid: i32) -> (i32, bool) {
 
 /// 拆分命令前导赋值：`VAR=val cmd` -> env + argv；纯赋值时 argv 为空。
 /// 值会先做变量展开（与 bash 一致）。
-fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) {
+fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) -> bool {
+    let mut ok = true;
     for cmd in cmds.iter_mut() {
         let mut assigns: Vec<(String, String)> = Vec::new();
         while let Some(first) = cmd.argv.first() {
@@ -832,6 +939,11 @@ fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) {
             if !valid {
                 break;
             }
+            if super::builtin::is_readonly(k) {
+                eprintln!("shell: {}: is read only", k);
+                ok = false;
+                break;
+            }
             let val = crate::applets::core::shell::expander::expand_vars(v, last_rc);
             assigns.push((k.to_string(), val));
             cmd.argv.remove(0);
@@ -840,6 +952,95 @@ fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) {
             cmd.env = assigns;
         }
     }
+    ok
+}
+
+/// 解析复合命令尾部的重定向（如 `done < file`、`} > out`）为 SimpleCmd（argv 为空）。
+/// 非重定向内容返回 None。
+pub(crate) fn parse_redirect_tail(tail: &str) -> Option<SimpleCmd> {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return None;
+    }
+    // 前置哑命令，使纯重定向序列也能被解析
+    let tokens = tokenize(&format!("__rbox_dummy__ {}", tail));
+    let cmd_list = build_command_list(&tokens).ok()?;
+    let mut cmd: SimpleCmd = (*cmd_list.segments.first()?.pipeline.cmds.first()?).clone();
+    if cmd.argv.len() != 1 || cmd.argv[0] != "__rbox_dummy__" {
+        return None;
+    }
+    cmd.argv.clear();
+    Some(cmd)
+}
+
+/// 展开反引号命令替换：`` `cmd` `` -> 输出（单引号内不展开）。
+pub fn expand_backticks(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let mut in_squote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            let ch = line[i..].chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            i += ch.len_utf8();
+            if c == b'\'' {
+                in_squote = false;
+            }
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_squote = true;
+                out.push('\'');
+                i += 1;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 1;
+                if i < bytes.len() {
+                    let ch = line[i..].chars().next().unwrap_or('\u{fffd}');
+                    out.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+            b'`' => {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len() {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b'`' {
+                        break;
+                    }
+                    j += 1;
+                }
+                if j >= bytes.len() {
+                    out.push('`');
+                    i += 1;
+                    continue;
+                }
+                let inner = &line[start..j];
+                let inner = inner
+                    .replace("\\`", "`")
+                    .replace("\\\\", "\\")
+                    .replace("\\$", "$");
+                let inner = expand_backticks(&inner);
+                let output = capture_output(&inner).unwrap_or_default();
+                out.push_str(output.trim_end_matches('\n'));
+                i = j + 1;
+            }
+            _ => {
+                let ch = line[i..].chars().next().unwrap_or('\u{fffd}');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
 }
 
 /// 执行一条管道（可能含多条 SimpleCmd）。`cmdline` 为原始命令行（作业控制显示用）。
@@ -876,6 +1077,30 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
             dups.push((2, 1));
         }
         let closes = cmd.close_fds.clone();
+        // 任意 fd 重定向：父进程打开文件，pre_exec 中 dup2
+        let mut fd_files: Vec<std::fs::File> = Vec::new();
+        let mut fd_dups: Vec<(i32, i32)> = Vec::new();
+        for r in &cmd.fd_redirects {
+            let file = if r.input {
+                std::fs::File::open(&r.path).ok()
+            } else {
+                open_redirect(&r.path, r.append, cmd.force)
+            };
+            match file {
+                Some(f) => {
+                    let raw = f.as_raw_fd();
+                    unsafe {
+                        libc::fcntl(raw, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                    fd_dups.push((raw, r.fd as i32));
+                    fd_files.push(f);
+                }
+                None => {
+                    eprintln!("shell: {}: cannot open", r.path);
+                    return 1;
+                }
+            }
+        }
         #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
@@ -886,12 +1111,16 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
                 for (from, to) in &dups {
                     libc::dup2(*to as i32, *from as i32);
                 }
+                for (src, dst) in &fd_dups {
+                    libc::dup2(*src, *dst);
+                }
                 for fd in &closes {
                     libc::close(*fd as i32);
                 }
                 Ok(())
             });
         }
+        let _ = &fd_files; // 保持文件打开至 spawn 之后
 
         // here-string：写入临时文件作为 stdin
         if let Some(ref hs) = cmd.here_string {
@@ -901,6 +1130,49 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
                 && let Ok(file) = std::fs::File::open(&path)
             {
                 command.stdin(Stdio::from(file));
+            }
+        }
+        if let Some(ref f) = cmd.rw_file
+            && let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(f)
+        {
+            match file.try_clone() {
+                Ok(f2) => {
+                    command.stdin(Stdio::from(file));
+                    command.stdout(Stdio::from(f2));
+                }
+                Err(_) => {
+                    command.stdin(Stdio::from(file));
+                }
+            }
+        }
+
+        // `<>` 读写重定向
+        if let Some(ref f) = cmd.rw_file {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(f)
+            {
+                Ok(file) => match file.try_clone() {
+                    Ok(f2) => {
+                        command.stdin(Stdio::from(file));
+                        command.stdout(Stdio::from(f2));
+                    }
+                    Err(_) => {
+                        command.stdin(Stdio::from(file));
+                    }
+                },
+                Err(e) => {
+                    eprintln!("shell: {}: {}", f, e);
+                    return 1;
+                }
             }
         }
 
@@ -919,7 +1191,7 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
 
         // stdout
         if let Some(ref f) = cmd.stdout_file {
-            match open_redirect(f, cmd.append) {
+            match open_redirect(f, cmd.append, cmd.force) {
                 Some(file) => {
                     command.stdout(Stdio::from(file));
                 }
@@ -931,7 +1203,7 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
 
         // stderr
         if let Some(ref f) = cmd.stderr_file {
-            match open_redirect(f, cmd.append_err) {
+            match open_redirect(f, cmd.append_err, cmd.force) {
                 Some(file) => {
                     command.stderr(Stdio::from(file));
                 }
@@ -1206,7 +1478,7 @@ mod tests {
     fn open_redirect_creates_new_file() {
         let path = "/tmp/rbox_test_redirect_new";
         let _ = std::fs::remove_file(path);
-        let f = open_redirect(path, false);
+        let f = open_redirect(path, false, false);
         assert!(f.is_some());
         assert!(std::path::Path::new(path).exists());
         let _ = std::fs::remove_file(path);
@@ -1217,9 +1489,9 @@ mod tests {
         let path = "/tmp/rbox_test_redirect_append";
         let _ = std::fs::remove_file(path);
         // First write
-        let _ = open_redirect(path, false);
+        let _ = open_redirect(path, false, false);
         // Append should also work
-        let f = open_redirect(path, true);
+        let f = open_redirect(path, true, false);
         assert!(f.is_some());
         let _ = std::fs::remove_file(path);
     }
@@ -1227,7 +1499,7 @@ mod tests {
     #[test]
     fn open_redirect_fails_for_invalid_path() {
         // Directory as target -> error
-        let f = open_redirect("/tmp", false);
+        let f = open_redirect("/tmp", false, false);
         assert!(f.is_none());
     }
 
@@ -1257,7 +1529,7 @@ mod tests {
             argv: vec!["pwd".into()],
             ..Default::default()
         };
-        assert!(apply_builtin_redirects(&cmd).unwrap().is_none());
+        assert!(apply_redirects(&cmd).unwrap().is_none());
     }
 
     #[test]
@@ -1268,7 +1540,7 @@ mod tests {
             stdout_file: Some("/tmp".into()),
             ..Default::default()
         };
-        assert_eq!(apply_builtin_redirects(&cmd).err(), Some(1));
+        assert_eq!(apply_redirects(&cmd).err(), Some(1));
     }
 
     #[test]

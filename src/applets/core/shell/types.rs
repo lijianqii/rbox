@@ -36,6 +36,14 @@ pub enum Token {
     RedirOutBothAppend,
     /// `<<<` here-string。
     RedirHereString,
+    /// `<>` 读写重定向。
+    RedirInOut,
+    /// `>|` 强制覆盖（绕过 noclobber）。
+    RedirOutForce,
+    /// `N>` / `N>>` 任意 fd 输出重定向。
+    RedirFdOut(u8, bool),
+    /// `N<` 任意 fd 输入重定向。
+    RedirFdIn(u8),
     /// `|` 管道。
     Pipe,
     /// `|&` 管道（stdout+stderr 都进入管道）。
@@ -51,7 +59,7 @@ pub enum Token {
 }
 
 /// 一条简单命令（不含管道/重定向操作符，但持有重定向目标）。
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, Clone)]
 pub struct SimpleCmd {
     pub argv: Vec<String>,
     pub stdin_file: Option<String>,
@@ -71,6 +79,21 @@ pub struct SimpleCmd {
     pub here_string: Option<String>,
     /// `|&`：stderr 也接入管道。
     pub stderr_to_pipe: bool,
+    /// `<>` 读写文件。
+    pub rw_file: Option<String>,
+    /// `>|`：绕过 noclobber。
+    pub force: bool,
+    /// 任意 fd 重定向（`3>f`、`3<f` 等）。
+    pub fd_redirects: Vec<FdRedirect>,
+}
+
+/// 任意 fd 重定向描述。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FdRedirect {
+    pub fd: u8,
+    pub path: String,
+    pub append: bool,
+    pub input: bool,
 }
 
 impl SimpleCmd {
@@ -132,6 +155,9 @@ mod tests {
         assert!(cmd.close_fds.is_empty());
         assert!(cmd.here_string.is_none());
         assert!(!cmd.stderr_to_pipe);
+        assert!(cmd.rw_file.is_none());
+        assert!(!cmd.force);
+        assert!(cmd.fd_redirects.is_empty());
     }
 
     #[test]

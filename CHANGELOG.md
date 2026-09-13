@@ -2,6 +2,21 @@
 
 本项目遵循「里程碑式」记录（无严格 SemVer 版本节奏）。
 
+## [未发布] - 2026-09
+
+### Shell：对齐 BusyBox ash
+- 子 shell `( ... )`（fork 隔离变量/cwd/重定向）、花括号组 `{ ...; }`、`!` 取反
+- 反引号命令替换；`$()`/`$(( ))`/反引号内部 `;`/`&`/`|` 不再被误分词
+- `:`、readonly（赋值/unset 保护）、getopts（OPTIND/OPTARG）、ulimit（-a/-H/-S，rlimit）
+- `kill` 内置支持 `%job` 规格；`$-` 选项串；`set -o`/`set +o` 名称列表与重置
+- 算术扩展：位运算 `& | ^ ~`、三元 `?:`、逗号、前置/后缀 `++ --`
+- 参数子串 `${var:offset[:length]}`（含负偏移）
+- 重定向：`<>`、`>|`（set -C 强制覆盖）、任意 `N>`/`N>>`/`N<`、`N<&M`/`N>&-`、
+  复合命令尾重定向（`while ...; done < file`，循环内变量持久）、子 shell/组重定向
+- 复合命令可出现在 `;` 之后（`set -- p q; for x; do ...; done`）
+- cd 支持 CDPATH、`-P`/`-L`；pwd 接受 `-P`/`-L`；`$ENV` 启动文件；`set -o ignoreeof`
+- `set -f`（noglob）、`$RANDOM`、行内 `!` 取反仅作用于首个 pipeline
+
 ## [0.1.0] - 2026-09
 
 ### 核心
@@ -32,7 +47,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 765 个、QEMU 集成断言 200 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 773 个、QEMU 集成断言 215 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

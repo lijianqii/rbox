@@ -85,6 +85,14 @@ pub(crate) fn signal_name(sig: i32) -> String {
         .unwrap_or_else(|| sig.to_string())
 }
 
+/// 子 shell 重置：清除非空陷阱（保留忽略的 `trap ''` 与 EXIT 语义）。
+pub(crate) fn reset_for_subshell() {
+    if let Ok(mut t) = traps().lock() {
+        t.retain(|_, cmd| cmd.is_empty());
+    }
+    PENDING.store(-1, Ordering::SeqCst);
+}
+
 /// 清除全部陷阱（测试用）。
 #[cfg(test)]
 pub(crate) fn reset_for_test() {

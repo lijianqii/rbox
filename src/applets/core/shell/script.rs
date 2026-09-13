@@ -241,6 +241,28 @@ pub(crate) fn run_source(
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        // verbose（set -v）：回显输入行
+        if options::verbose() {
+            eprintln!("{}", line);
+        }
+        // `!` 取反（仅作用于第一个 pipeline）
+        let mut negate_tail = String::new();
+        let negate = trimmed == "!" || trimmed.starts_with("! ");
+        if negate {
+            let rest = trimmed[1..].trim_start();
+            match split_first_connector(rest) {
+                Some(idx) => {
+                    negate_tail = rest[idx..].to_string();
+                    line = rest[..idx].trim_end().to_string();
+                }
+                None => line = rest.to_string(),
+            }
+        }
+        // noexec（set -n）：仅语法检查
+        if options::noexec() {
+            let _ = super::parser::build_command_list(&super::tokenizer::tokenize(&line));
+            continue;
+        }
         // here-doc 收集
         if line.contains("<<")
             && let Some((new_line, consumed)) = collect_heredoc(&line, &lines[i..])
@@ -254,8 +276,92 @@ pub(crate) fn run_source(
             i += consumed;
             continue;
         }
-        // 复合命令块
-        if compound::is_compound_start(&line) {
+        // 顶层分号 + 复合关键字/子 shell：先执行前段，余下部分按复合命令处理
+        {
+            let segments = split_top_level_semicolons(&line);
+            if segments.len() > 1 {
+                let mut split_at = None;
+                for (idx, seg) in segments.iter().enumerate().skip(1) {
+                    let t = seg.trim_start();
+                    if t.starts_with('(')
+                        || t.starts_with('{')
+                        || t.starts_with("! ")
+                        || starts_compound_keyword(t)
+                    {
+                        split_at = Some(idx);
+                        break;
+                    }
+                }
+                if let Some(idx) = split_at {
+                    let head: String = segments[..idx].join(";");
+                    let tail: String = segments[idx..].join(";");
+                    if !head.trim().is_empty() {
+                        last_rc = execute_line(&head, &mut last_rc, history, exit_fn);
+                    }
+                    line = tail;
+                }
+            }
+        }
+        let mut rc;
+        if line.trim_start().starts_with('(') {
+            // 子 shell：fork 执行，隔离变量与 cwd
+            let mut text = line.clone();
+            let mut depth = paren_delta(&text);
+            while depth > 0 && i < lines.len() {
+                let l = lines[i].clone();
+                i += 1;
+                depth += paren_delta(&l);
+                text.push('\n');
+                text.push_str(&l);
+            }
+            let Some((inner, tail)) = extract_subshell(&text) else {
+                eprintln!("shell: syntax error: missing ')'");
+                return 2;
+            };
+            let (rtail, rest) = split_redirect_tail(&tail);
+            let rcmd = executor::parse_redirect_tail(&rtail);
+            rc = run_subshell(&inner, history, exit_fn, rcmd.as_ref());
+            if !rest.is_empty() {
+                last_rc = rc;
+                last_rc = execute_line(&rest, &mut last_rc, history, exit_fn);
+                rc = last_rc;
+            }
+        } else if line.trim_start().starts_with('{') {
+            // 花括号组：当前 shell 执行（变量保留）
+            let mut text = line.clone();
+            let mut depth = brace_delta(&text);
+            while depth > 0 && i < lines.len() {
+                let l = lines[i].clone();
+                i += 1;
+                depth += brace_delta(&l);
+                text.push('\n');
+                text.push_str(&l);
+            }
+            let Some((inner, tail)) = extract_group(&text) else {
+                eprintln!("shell: syntax error: missing '}}'");
+                return 2;
+            };
+            let (rtail, rest) = split_redirect_tail(&tail);
+            let rcmd = executor::parse_redirect_tail(&rtail);
+            let guard = match rcmd.as_ref() {
+                Some(c) => match executor::apply_redirects(c) {
+                    Ok(g) => g,
+                    Err(code) => {
+                        last_rc = code;
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            rc = compound::execute_block(&inner, &mut last_rc, history, exit_fn);
+            drop(guard);
+            if !rest.is_empty() {
+                last_rc = rc;
+                last_rc = execute_line(&rest, &mut last_rc, history, exit_fn);
+                rc = last_rc;
+            }
+        } else if compound::is_compound_start(&line) {
+            // 复合命令块
             let mut depth = compound::nesting_delta(&line);
             let mut block = vec![line.clone()];
             while depth > 0 && i < lines.len() {
@@ -268,9 +374,17 @@ pub(crate) fn run_source(
                 eprintln!("shell: syntax error: unexpected EOF");
                 return 2;
             }
-            last_rc = compound::execute_block(&block.join("\n"), &mut last_rc, history, exit_fn);
+            rc = run_compound_lines(&mut block, last_rc, history, exit_fn);
         } else {
-            last_rc = execute_line(&line, &mut last_rc, history, exit_fn);
+            rc = execute_line(&line, &mut last_rc, history, exit_fn);
+        }
+        last_rc = if negate {
+            if rc == 0 { 1 } else { 0 }
+        } else {
+            rc
+        };
+        if !negate_tail.is_empty() {
+            last_rc = execute_line(&negate_tail, &mut last_rc, history, exit_fn);
         }
         // 行执行后检查待处理信号 trap（信号可能在命令执行期间到达）
         if let Some(sig) = trap::take_pending() {
@@ -336,6 +450,470 @@ fn has_conditional(line: &str) -> bool {
         i += 1;
     }
     false
+}
+
+/// 顶层分号分段（引号感知）。
+fn split_top_level_semicolons(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    let mut in_backtick = false;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            cur.push(c as char);
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            if c == b'\\' && i + 1 < bytes.len() {
+                cur.push('\\');
+                cur.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            cur.push(c as char);
+            if c == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            cur.push(c as char);
+            if c == b'\\' && i + 1 < bytes.len() {
+                cur.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if c == b'`' {
+                in_backtick = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => {
+                in_squote = true;
+                cur.push('\'');
+            }
+            b'"' => {
+                in_dquote = true;
+                cur.push('"');
+            }
+            b'`' => {
+                in_backtick = true;
+                cur.push('`');
+            }
+            b'(' | b'{' => {
+                depth += 1;
+                cur.push(c as char);
+            }
+            b')' | b'}' => {
+                depth -= 1;
+                cur.push(c as char);
+            }
+            b';' if depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c as char),
+        }
+        i += 1;
+    }
+    parts.push(cur);
+    parts
+}
+
+/// 是否为复合命令起始关键字。
+fn starts_compound_keyword(t: &str) -> bool {
+    let w = t.split_whitespace().next().unwrap_or("");
+    matches!(w, "for" | "while" | "until" | "if" | "case" | "select")
+}
+
+/// 拆分重定向尾部与后续命令：`< file; echo x` -> (`< file`, `; echo x`)。
+fn split_redirect_tail(tail: &str) -> (String, String) {
+    match split_first_connector(tail) {
+        Some(i) => (tail[..i].to_string(), tail[i..].to_string()),
+        None => (tail.to_string(), String::new()),
+    }
+}
+
+/// 执行复合命令块（含终结符行重定向，如 `done < file`）。
+pub(crate) fn run_compound_lines(
+    block: &mut [String],
+    last_rc: i32,
+    history: &[String],
+    exit_fn: &dyn Fn(i32),
+) -> i32 {
+    let mut last_rc = last_rc;
+    let term = match first_word(block.first().map(String::as_str).unwrap_or("")) {
+        "if" => "fi",
+        "case" => "esac",
+        _ => "done",
+    };
+    let mut tail = String::new();
+    if let Some(last) = block.last_mut()
+        && let Some((rest, t)) = split_terminator_tail(last, term)
+    {
+        *last = rest;
+        tail = t;
+    }
+    let (rtail, rest) = split_redirect_tail(&tail);
+    let rcmd = executor::parse_redirect_tail(&rtail);
+    let guard = match rcmd.as_ref() {
+        Some(c) => match executor::apply_redirects(c) {
+            Ok(g) => g,
+            Err(code) => return code,
+        },
+        None => None,
+    };
+    let rc = compound::execute_block(&block.join("\n"), &mut last_rc, history, exit_fn);
+    drop(guard);
+    if !rest.is_empty() {
+        last_rc = rc;
+        return execute_line(&rest, &mut last_rc, history, exit_fn);
+    }
+    rc
+}
+
+/// 交互式单行执行：支持 `cmd; ( ... )`、`cmd; { ...; }`、`cmd; for ...; done` 等形式。
+pub(crate) fn run_interactive_line(
+    line: &str,
+    last_rc: i32,
+    history: &[String],
+    exit_fn: &dyn Fn(i32),
+) -> i32 {
+    let mut line = line.to_string();
+    let mut rc = last_rc;
+    {
+        let segments = split_top_level_semicolons(&line);
+        if segments.len() > 1 {
+            let mut split_at = None;
+            for (idx, seg) in segments.iter().enumerate().skip(1) {
+                let t = seg.trim_start();
+                if t.starts_with('(')
+                    || t.starts_with('{')
+                    || t.starts_with("! ")
+                    || starts_compound_keyword(t)
+                {
+                    split_at = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = split_at {
+                let head: String = segments[..idx].join(";");
+                let tail: String = segments[idx..].join(";");
+                if !head.trim().is_empty() {
+                    rc = execute_line(&head, &mut rc, history, exit_fn);
+                }
+                line = tail;
+            }
+        }
+    }
+    let t = line.trim_start();
+    if t.starts_with('(') || t.starts_with('{') || t.starts_with("! ") {
+        return run_segment(&line, history, exit_fn, rc);
+    }
+    if starts_compound_keyword(t) {
+        let mut block = vec![line.clone()];
+        return run_compound_lines(&mut block, rc, history, exit_fn);
+    }
+    execute_line(&line, &mut rc, history, exit_fn)
+}
+
+/// 执行单个顶层段（处理 `!`、`(` 子 shell、`{` 组与普通命令）。
+fn run_segment(seg: &str, history: &[String], exit_fn: &dyn Fn(i32), mut last_rc: i32) -> i32 {
+    let t = seg.trim();
+    if t.is_empty() {
+        return last_rc;
+    }
+    let mut rc = last_rc;
+    let negate = t.starts_with("! ") || t == "!";
+    let body = if negate { t[1..].trim_start() } else { t };
+    if negate && let Some(idx) = split_first_connector(body) {
+        let first = body[..idx].trim_end();
+        let rest = body[idx..].to_string();
+        let mut r = execute_line(first, &mut rc, history, exit_fn);
+        r = if r == 0 { 1 } else { 0 };
+        return execute_line(&rest, &mut r, history, exit_fn);
+    }
+    if body.starts_with('(') {
+        if let Some((inner, tail)) = extract_subshell(body) {
+            let (rtail, rest) = split_redirect_tail(&tail);
+            let rcmd = executor::parse_redirect_tail(&rtail);
+            rc = run_subshell(&inner, history, exit_fn, rcmd.as_ref());
+            if !rest.is_empty() {
+                last_rc = rc;
+                last_rc = execute_line(&rest, &mut last_rc, history, exit_fn);
+                rc = last_rc;
+            }
+        } else {
+            eprintln!("shell: syntax error: missing ')'");
+            rc = 2;
+        }
+    } else if body.starts_with('{') {
+        if let Some((inner, tail)) = extract_group(body) {
+            let (rtail, rest) = split_redirect_tail(&tail);
+            let rcmd = executor::parse_redirect_tail(&rtail);
+            let guard = match rcmd.as_ref() {
+                Some(c) => executor::apply_redirects(c).ok().flatten(),
+                None => None,
+            };
+            rc = compound::execute_block(&inner, &mut rc, history, exit_fn);
+            drop(guard);
+            if !rest.is_empty() {
+                rc = execute_line(&rest, &mut rc, history, exit_fn);
+            }
+        } else {
+            eprintln!("shell: syntax error: missing '}}'");
+            rc = 2;
+        }
+    } else {
+        rc = execute_line(body, &mut rc, history, exit_fn);
+    }
+    if negate {
+        if rc == 0 { 1 } else { 0 }
+    } else {
+        rc
+    }
+}
+
+/// 找第一个顶层连接符（`;`、`&`、`&&`、`||`）的字节位置（引号感知）。
+fn split_first_connector(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    let mut in_backtick = false;
+    let mut depth: i32 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            match c {
+                b'"' => in_dquote = false,
+                b'\\' => i += 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if c == b'`' {
+                in_backtick = false;
+            } else if c == b'\\' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'`' => in_backtick = true,
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
+            b'\\' => i += 1,
+            b';' | b'&' | b'|' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 行内未加引号的括号深度增量（`(` +1，`)` -1）。
+fn paren_delta(line: &str) -> i32 {
+    let bytes = line.as_bytes();
+    let mut depth = 0;
+    let mut i = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            match c {
+                b'"' => in_dquote = false,
+                b'\\' => i += 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'\\' => i += 1,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// 行内独立 `{`/`}` 记号深度增量。
+fn brace_delta(line: &str) -> i32 {
+    let mut depth = 0;
+    for tok in line.split(|c: char| c.is_whitespace() || c == ';') {
+        match tok {
+            "{" => depth += 1,
+            "}" => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// 提取子 shell 内容：`( inner ) tail` -> (inner, tail)。
+fn extract_subshell(text: &str) -> Option<(String, String)> {
+    let start = text.find('(')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    let mut i = start;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            match c {
+                b'"' => in_dquote = false,
+                b'\\' => i += 1,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'\\' => i += 1,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[start + 1..i].to_string(), text[i + 1..].to_string()));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 提取花括号组内容：`{ inner; } tail` -> (inner, tail)。
+fn extract_group(text: &str) -> Option<(String, String)> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((text[start + 1..i].to_string(), text[i + 1..].to_string()));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 拆分终结符行：`done < file` -> ("done", "< file")。
+fn split_terminator_tail(line: &str, term: &str) -> Option<(String, String)> {
+    let bytes = line.as_bytes();
+    let tb = term.as_bytes();
+    let mut i = 0;
+    while i + tb.len() <= bytes.len() {
+        if &bytes[i..i + tb.len()] == tb {
+            let prev_ok = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b';';
+            let next_ok = i + tb.len() == bytes.len() || bytes[i + tb.len()].is_ascii_whitespace();
+            if prev_ok && next_ok {
+                return Some((
+                    line[..i + tb.len()].trim_end().to_string(),
+                    line[i + tb.len()..].trim_start().to_string(),
+                ));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 取一行首词（用于判断块终结符）。
+fn first_word(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or("")
+}
+
+/// 子 shell：fork 后在子进程执行（隔离变量/cwd/陷阱），父进程等待。
+fn run_subshell(
+    inner: &str,
+    history: &[String],
+    exit_fn: &dyn Fn(i32),
+    redirect: Option<&crate::applets::core::shell::types::SimpleCmd>,
+) -> i32 {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        eprintln!("shell: fork failed");
+        return 1;
+    }
+    if pid == 0 {
+        // 子进程
+        trap::reset_for_subshell();
+        let _guard = match redirect {
+            Some(c) => match executor::apply_redirects(c) {
+                Ok(g) => g,
+                Err(code) => std::process::exit(code & 0xff),
+            },
+            None => None,
+        };
+        let rc = run_source(inner, history, exit_fn, false);
+        std::process::exit(rc & 0xff);
+    }
+    let mut status: libc::c_int = 0;
+    unsafe {
+        libc::waitpid(pid, &mut status, 0);
+    }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        128 + libc::WTERMSIG(status)
+    }
 }
 
 /// 运行 EXIT trap（`trap 'cmd' EXIT`）。

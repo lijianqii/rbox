@@ -112,6 +112,12 @@ pub(crate) fn reset_for_test() {
 mod tests {
     use super::*;
 
+    /// 全局局部变量栈在并行测试下互相干扰，串行化。
+    fn local_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn define_get_list_unset() {
         reset_for_test();
@@ -124,6 +130,7 @@ mod tests {
 
     #[test]
     fn locals_restore() {
+        let _g = local_guard();
         reset_for_test();
         let mark = local_mark();
         unsafe { std::env::set_var("RBOX_LOCAL_TEST", "outer") };
@@ -137,6 +144,7 @@ mod tests {
 
     #[test]
     fn locals_remove_new_vars() {
+        let _g = local_guard();
         reset_for_test();
         let mark = local_mark();
         push_local("RBOX_LOCAL_NEW");

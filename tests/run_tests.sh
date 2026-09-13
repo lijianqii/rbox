@@ -336,6 +336,19 @@ OUT=$(timeout 400 bash -c '
   printf "p=/a/b/c.txt; echo \"\${p##*/} \${p%%/*} \${UNSET_X:-DEF}\"\n"; sleep 0.5
   printf "echo \x27r1 r2\x27 > /tmp/rin.txt; read a b < /tmp/rin.txt; echo \"read:\$a:\$b\"\n"; sleep 0.5
   printf "sleep 0.2 & wait \$!; echo wait_ok=\$?\n"; sleep 0.6
+  # 10.10 ash 对齐：子 shell/组/取反/反引号/只读/getopts/算术/子串/复合重定向
+  printf "x=1; ( x=2; echo \"sub:\$x\" ); echo \"out:\$x\"\n"; sleep 0.6
+  printf "{ echo grp1; echo grp2; } > /tmp/grp.txt; cat /tmp/grp.txt\n"; sleep 0.6
+  printf "! false; echo \"neg=\$?\"\n"; sleep 0.5
+  printf "echo \x60echo bq_ok\x60\n"; sleep 0.5
+  printf ":; echo colon_rc=\$?\n"; sleep 0.5
+  printf "readonly RO=7; RO=9; echo \"ro=\$RO\"\n"; sleep 0.5
+  printf "set -- -a -b val x; getopts ab: o; echo \"g1:\$o:\$OPTIND\"; getopts ab: o; echo \"g2:\$o:\$OPTARG\"\n"; sleep 0.6
+  printf "echo \"ar:\$((5&3)):\$((5|2)):\$((1?2:3))\"\n"; sleep 0.5
+  printf "sv=abcdef; echo \"sub:\${sv:1:3}\"\n"; sleep 0.5
+  printf "set -- p q; for a; do echo \"noin:\$a\"; done\n"; sleep 0.6
+  printf "echo line1 > /tmp/cmp.txt; echo line2 >> /tmp/cmp.txt; while read l; do c=\$l; done < /tmp/cmp.txt; echo \"last:\$c\"\n"; sleep 0.7
+  printf "ulimit -n > /tmp/ul.txt; wc -l < /tmp/ul.txt\n"; sleep 0.5
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -586,6 +599,24 @@ assert_contains "|& 管道 stderr" "No such file"
 assert_line "参数前后缀删除" "c.txt /a/b DEF"
 assert_line "read 变量拆分" "read:r1:r2"
 assert_line "wait 返回码" "wait_ok=0"
+
+echo ""
+echo "[Shell: ash 对齐（子 shell/组/内置/算术）]"
+assert_line "子 shell 变量隔离" "sub:2"
+assert_line "子 shell 不影响父 shell" "out:1"
+assert_line "花括号组重定向" "grp1"
+assert_line "! 取反退出码" "neg=0"
+assert_line "反引号命令替换" "bq_ok"
+assert_line "冒号内置命令" "colon_rc=0"
+assert_contains "readonly 保护" "read only"
+assert_line "readonly 值不变" "ro=7"
+assert_line "getopts 第一项" "g1:a:2"
+assert_line "getopts 带参选项" "g2:b:val"
+assert_line "算术位运算与三元" "ar:1:7:2"
+assert_line "参数子串 \${v:1:3}" "sub:bcd"
+assert_line "for 无 in 遍历位置参数" "noin:p"
+assert_line "复合命令重定向变量持久" "last:line2"
+assert_contains "ulimit -n 输出" "1"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"
