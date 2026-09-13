@@ -45,6 +45,53 @@ impl Applet for Touch {
     }
 }
 
+fn touch_one(path: &str) -> io::Result<()> {
+    // 已存在（包括目录、符号链接）直接更新时间戳；不存在才创建空文件。
+    // 这样可以避免对只读文件因 open(O_WRONLY) 失败而无法 touch。
+    if std::fs::symlink_metadata(path).is_err() {
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+    }
+
+    // 设置修改/访问时间为当前时间
+    set_file_times(path, SystemTime::now(), SystemTime::now())
+}
+
+/// 设置文件的访问和修改时间（使用 libc::utimensat）。
+fn set_file_times(path: &str, atime: SystemTime, mtime: SystemTime) -> io::Result<()> {
+    let c_path = CString::new(Path::new(path).as_os_str().as_bytes())?;
+    let atv = to_timespec(atime)?;
+    let mtv = to_timespec(mtime)?;
+
+    let times = [
+        libc::timespec {
+            tv_sec: atv.0,
+            tv_nsec: atv.1 as i64,
+        },
+        libc::timespec {
+            tv_sec: mtv.0,
+            tv_nsec: mtv.1 as i64,
+        },
+    ];
+
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn to_timespec(t: SystemTime) -> io::Result<(i64, i64)> {
+    let dur = t
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| io::Error::other("time before UNIX epoch"))?;
+    Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,51 +139,4 @@ mod tests {
         let _ = TOUCH.run(&[]);
         // Should not panic
     }
-}
-
-fn touch_one(path: &str) -> io::Result<()> {
-    // 已存在（包括目录、符号链接）直接更新时间戳；不存在才创建空文件。
-    // 这样可以避免对只读文件因 open(O_WRONLY) 失败而无法 touch。
-    if std::fs::symlink_metadata(path).is_err() {
-        OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-    }
-
-    // 设置修改/访问时间为当前时间
-    set_file_times(path, SystemTime::now(), SystemTime::now())
-}
-
-/// 设置文件的访问和修改时间（使用 libc::utimensat）。
-fn set_file_times(path: &str, atime: SystemTime, mtime: SystemTime) -> io::Result<()> {
-    let c_path = CString::new(Path::new(path).as_os_str().as_bytes())?;
-    let atv = to_timespec(atime)?;
-    let mtv = to_timespec(mtime)?;
-
-    let times = [
-        libc::timespec {
-            tv_sec: atv.0,
-            tv_nsec: atv.1 as i64,
-        },
-        libc::timespec {
-            tv_sec: mtv.0,
-            tv_nsec: mtv.1 as i64,
-        },
-    ];
-
-    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-fn to_timespec(t: SystemTime) -> io::Result<(i64, i64)> {
-    let dur = t
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| io::Error::other("time before UNIX epoch"))?;
-    Ok((dur.as_secs() as i64, dur.subsec_nanos() as i64))
 }

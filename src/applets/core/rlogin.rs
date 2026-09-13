@@ -102,16 +102,25 @@ impl Drop for EchoGuard {
 /// 密码最大长度（字节）：超限拒绝登录（防超长粘贴撑爆内存）。
 const MAX_PASSWORD_LEN: usize = 256;
 
+/// 关闭终端回显：原地修改 `term`，返回修改前的原始 termios 供恢复。
+/// （先保存再修改，Drop 时才能正确恢复 ECHO；此前直接把改后的值存入
+/// guard 导致回显无法恢复，独立调用 rlogin 时终端残留无回显。）
+fn disable_echo(term: &mut libc::termios) -> libc::termios {
+    let original = *term;
+    term.c_lflag &= !libc::ECHO;
+    original
+}
+
 /// 读取一行密码（终端上关闭 ECHO；非 tty 时直接读取）。
 /// `timeout_secs` 内无输入返回 None（防恶意用户挂住登录进程）。
 /// 支持退格键（0x7f / 0x08）删除已输入字符；超长输入返回 None 拒绝登录。
-fn read_password(timeout_secs: Option<u64>) -> Option<String> {
+pub(crate) fn read_password(timeout_secs: Option<u64>) -> Option<String> {
     let fd = libc::STDIN_FILENO;
     let mut term: libc::termios = unsafe { std::mem::zeroed() };
     let guard = if unsafe { libc::tcgetattr(fd, &mut term) } == 0 {
-        term.c_lflag &= !libc::ECHO;
+        let original = disable_echo(&mut term);
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) };
-        Some(EchoGuard { fd, original: term })
+        Some(EchoGuard { fd, original })
     } else {
         None
     };
@@ -246,25 +255,28 @@ pub(crate) fn password_matches(stored: &str, shadow: Option<&str>, input: &str) 
 /// 用 libc crypt() 校验密码（glibc libcrypt，与 busybox/标准 shadow 兼容）。
 /// salt 传完整存储串（crypt 只解析其中的盐部分）。
 fn crypt_verify(password: &str, stored: &str) -> bool {
-    let p = match std::ffi::CString::new(password) {
-        Ok(p) => p,
-        Err(_) => return false,
-    };
-    let s = match std::ffi::CString::new(stored) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    match crypt_hash(password, stored) {
+        Some(hash) => hash == stored,
+        None => false,
+    }
+}
+
+/// 用 libc crypt() 生成哈希（供 passwd 复用；salt 如 `$6$xxxx`）。
+pub(crate) fn crypt_hash(password: &str, salt: &str) -> Option<String> {
+    let p = std::ffi::CString::new(password).ok()?;
+    let s = std::ffi::CString::new(salt).ok()?;
     let r = unsafe { crypt(p.as_ptr(), s.as_ptr()) };
     if r.is_null() {
-        return false;
+        return None;
     }
-    // crypt 返回指向静态缓冲区的指针，立即转换为 String 再比较
+    // crypt 返回指向静态缓冲区的指针，立即转换为 String
     let hash = unsafe { std::ffi::CStr::from_ptr(r) };
-    hash.to_str().map(|h| h == stored).unwrap_or(false)
+    hash.to_str().ok().map(str::to_string)
 }
 
 // libcrypt 的 crypt(3)：`$5$`/`$6$` 等标准密码哈希。
-#[link(name = "crypt")]
+// musl 将 crypt(3) 包含在 libc 中，无需（也没有）独立 libcrypt。
+#[cfg_attr(not(target_env = "musl"), link(name = "crypt"))]
 unsafe extern "C" {
     fn crypt(
         passwd: *const std::ffi::c_char,
@@ -273,7 +285,7 @@ unsafe extern "C" {
 }
 
 /// 认证：用户存在且密码正确时返回 passwd 条目。
-fn authenticate(user: &str, password: &str) -> Option<PasswdEntry> {
+pub(crate) fn authenticate(user: &str, password: &str) -> Option<PasswdEntry> {
     let path = &crate::config::load().paths.passwd;
     let content = std::fs::read_to_string(path).ok()?;
     let entries = parse_passwd(&content);
@@ -452,6 +464,17 @@ locked:*LK*:19437:0:99999:7:::
     #[test]
     fn password_matches_empty_stored_is_free() {
         assert!(password_matches("", None, "anything"));
+    }
+
+    #[test]
+    fn disable_echo_keeps_original_flags() {
+        // 回归：guard 保存的必须是修改前的 termios（含 ECHO），否则退出后回显无法恢复
+        let mut term: libc::termios = unsafe { std::mem::zeroed() };
+        term.c_lflag = libc::ECHO | libc::ICANON;
+        let original = disable_echo(&mut term);
+        assert_eq!(term.c_lflag & libc::ECHO, 0, "修改后应关闭 ECHO");
+        assert_ne!(original.c_lflag & libc::ECHO, 0, "原始终端设置应保留 ECHO");
+        assert_ne!(original.c_lflag & libc::ICANON, 0);
     }
 
     #[test]

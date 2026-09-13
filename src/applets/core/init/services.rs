@@ -1,9 +1,10 @@
 //! 服务运行时：spawn、生命周期、重启调度、停止。
 
-use crate::applets::core::init::shutdown_requested;
+use crate::applets::core::init::signals::shutdown_requested;
 use crate::applets::core::init::syscall::{kill_process, kill_process_group};
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::{LogLevel, log, log_at};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 
@@ -24,6 +25,12 @@ pub(crate) struct ServiceInstance {
     pub(crate) logfile: Option<String>,
     pub(crate) user: Option<String>,
     pub(crate) group: Option<String>,
+    /// 工作目录（WorkingDirectory=）
+    pub(crate) working_directory: Option<String>,
+    /// 停止超时秒数（TimeoutStopSec=）
+    pub(crate) timeout_stop_sec: u64,
+    /// 停止模式（KillMode=）
+    pub(crate) kill_mode: String,
     /// Type=forking 相关（重启时重新走 daemon 化流程）
     pub(crate) is_forking: bool,
     pub(crate) pidfile: Option<String>,
@@ -83,13 +90,15 @@ impl ServiceInstance {
     }
 }
 
-/// spawn 附加配置（LogFile/User/Group）。
+/// spawn 附加配置（LogFile/User/Group/WorkingDirectory）。
 pub(crate) struct SpawnConfig<'a> {
     /// stdout/stderr 重定向文件
     pub(crate) logfile: Option<&'a str>,
     /// 降权用户/组名
     pub(crate) user: Option<&'a str>,
     pub(crate) group: Option<&'a str>,
+    /// 工作目录
+    pub(crate) working_directory: Option<&'a str>,
 }
 
 impl SpawnConfig<'_> {
@@ -98,6 +107,7 @@ impl SpawnConfig<'_> {
             logfile: unit.service.logfile.as_deref(),
             user: unit.service.user.as_deref(),
             group: unit.service.group.as_deref(),
+            working_directory: unit.service.working_directory.as_deref(),
         }
     }
 }
@@ -129,6 +139,17 @@ pub(crate) fn spawn_unit_command(
     command.args(args);
     command.envs(env.iter().cloned());
     command.process_group(0);
+    // 工作目录（WorkingDirectory=）：无效目录仅告警，不阻止启动
+    if let Some(dir) = cfg.working_directory {
+        if std::path::Path::new(dir).is_dir() {
+            command.current_dir(dir);
+        } else {
+            log(&format!(
+                "rbox init: working directory {} for {} not found, using inherited cwd",
+                dir, name
+            ));
+        }
+    }
     // 输出重定向到日志文件（追加），超过阈值则轮转，否则继承 console。
     // 日志文件打不开只告警并继续（继承 console），日志失败不应阻止服务启动。
     if let Some(path) = cfg.logfile {
@@ -136,6 +157,7 @@ pub(crate) fn spawn_unit_command(
         match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
             .open(path)
         {
             Ok(f) => match f.try_clone() {
@@ -236,6 +258,60 @@ pub(crate) fn parse_environment(envs: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// 解析 EnvironmentFile 内容（每行 KEY=VALUE，`#` 注释，值去引号）。
+pub(crate) fn parse_environment_file(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                return None;
+            }
+            let (k, v) = t.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            let v = v.trim().trim_matches('"').trim_matches('\'');
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// 单元环境变量：EnvironmentFile=（路径前缀 `-` 表示可选）打底，
+/// Environment= 覆盖同名项。
+pub(crate) fn unit_environment(unit: &Unit) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(path) = &unit.service.environment_file {
+        let (optional, p) = match path.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, path.as_str()),
+        };
+        match std::fs::read_to_string(p) {
+            Ok(content) => env = parse_environment_file(&content),
+            Err(e) => {
+                if !optional {
+                    log_at(
+                        LogLevel::Warn,
+                        &format!(
+                            "rbox init: cannot read EnvironmentFile {} for {}: {}",
+                            p, unit.name, e
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    for (k, v) in parse_environment(&unit.service.environment) {
+        if let Some(existing) = env.iter_mut().find(|(ek, _)| *ek == k) {
+            existing.1 = v;
+        } else {
+            env.push((k, v));
+        }
+    }
+    env
+}
+
 /// 启动一个 simple 类型服务，返回运行时实例。
 pub(crate) fn start_service(
     unit: &Unit,
@@ -328,6 +404,9 @@ fn new_service_instance(
         logfile: unit.service.logfile.clone(),
         user: unit.service.user.clone(),
         group: unit.service.group.clone(),
+        working_directory: unit.service.working_directory.clone(),
+        timeout_stop_sec: unit.service.timeout_stop_sec,
+        kill_mode: unit.service.kill_mode.clone(),
         is_forking: unit.service.typ == "forking",
         pidfile: unit.service.pidfile.clone(),
         timeout_start_sec: unit.service.timeout_start_sec,
@@ -388,6 +467,7 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
         logfile: svc.logfile.as_deref(),
         user: svc.user.as_deref(),
         group: svc.group.as_deref(),
+        working_directory: svc.working_directory.as_deref(),
     };
     svc.tracked_pid = None;
     svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg);
@@ -438,8 +518,9 @@ pub(crate) fn run_command_with_timeout(argv: &[String], timeout_secs: u64) -> bo
     }
 }
 
-/// 执行 ExecStop 并终止服务进程组：SIGTERM 等 1 秒，超时 SIGKILL。
-/// 供关机流程与 stop/restart 命令复用；forking 服务额外终止 daemon pid。
+/// 执行 ExecStop 并终止服务进程组：SIGTERM 等待 TimeoutStopSec 秒，超时 SIGKILL。
+/// KillMode= 控制信号范围：control-group（默认，整个进程组）/ process（仅主进程）/
+/// mixed（SIGTERM 主进程，超时 SIGKILL 进程组）/ none（不发信号）。
 pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
     if let Some(stop_cmd) = &svc.exec_stop {
         log(&format!("rbox init: stopping {}: {}", svc.name, stop_cmd));
@@ -451,15 +532,27 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
             );
         }
     }
+    let mode = svc.kill_mode.as_str();
     if let Some(mut child) = svc.child.take() {
-        let _ = kill_process_group(child.id(), libc::SIGTERM);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        if mode != "none" {
+            let _ = match mode {
+                "process" => kill_process(child.id(), libc::SIGTERM),
+                _ => kill_process_group(child.id(), libc::SIGTERM),
+            };
+        }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_stop_sec.max(1));
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        let _ = kill_process_group(child.id(), libc::SIGKILL);
+                        if mode != "none" {
+                            let _ = match mode {
+                                "process" => kill_process(child.id(), libc::SIGKILL),
+                                _ => kill_process_group(child.id(), libc::SIGKILL),
+                            };
+                        }
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -473,9 +566,17 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
     // daemon 化通常伴随 setsid，此时 pgid == pid，kill(-pid) 可连同 daemon 派生的工作进程
     // 一起终止；组不存在（未 setsid）时 kill_process_group 失败，回退单进程。
     if let Some(pid) = svc.tracked_pid.take() {
-        let _ =
-            kill_process_group(pid, libc::SIGTERM).or_else(|_| kill_process(pid, libc::SIGTERM));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        if mode == "none" {
+            return;
+        }
+        if mode == "process" {
+            let _ = kill_process(pid, libc::SIGTERM);
+        } else {
+            let _ = kill_process_group(pid, libc::SIGTERM)
+                .or_else(|_| kill_process(pid, libc::SIGTERM));
+        }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_stop_sec.max(1));
         let mut status: libc::c_int = 0;
         loop {
             let r = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
@@ -483,8 +584,12 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                let _ = kill_process_group(pid, libc::SIGKILL)
-                    .or_else(|_| kill_process(pid, libc::SIGKILL));
+                if mode == "process" {
+                    let _ = kill_process(pid, libc::SIGKILL);
+                } else {
+                    let _ = kill_process_group(pid, libc::SIGKILL)
+                        .or_else(|_| kill_process(pid, libc::SIGKILL));
+                }
                 unsafe { libc::waitpid(pid as i32, &mut status, 0) };
                 break;
             }
@@ -561,6 +666,9 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         logfile: None,
         user: None,
         group: None,
+        working_directory: None,
+        timeout_stop_sec: 5,
+        kill_mode: "control-group".to_string(),
         is_forking: false,
         pidfile: None,
         timeout_start_sec: 10,

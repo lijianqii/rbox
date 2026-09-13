@@ -1,6 +1,7 @@
 //! 文件系统挂载（/etc/fstab）、主机名、sysctl 等系统初始化。
 
 use crate::applets::core::log;
+use crate::applets::fstab::{FstabEntry, parse_fstab, parse_fstab_line};
 use std::fs;
 
 /// 内置默认挂载集：/etc/fstab 缺失时回退使用。
@@ -12,39 +13,6 @@ const DEFAULT_FSTAB: &[&str] = &[
     "tmpfs    /tmp       tmpfs     defaults  0 0",
     "tmpfs    /run       tmpfs     defaults  0 0",
 ];
-
-/// 一条 fstab 挂载记录：<device> <mountpoint> <type> <options> [<dump> <pass>]。
-#[derive(Debug, Clone)]
-struct FstabEntry {
-    device: String,
-    mountpoint: String,
-    fstype: String,
-    options: String,
-}
-
-/// 解析一行 fstab 记录；空行、注释行、字段不足的行返回 None。
-fn parse_fstab_line(line: &str) -> Option<FstabEntry> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let mut fields = line.split_whitespace();
-    let device = fields.next()?;
-    let mountpoint = fields.next()?;
-    let fstype = fields.next()?;
-    let options = fields.next().unwrap_or("defaults");
-    Some(FstabEntry {
-        device: device.to_string(),
-        mountpoint: mountpoint.to_string(),
-        fstype: fstype.to_string(),
-        options: options.to_string(),
-    })
-}
-
-/// 解析整个 fstab 内容。
-fn parse_fstab(content: &str) -> Vec<FstabEntry> {
-    content.lines().filter_map(parse_fstab_line).collect()
-}
 
 /// 挂载所有文件系统：优先读取配置的 fstab，缺失时回退到内置默认集。
 /// 单个挂载失败只记录日志，不中断其余挂载。

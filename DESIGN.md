@@ -14,8 +14,8 @@
 | 运行环境 | QEMU 全系统模拟（qemu-system-aarch64） |
 | 内核 | Linux 6.12.36 LTS，本机从源码交叉编译（defconfig，ARM64） |
 | 依赖 | serde + toml + libc（libc 用于 init/系统调用） |
-| 二进制大小 | ~965KB（release + strip） |
-| initramfs 大小 | ~1.4MB |
+| 二进制大小 | ~1.4MB（release + strip + LTO）；musl 静态 ~1.5MB |
+| initramfs 大小 | ~1.7MB |
 
 **设计理念**：单一二进制 rbox 通过 argv[0] basename 分发或 rbox subcommand 子命令分发，模拟 BusyBox 的 multi-call binary 模式。一个二进制既是 init、又是 shell、又是所有用户命令。
 ## 环境与工具链
@@ -96,25 +96,30 @@ rbox/
 │       ├── core/           # 系统核心 applet + init 内部实现
 │       │   ├── mod.rs      # 模块声明 + 共享 log()（kmsg/console）
 │       │   ├── init/       # PID 1 实现（非 applet，仅 init 使用）
-│       │   │   ├── mod.rs  # 入口：信号、run、主循环（回收/重启/关机）
+│       │   │   ├── mod.rs  # 入口：run、早期根切换、拓扑分层启动、主循环
+│       │   │   ├── signals.rs  # 信号处理器、self-pipe、关机/重启标志
+│       │   │   ├── watchdog.rs # 硬件看门狗（打开/喂狗/poll 超时压缩）
+│       │   │   ├── boot.rs     # 启动模式（single/emergency）与应急 shell
+│       │   │   ├── shutdown.rs # 有序关机/重启
 │       │   │   ├── units.rs    # 单元 TOML 解析、单元名、拓扑排序
 │       │   │   ├── services.rs # 服务生命周期：spawn/daemon化/重启退避/停止/降权
 │       │   │   ├── server.rs   # 控制协议服务端（status/start/stop/restart/reload）
 │       │   │   ├── mount.rs    # fstab 挂载、hostname、sysctl
 │       │   │   └── syscall.rs  # libc 系统调用封装
 │       │   ├── control.rs  # 控制协议客户端（status/rservice 共用）
-│       │   ├── shell/       # 命令解释器（模块目录：mod/tokenizer/parser/expander/completion/builtin/executor/reader/types）
+│       │   ├── shell/       # 命令解释器（mod/tokenizer/parser/expander/completion/builtin/executor/reader/types/alias/compound/jobs）
 │       │   ├── rgetty.rs    # rgetty（终端登录提示，常驻 fork/wait 原地重试）
 │       │   ├── rlogin.rs    # rlogin（密码校验、降权、exec 用户 shell）
 │       │   ├── shutdown.rs # shutdown（向 PID 1 发 SIGTERM）
 │       │   ├── reboot.rs   # reboot（向 PID 1 发 SIGINT）
 │       │   ├── status.rs   # status [unit]（unix socket 查询 init 服务状态）
 │       │   └── rservice.rs # rservice（unix socket 管理 init 服务：start/stop/restart/reload）
-│       ├── file/           # 文件与目录操作：ls、cp、mv、rm、mkdir、touch、ln、cat（+ util.rs 递归删除）
-│       ├── text/           # 文本与字符串处理：head、tail、wc、grep、printf、echo、basename、dirname（+ util.rs 输入遍历）
-│       ├── sys/            # 系统信息与进程工具：true、false、pwd、uname、date、sleep、env、meminfo、processes、logkeeper
-│       └── proc.rs         # 跨模块共享工具：进程收集/解析（ProcMem）、human_size 单位格式化
-│           （core/init/server、sys/meminfo、sys/processes 共用；不挂在 applet 分组下）
+│       ├── file/           # 文件操作：ls、cp、mv、rm、mkdir、touch、ln、cat、chmod、chown、find（+ util.rs）
+│       ├── text/           # 文本处理：head、tail、wc、grep、printf、echo、basename、dirname（+ util.rs）
+│       ├── sys/            # 系统工具：true、false、pwd、uname、date、sleep、env、meminfo、processes、logkeeper、kill、dmesg、mount、umount
+│       ├── proc.rs         # 共享工具：进程收集/解析（ProcMem）、human_size 单位格式化
+│       ├── glob.rs         # 共享工具：glob 匹配（shell 通配符与 find -name 共用）
+│       └── fstab.rs        # 共享工具：/etc/fstab 解析（init 挂载与 mount 命令共用）
 ├── rootfs/                 # 根文件系统目录树
 │   ├── init -> bin/rbox    # init 符号链接
 │   ├── bin/
@@ -183,7 +188,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 34 个 applet：
+共 65 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -220,6 +225,38 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 31 | rlogin | rlogin [username] | 校验密码（/etc/passwd + /etc/shadow），成功后降权并 exec 用户 shell |
 | 32 | meminfo | meminfo [-bkmg] [-a] | 内存总览 + 分类核算（与 MemTotal 对账）+ 明细 + iomem 树 + 进程列表 |
 | 33 | processes | processes | 进程树：system 大分组，每行 PID 名称(Command) State RSS MEM% |
+| 34 | logkeeper | logkeeper [FILE] | 将 /dev/kmsg 转发到日志文件（持久化，Restart=always 服务） |
+| 35 | dmesg | dmesg [-n N] [-c] | 查看内核环形缓冲区（klogctl 全量读取，无权限回退 /dev/kmsg；-c 清空） |
+| 36 | kill | kill [-SIGNAL] PID... / kill -l [SIG] | 向进程发送信号（名字/数字/`-l` 映射，`--` 后为 PID） |
+| 37 | mount | mount [-t TYPE] [-o OPTS] [DEVICE DIR\|TARGET] | 挂载文件系统（无参列出；TARGET 查 /etc/fstab；-r/-w 简写） |
+| 38 | umount | umount [-f] [-l] TARGET... | 卸载文件系统（umount2，支持强制/惰性） |
+| 39 | chmod | chmod [-R] MODE FILE... | 修改权限（八进制/符号，支持 s/t/X，递归不跟随符号链接） |
+| 40 | chown | chown [-R] USER[:GROUP] FILE... | 修改属主/属组（lchown，支持 `user:`/`:group`） |
+| 41 | find | find [PATH...] [-name PATTERN] [-type f\|d] [-maxdepth N] | 递归查找文件（不跟随符号链接，按路径排序） |
+| 42 | test | test EXPR | 条件表达式（文件/字符串/数值/逻辑，含 -a -o ! 括号） |
+| 43 | [ | [ EXPR ] | test 的别名（要求末尾 ]） |
+| 44 | sort | sort [-nruf] [file...] | 行排序（数值/逆序/去重/忽略大小写） |
+| 45 | uniq | uniq [-cdu] [file] | 相邻重复行去重（计数/仅重复/仅唯一） |
+| 46 | cut | cut -d DELIM -f LIST [-s] \| cut -c LIST | 按分隔符取字段 / 按字符位置截取 |
+| 47 | tr | tr [-d] [-s] SET1 [SET2] | 字符转换/删除/压缩（支持范围与转义） |
+| 48 | tee | tee [-a] [file...] | stdin 同时写 stdout 与文件 |
+| 49 | stat | stat [-c FORMAT] FILE... | 文件元数据（%n %s %a %u %g %F %y 等格式码） |
+| 50 | du | du [-s] [-h] [path...] | 目录/文件磁盘占用统计 |
+| 51 | df | df [-h] | 文件系统使用（/proc/mounts + statfs） |
+| 52 | readlink | readlink [-f] [-n] PATH... | 读符号链接目标 / 规范化 |
+| 53 | realpath | realpath PATH... | 输出规范化绝对路径 |
+| 54 | mktemp | mktemp [-d] [-u] [template] | 创建唯一临时文件/目录 |
+| 55 | sync | sync | 刷新文件系统缓冲 |
+| 56 | dd | dd [if= of= bs= count= skip= seek=] | 按块复制数据 |
+| 57 | tar | tar -c\|-x\|-t [-f FILE] [-v] [-C DIR] | ustar 打包/解包（普通文件/目录/符号链接） |
+| 58 | id | id [-u] [-g] [-G] [-n] [user] | 用户/组身份 |
+| 59 | hostname | hostname [-s] [NAME] | 显示/设置主机名 |
+| 60 | uptime | uptime | 运行时长与负载 |
+| 61 | timeout | timeout [-s SIG] DURATION CMD... | 限时运行命令（超时 124） |
+| 62 | pgrep | pgrep [-f] [-x] [-l] PATTERN | 按名称/命令行查找进程 |
+| 63 | pkill | pkill [-f] [-x] [-SIGNAL] PATTERN | 按名称/命令行发送信号 |
+| 64 | passwd | passwd [user] | 修改密码（SHA-512 crypt 写 /etc/shadow） |
+| 65 | su | su [user] | 切换用户并启动 shell（shadow 校验） | |
 ## Shell
 
 文件：src/applets/core/shell/（模块目录，含单元测试）
@@ -275,6 +312,19 @@ shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>
 | 历史扩展 !-n | !-1 -> 倒数第 1 条 | 已实现 |
 | 历史扩展 !$ | !$ -> 上一条命令最后参数 | 已实现 |
 | ~ 展开 | cd ~ 或 echo ~/path | 已实现 |
+| test/[ 条件 | [ -f x ] && echo yes | 已实现（文件/字符串/数值/-a -o ! 括号） |
+| 算术 $(( )) | echo $((2+3*4)) | 已实现（+ - * / % 括号，变量） |
+| 位置参数 | set -- a b; echo $1 $# $@ | 已实现 |
+| read 内置 | read VAR / read -r A B | 已实现（tty 回显/退格） |
+| set/shift | set -- a b; shift | 已实现 |
+| if/elif/else/fi | if true; then echo a; fi | 已实现（多行/单行均支持） |
+| for 循环 | for i in a b; do echo $i; done | 已实现（词表支持变量/tilde/glob 展开） |
+| while 循环 | while true; do ...; done | 已实现（支持 break/continue） |
+| 命令替换 $() | echo $(echo hi) | 已实现（单引号内不展开，嵌套支持） |
+| 别名 alias | alias ll='ls -l' | 已实现（unalias，链式展开上限 16） |
+| 作业控制 jobs | jobs | 已实现（后台 & 与 Ctrl-Z 挂起） |
+| 作业控制 fg/bg | fg [%n] / bg [%n] | 已实现（SIGCONT + 等待/继续） |
+| Ctrl-Z | 挂起前台进程组 | 已实现（jobs 显示 Stopped） |
 
 ### 实现细节
 
@@ -330,6 +380,14 @@ enum Token {
 
 **~ 展开**（expand_tilde）：在变量展开后、通配符展开前执行。`~` 或 `~/path` 展开为 $HOME。
 
+**别名展开**（alias）：分词前按“命令位置首词”做文本替换（行首、`;` `|` `&&` `||` `&` 之后），单/双引号内不展开，链式展开最多 16 次防循环。内置命令 `alias`/`unalias` 维护全局别名表。
+
+**命令替换**（expand_command_subst）：分词前扫描 `$(...)`（单引号内不展开，支持嵌套与引号内括号），内层命令通过 `capture_output` 子进程执行并捕获 stdout，去尾部换行后拼回原行；不做二次语法解析（与 POSIX 接近）。内置命令（cd/export 等）在子进程中不生效（子进程语义）。
+
+**复合命令**（compound）：REPL 用 `nesting_delta` 判断块是否完整（`if`/`for`/`while` +1，`fi`/`done` -1），未闭合时继续以 `> ` 提示读取；完整后交给 `execute_block`。块先按引号外 `;` 规范化（`if a; then b; fi` 与多行写法等价，`then`/`do`/`else`/`fi`/`done` 行首关键字独立成行），再递归解析执行，块内普通行仍由 `execute_line` 执行。`break`/`continue` 用内部退出码哨兵实现（支持嵌套，仅单层）；缺失 `then`/`do`/终结符、`elif` 在 `else` 之后、重复 `else` 均报语法错误（rc=2），顶层 `break`/`continue` 仅警告。
+
+**作业控制**（jobs）：后台 `&` 与挂起作业统一放入独立进程组并登记作业表；`jobs` 列出（kill(pgid,0) 存活探测自动清理），`fg` 取出并 SIGCONT + 等待，`bg` 标记运行并 SIGCONT。Ctrl-Z（0x1A）由 stdin 监控线程转发 SIGTSTP 到前台进程组，前台等待用 `waitpid(..., WUNTRACED)` 感知停止并登记 Stopped 作业。SIGCHLD 在 spawn 到等待全程屏蔽（SigchldGuard），避免 std 的 `Child::wait()` 在 exec 失败路径上与处理器抢收导致 ECHILD panic。
+
 **通配符展开**（expand_glob）：对含 * ? [] 的词项执行 glob 匹配，隐藏文件不匹配 *（与 bash 一致）。展开后按字典序排序。
 
 **Tab 补全**（tab_complete）：
@@ -351,7 +409,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 35 个测试组、148 个断言（涵盖 34 个 applet、Shell 全功能、init 服务管理、Wants/Requisite 依赖、emergency/single 启动模式、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 36 个测试组、182 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -386,16 +444,21 @@ enum Token {
 | 重启流程 | reboot 触发有序关机、重启后系统恢复 | 2 |
 | 关机流程 | shutdown 触发、ExecStop 逆序、power off | 3 |
 | 内存信息/进程树 | meminfo 输出、分类核算、iomem 树、processes 进程树 | 15 |
-| **合计** | | **143** |
+| Shell: 引号保护 glob / 内置重定向 | 双引号 * 不展开、内置 pwd 重定向 | 3 |
+| 新增 applet | chmod/chown/find/kill/dmesg/mount/umount | 16 |
+| Shell: 复合命令/别名/命令替换/作业控制 | if/for/while、alias、$()、jobs、Ctrl-Z | 8 |
+| rescue 启动降级 | target Requires 失败 → 停止服务进 rescue shell | 4 |
+| 持久盘模式 | switch_root、写入、重启后数据保留 | 3 |
+| **合计** | | **182** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
 **已知限制**：
 - Ctrl-A 被 QEMU `-nographic` 截获，自动化测试无法覆盖
-- Shell 不支持 `for`/`while`/`if` 等复合命令
-- 不支持命令别名 `alias`
-- 不支持子shell `()` 和命令替换 `$()`
+- 不支持子 shell `()`（命令替换 `$()` 已支持，但输出不做二次语法解析）
+- 不支持 `case`/`until`/函数定义；`break`/`continue` 仅支持单层（无 `break N`）
 - here-doc 仅在交互式 tty 模式下可用（管道模式无法多行输入）
+- 命令替换内为子进程语义：内置命令（cd/export 等）不生效
 
 ### 终端模式（Tab 补全的前提）
 
@@ -434,7 +497,7 @@ SIGINT handler 仍注册为后备（管道模式下 ISIG 仍然开启时生效�
 
 ### SIGCHLD 后台进程回收
 
-shell 注册 `SIGCHLD` handler，自动回收后台子进程（`&` 启动的），避免僵尸进程。handler 内部循环 `waitpid(-1, WNOHANG)` 直到无子进程可回收。前台命令等待期间主线程用 `pthread_sigmask(SIG_BLOCK, SIGCHLD)` 屏蔽该信号，避免 handler 用 `waitpid(-1)` 抢收前台子进程导致 `child.wait()` 返回 ECHILD、退出码被误判为 1；等待结束后统一 `waitpid` 收割后台僵尸再解除屏蔽。
+shell 注册 `SIGCHLD` handler，自动回收后台子进程（`&` 启动的），避免僵尸进程。handler 内部循环 `waitpid(-1, WNOHANG)` 直到无子进程可回收。前台命令在 spawn 前用 `SigchldGuard`（`pthread_sigmask`）屏蔽 SIGCHLD，直到等待结束后恢复：避免 handler 用 `waitpid(-1)` 抢收前台子进程，导致 `waitpid(pid)` 返回 ECHILD；同时消除 `Command::spawn()` exec 失败路径上 std 内部 `Child::wait()` 与处理器抢收的 panic 竞态。
 
 ### 命令历史持久化
 
@@ -567,6 +630,7 @@ After = ["network.service"]        # 可选：在此服务之后启动
 Requires = ["network.service"]     # 可选：硬依赖（失败则本单元跳过）
 Wants = ["log.service"]            # 可选：尽力依赖（参与排序，失败不传播）
 Requisite = ["db.service"]         # 可选：前置检查（不激活依赖；未成功则本单元跳过）
+Before = ["late.service"]          # 可选：本单元必须先于这些单元启动
 
 [Service]
 Type = "simple"                    # simple（默认）/ forking（daemon 化）
@@ -574,10 +638,14 @@ ExecStart = "/bin/rbox echo hello" # 启动命令
 ExecStop = "/bin/rbox echo bye"    # 可选：关机时执行的停止命令
 ExecReload = "/bin/rbox echo ok"   # 可选：rservice reload 执行的命令
 Environment = ["HELLO=world"]      # 可选：服务环境变量
+EnvironmentFile = "/etc/x.env"     # 可选：环境变量文件（前缀 - 表示缺失不报错）
+WorkingDirectory = "/var/lib/x"    # 可选：工作目录
 Restart = "on-failure"             # 可选：非零退出自动重启（默认 no）
 RestartSec = 1                      # 可选：重启间隔秒（默认 1）
 StartLimitBurst = 5                 # 可选：失败/重启上限（默认 5；burst 为允许的重启次数，第 burst+1 次失败放弃）
 TimeoutStartSec = 10                # 可选：forking 等待父进程退出超时（默认 10）
+TimeoutStopSec = 5                  # 可选：停止时 SIGTERM 等待秒数（默认 5）
+KillMode = "control-group"          # 可选：control-group/process/mixed/none
 PIDFile = "/var/run/x.pid"         # 可选：forking 的 daemon PID 文件
 LogFile = "/var/log/x.log"         # 可选：stdout/stderr 重定向文件（打不开仅告警并回退 console，不阻止启动）
 User = "nobody"                    # 可选：降权用户（getpwnam）
@@ -669,6 +737,7 @@ libc::reboot 使用 glibc 封装的简化签名 `reboot(how_to)`，不需要手�
 |------|------|------|------|
 | default.target.toml | target | default.target | 启动根节点（无 Name 字段，回退文件名） |
 | console-shell.service.toml | service | console-shell | ExecStart=/bin/rgetty -L -t 60 ttyAMA0，Restart=always 登录提示（登录成功后 exec shell） |
+| logkeeper.service.toml | service | logkeeper | ExecStart=/bin/rbox logkeeper，Restart=always 将 /dev/kmsg 转发到 /var/log/messages |
 
 测试专用服务（hello、restart-test、longrun、forktest、forktimeout、usertest、console-shell 覆盖单元）放在 `tests/units/`，由集成测试脚本运行时注入 rootfs 并打包独立的测试 initramfs，测试结束自动清理并恢复被覆盖的生产单元，不进入生产镜像。
 
@@ -704,12 +773,12 @@ make test      # 集成测试
 |------|------|
 | make all | 编译 + 构建 rootfs + 打包 initramfs |
 | make build | 交叉编译 rbox（cargo build --target aarch64-unknown-linux-gnu --release） |
-| make rootfs | 拷贝 rbox 二进制 + 创建 33 个 applet 符号链接 + 拷贝 glibc 运行时 |
+| make rootfs | 拷贝 rbox 二进制 + 创建 65 个 applet 符号链接 + 拷贝 glibc 运行时 |
 | make initramfs | 将 rootfs/ 打包为 initramfs.cpio.gz（newc 格式 + gzip） |
 | make run | QEMU 全系统模拟启动（initramfs） |
 | make disk | 制作 ext4 磁盘镜像（rootfs.ext4，mkfs.ext4 -d） |
 | make run-disk | 从 ext4 磁盘镜像启动（root=/dev/vda 触发 switch_root） |
-| make strip | strip 符号表（1.4M -> 965K） |
+| make strip | strip 符号表（减小体积；release profile 已开 strip） |
 | make rootfs-test | 构建含测试单元的 initramfs（不污染生产 rootfs） |
 | make kernel | 编译 ARM64 内核（defconfig + Image） |
 | make clean | 清理产物 |
@@ -752,7 +821,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 35 个测试组、148 个断言，覆盖全部 34 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 36 个测试组、182 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -774,26 +843,35 @@ make unittest
 
 | 模块 | 覆盖 | 数量 |
 |------|------|------|
-| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行） | 29 |
-| shell/parser | parse（逻辑段/语法错误/后台执行/管道） | 30 |
-| shell/expander | expand_vars（$VAR/${VAR}/$?/$$）、expand_history（!!/!n/!-n，单引号感知/UTF-8 保留）、expand_tilde、expand_glob（* ? []） | 37 |
-| shell/completion | find_last_word_start、complete_command、complete_file（根路径/嵌套路径/尾斜杠）、common_prefix | 29 |
-| shell/builtin | cd、exit（8 位截断）、export、unset、pwd、history 内置命令 | 18 |
-| shell/reader | make_prompt（PS1 展开）、display_width（CJK/全角宽度）、set_isig | 16 |
-| shell/executor | 重定向打开、命令解析回退、管道失败清理 | 6 |
-| shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 7 |
-| shell/mod | read_utf8_char、find_heredoc_operator、needs_continuation、source 历史隔离、~ 路径展开 | 14 |
-| init/units | parse_cmdline、compute_start_order、parse_fstab、parse_mount_flags、parse_environment、format_status、parse_control_request、TTY/ExecStart | 16 |
-| init/server | 控制协议处理 | 8 |
-| init/services | 服务生命周期、schedule_restart（on-failure/always）、finish_daemonize | 13 |
+| shell/tokenizer | tokenize（引号/转义/重定向/管道/控制操作符/注释/续行/glob 保护标记/2>&1） | 38 |
+| shell/parser | parse（逻辑段/语法错误/后台执行/管道/fd 复制） | 30 |
+| shell/expander | expand_vars（含位置参数/算术）、expand_history、expand_tilde、expand_glob、expand_word | 45 |
+| shell/completion | find_last_word_start、complete_command、complete_file、common_prefix | 29 |
+| shell/builtin | cd/exit/export/unset/pwd/history/alias/unalias/jobs/fg/bg/read/set/shift | 21 |
+| shell/reader | make_prompt（PS1 展开）、display_width、set_isig | 16 |
+| shell/executor | 重定向（含 fd 复制）、命令解析回退、命令替换、X_OK、SIGCHLD 清理 | 13 |
+| shell/types | CommandList/Pipeline/SimpleCmd/Token 默认值与比较 | 8 |
+| shell/mod | read_utf8_char、here-doc、续行、source 历史隔离、~ 路径展开 | 14 |
+| shell/alias | 别名定义/查询/展开（命令位置、引号内不展开、链式/自引用上限） | 7 |
+| shell/compound | if/elif/else、for、while、break/continue、规范化、语法错误 | 14 |
+| shell/jobs | 作业登记/列表/取出/存活清理/输出格式 | 5 |
+| shell/params | 位置参数 set/get/count/shift | 3 |
+| shell/fuzz | 随机化健壮性（tokenizer/parser/expander/glob/fstab/算术） | 4 |
+| init/units | parse_cmdline、compute_start_order（Before）、单元字段、fstab 解析 | 18 |
+| init/server | 控制协议处理、status 渲染 | 17 |
+| init/services | 服务生命周期、schedule_restart、EnvironmentFile、KillMode | 13 |
 | init/mount | fstab 挂载、mount_line_matches 匹配 | 7 |
-| init/mod | failed_required_dep、compute_next_timeout | 6 |
+| init/mod | failed_required_dep、compute_depths、root 规格解析、秒退检测 | 14 |
+| init/boot | cmdline 启动模式解析 | 1 |
+| init/watchdog | 喂狗超时压缩（无限/取 min/禁用/到期） | 4 |
 | config | /etc/rbox.conf 解析（默认值/完整/部分覆盖/坏文件回退） | 4 |
-| text/* | basename 7、dirname 5、printf 12、echo 7、grep 14、head 6、tail 6、wc 5、util 4 | 66 |
-| file/* | ls 13、util 7、cp 5、mv 5、rm 5、mkdir 5、touch 4、ln 4、cat 4 | 52 |
-| sys/* | sleep 6、uname 5、env 4、date 2、true 1、false 1、pwd 1、meminfo 19、proc 5、processes 9 | 53 |
-| core/* | rservice 3、status 2、log 2、shutdown 1、reboot 1、control 1、rgetty 11、rlogin 11 | 32 |
-| **合计** | | **479** |
+| text/* | grep 14、printf 12、util 9、echo 7、basename 7、tr 6、sort 6、head 6、cut 6、tail 6、wc 5、uniq 5、dirname 5、tee 4 | 98 |
+| file/* | ls 14、find 11、chmod 10、util 8、chown 8、tar 7、cp 7、stat 5、rm 5、mv 5、mktemp 5、mkdir 5、touch 4、realpath 4、ln 4、df 4、dd 4、cat 4 | 122 |
+| sys/* | meminfo 20、mount 12、kill 10、test 8、umount 7、processes 7、dmesg 7、sleep 6、env 6、uname 5、timeout 5、pgrep 5、passwd 5、id 4、logkeeper 3、hostname 3、uptime 3、date 2、su 2、true/false/pwd 各 1 | 123 |
+| core/* | rservice 3、status 2、log 4、shutdown 1、reboot 1、control 3、rgetty 11、rlogin 12 | 37 |
+| proc / glob / fstab（共享工具） | 进程信息收集/单位格式化；glob 匹配；fstab 解析 | 15 |
+| main | applet 注册表唯一性/查找/--help 处理 | 7 |
+| **合计** | | **727** |
 
 测试结果示例：
 
@@ -820,7 +898,7 @@ rbox 集成测试
   PASS  power off
 
 ========================================
-结果: 143 通过, 0 失败
+结果: 182 通过, 0 失败
 ========================================
 ```
 ## rootfs 布局
@@ -905,120 +983,45 @@ make run-disk   # QEMU -drive virtio + root=/dev/vda
   （不能用 /proc/mounts 判断，chroot 后挂载表仍显示 rootfs）。
 - 无 `root=` 内核参数时行为与原来完全一致（initramfs 模式）。
 
-## 后续计划
+## 后续计划（剩余路线图）
 
-按优先级排列：
+> 历史计划中的 applet 扩展（dmesg/mount/umount/kill/find/chmod/chown）、shell 增强
+> （test/[、算术、位置参数、read、复合命令、别名、$()、作业控制）、init 生产化
+> （Before/EnvironmentFile/WorkingDirectory/TimeoutStopSec/KillMode、rescue 降级、
+> logkeeper 轮转、UUID/LABEL 根设备）、工程化（musl 静态构建、fuzz-lite、覆盖率/
+> 审计/发布目标）均已完成，见上文各章节与 CHANGELOG.md。以下是仍待实现的部分。
 
-### 第一优先级：扩展 Applet
-
-这是当前阶段的主要工作。以下为建议的 applet 及优先级：
-
-**高优先级（核心工具）**：
-
-| Applet | 用法 | 状态 |
-|--------|------|------|
-| dmesg | dmesg | 未实现 |
-| mount | mount [-t type] src tgt | 未实现 |
-| umount | umount tgt | 未实现 |
-| ps | ps | 未实现 |
-| kill | kill [-signal] pid | 未实现 |
-| find | find path [-name pattern] | 未实现 |
-| chmod | chmod mode file | 未实现 |
-| chown | chown user:group file | 未实现 |
-
-**已实现（第一批扩展）**：
-
-| Applet | 用法 |
-|--------|------|
-| head | head [-n N] [file] |
-| tail | tail [-n N] [file] |
-| wc | wc [-lwc] [file] |
-| grep | grep [-inv] PATTERN [file] |
-| ln | ln [-s] target link |
-| date | date |
-| sleep | sleep N |
-| env | env [name=val] [cmd] |
-| printf | printf format args... |
-| basename | basename path [suffix] |
-| dirname | dirname path |
-
-**中优先级（实用工具）**：
-
-| Applet | 用法 | 状态 |
-|--------|------|------|
-| tar | tar [xf\|cf] file | 未实现 |
-| dd | dd if= of= bs= | 未实现 |
-| du | du | 未实现 |
-| stat | stat file | 未实现 |
-| sort | sort [file] | 未实现 |
-| uniq | uniq | 未实现 |
-| cut | cut -d -f | 未实现 |
-| tr | tr set1 set2 | 未实现 |
-| test | test expr | 未实现 |
-| xargs | xargs cmd | 未实现 |
-
-### 第二优先级：Shell 增强
-
-| 功能 | 说明 |
+### 高优先级
+| 项目 | 说明 |
 |------|------|
-| 环境变量 $VAR | 支持变量展开和赋值 VAR=value |
-| 命令分隔 ; | 顺序执行多条命令 |
-| 条件执行 && / \|\| | 根据退出码决定是否执行 |
-| 后台运行 & | fork 子进程后台执行 |
-| 通配符 * ? | glob 展开 |
-| 退出码 $? | 上条命令退出码 |
-| 命令历史 | readline 式输入 |
-| if/for/while | 控制结构 |
+| cgroup 进程跟踪 | forking 无 PIDFile 的 daemon 崩溃目前不触发 Restart；cgroup v2 可彻底解决 |
+| Type=notify / WatchdogSec | sd_notify 协议与 per-service 健康检查（目前仅硬件看门狗） |
+| socket activation | `.socket` 单元 + 按需拉起服务 |
+| ExecStartPre/ExecStartPost | 启动前/后钩子（含超时与失败传播） |
+| 启动失败降级细化 | rescue.target 独立单元、失败计数聚合、`systemctl` 风格 enable/disable |
+| `xargs` / `sed` / `awk` | 脚本化最后三块常用工具（`sed`/`awk` 工作量大，可先做 `xargs`） |
 
-### 第三优先级：Init 增强
+### 中优先级
+| 项目 | 说明 |
+|------|------|
+| 网络栈 | 内核 virtio-net + `ip`/`udhcpc`/`wget`/`ping`/`nc`（含 DNS 解析） |
+| 时间同步 | NTP 客户端（或从 RTC 初始化系统时间） |
+| udev/mdev | 设备节点动态管理（UUID 根设备依赖 /dev/disk/by-* 符号链接） |
+| 多 target 切换 | boot/multi-user/rescue.target 与隔离语义 |
+| fstab pass 字段 | 按 dump/pass 排序并 fsck（需 fsck 工具） |
+| 日志结构化 | journald 风格索引/级别过滤；logkeeper 多文件轮转与压缩 |
+| 终端 | 多 getty（多串口/虚拟终端）、utmp/wtmp/lastlog 记录 |
+| 关机 | `shutdown -h +N` 定时、wall 广播、SIGPWR 处理、kexec |
 
-以下功能已在后续迭代中实现：
-
-| 功能 | 说明 | 状态 |
-|------|------|------|
-| Restart=on-failure | 服务退出后自动重启 | ✅ 已实现 |
-| RestartSec / StartLimitBurst | 固定 RestartSec 间隔与连续失败上限（防 crash-loop 刷屏） | ✅ 已实现 |
-| Type=forking | daemon 化服务：等待父进程退出 + PIDFile 跟踪 + TimeoutStartSec 超时 | ✅ 已实现 |
-| ExecReload | rservice reload <unit> 执行 ExecReload 命令（不重启） | ✅ 已实现 |
-| 服务输出重定向 | LogFile= 将 stdout/stderr 写入日志文件 | ✅ 已实现 |
-| User=/Group= 降权 | 以指定用户/组运行（getpwnam/getgrnam 解析） | ✅ 已实现 |
-| sysctl 支持 | 启动时应用 /etc/sysctl.conf（写 /proc/sys/*） | ✅ 已实现 |
-| 日志写 /dev/kmsg | init 日志进入内核环形缓冲（dmesg/console 回显可见） | ✅ 已实现 |
-| Environment= | 服务环境变量 | ✅ 已实现 |
-| 前台/后台服务区分 | 退出即重启用 Restart=always（console/getty）；按需重启用 Restart=on-failure | ✅ 已实现 |
-| 服务状态查询 | rbox status / status <unit>（unix socket） | ✅ 已实现 |
-| 服务管理命令 | rservice start/stop/restart/reload（unix socket 控制协议） | ✅ 已实现 |
-| 进程组清理 | 服务独立进程组，关机按组终止后代 | ✅ 已实现 |
-| 多 target 切换 | boot.target / multi-user.target / rescue.target | TODO |
-| 依赖更精细控制 | Wants= / Requisite= / Before=（Wants 尽力依赖参与排序、Requisite 前置检查不激活；Before= TODO） | ✅ 部分实现 |
-| ExecStartPre/Post 钩子 | 启动前/后执行额外命令 | TODO |
-| 内核 cmdline 解析 | single/emergency（跳过服务直接进 shell）、quiet | ✅ 部分实现（single/emergency；quiet TODO） |
-| 启动失败降级 | default.target 失败 → 自动进入 rescue | TODO |
-| 看门狗喂狗 | 主循环空闲时按 [init] watchdog_interval 定时喂狗（poll 与喂狗截止取 min），挂死即硬件复位；无设备静默禁用 | ✅ 已实现 |
-| 静态网络配置 | [Network] Address=/Gateway= 设置 IP | TODO |
-| SIGCHLD 驱动回收 | self-pipe + poll 事件驱动，信号唤醒即 try_wait（无 200ms 轮询） | ✅ 已实现 |
-| ExecStop 超时 | ExecStop/ExecReload 命令超时限制（5s，超时按进程组 SIGKILL，见 run_command_with_timeout） | ✅ 已实现 |
-| fstab pass 字段 | 按 dump/pass 决定挂载顺序 | TODO |
-| head 字符设备兼容 | head/tail/grep/wc 读取 /dev/kmsg 等设备文件（read_file_fully：EINVAL 重试 + O_NONBLOCK） | ✅ 已实现 |
-
-### 第四优先级：工程化进阶
-
-| 功能 | 说明 | 状态 |
-|------|------|------|
-| CI 流水线 | GitHub Actions 自动构建 + 测试 | 不需要 |
-| 单元测试 | Rust #[test] 模块（479 个） | ✅ 已实现 |
-| Clippy 零警告 | 全量修复 clippy warning | ✅ 已实现 |
-| rustfmt 统一格式 | rustfmt.toml 配置 | ✅ 已实现 |
-| Makefile verify 目标 | check + clippy + fmt + unittest 一键验证 | ✅ 已实现 |
-| Makefile APPLETS 自动同步 | 从 cargo run --list 提取 applet 列表 | ✅ 已实现 |
-| 共享工具提取 | file/util.rs（remove_recursive/is_dir/resolve_dest/copy_recursive） | ✅ 已实现 |
-| applet --help 支持 | `rbox <applet> --help` 打印帮助 | ✅ 已实现 |
-| 静态链接 musl | 减小 rootfs 依赖（aarch64-unknown-linux-musl） | TODO |
-| 压缩二进制 | make strip（strip 符号表，1.4M -> 965K） | ✅ 已实现 |
-| 持久化根文件系统 | ext4 磁盘镜像 + init 的 switch_root（root= 内核参数） | ✅ 已实现 |
-| 网络支持 | 内核配置 virtio-net + busybox-style 网络工具 | TODO |
-
----
+### 低优先级 / 可选
+| 项目 | 说明 |
+|------|------|
+| `case`/`until`/函数 | shell 脚本结构补全；`break N`/`continue N` |
+| `$()` 词分割 | 命令替换按 POSIX 做词分割（当前不分割） |
+| 密码策略 | 失败锁定/nologin/密码老化（目前仅失败延迟） |
+| 服务隔离 | capabilities/no_new_privs/seccomp/只读根 |
+| 供应链 | 内核 tarball 默认 sha256、SBOM、签名校验 |
+| 多架构 | Makefile 参数化内核交叉编译（目前固定 aarch64） |
 
 ## 开发笔记
 

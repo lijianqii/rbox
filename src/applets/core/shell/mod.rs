@@ -16,10 +16,16 @@
 //! - Ctrl-C SIGINT 转发：中断前台运行命令而不退出 shell。
 //! - `~` 展开。
 
+mod alias;
 mod builtin;
 mod completion;
+mod compound;
 mod executor;
 mod expander;
+#[cfg(test)]
+mod fuzz;
+mod jobs;
+mod params;
 mod parser;
 mod reader;
 mod tokenizer;
@@ -27,11 +33,53 @@ mod types;
 
 use crate::applet::Applet;
 use reader::{enable_raw_mode, make_prompt, redraw};
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
+
+/// 无缓冲 stdin：直接 `read(2)`。Rust 的 `Stdin` 会预读缓冲，导致 `read`
+/// 内置命令与 REPL 争抢输入（缓冲吃掉后续行）；REPL 改用裸 fd 读取后，
+/// 两者共享同一文件偏移，行为与 POSIX 一致。
+struct RawStdin;
+
+impl Read for RawStdin {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+/// 从 `Read` 读一行（含换行符；EOF 返回已读内容）。
+fn read_line_raw<R: Read>(input: &mut R) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        match input.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(b[0]);
+                if b[0] == b'\n' {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    buf
+}
 
 /// 处理 here-doc：检测 `<<DELIM`，读取后续行直到 DELIM，写入临时文件。
 /// 返回替换后的命令行（`<<DELIM` -> `<tmpfile`）。
-fn process_heredoc<R: BufRead>(line: &str, input: &mut R) -> String {
+fn process_heredoc<R: Read>(line: &str, input: &mut R) -> String {
     // 查找真正的 <<（跳过引号内与反斜杠转义）
     let idx = match find_heredoc_operator(line) {
         Some(i) => i,
@@ -50,8 +98,8 @@ fn process_heredoc<R: BufRead>(line: &str, input: &mut R) -> String {
     loop {
         let _ = write!(io::stdout(), "> ");
         let _ = io::stdout().flush();
-        let mut line_buf = Vec::new();
-        if input.read_until(b'\n', &mut line_buf).unwrap_or(0) == 0 {
+        let mut line_buf = read_line_raw(input);
+        if line_buf.is_empty() {
             break; // EOF
         }
         // 去掉行尾换行符（\n 或 \r\n）
@@ -307,8 +355,7 @@ impl Shell {
             source_file(profile_path, &mut boot_rc, &mut boot_history);
         }
 
-        let stdin = io::stdin();
-        let mut input = stdin.lock();
+        let mut input = RawStdin;
         let mut last_rc: i32 = 0;
         let mut pending_line = String::new();
 
@@ -316,6 +363,10 @@ impl Shell {
         let mut history: Vec<String> = load_history();
         let mut hist_idx: Option<usize> = None;
         let mut saved_line = String::new();
+
+        // 复合命令（if/for/while）累积状态：block_depth > 0 表示块未闭合
+        let mut block_lines: Vec<String> = Vec::new();
+        let mut block_depth: i32 = 0;
 
         // raw mode guard（终端时启用，管道时为 None）
         let _raw_guard = enable_raw_mode();
@@ -372,6 +423,33 @@ impl Shell {
 
                     // 空行直接跳过
                     if full_line.trim().is_empty() {
+                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+
+                    // 复合命令（if/for/while）：累积到完整块后整体执行
+                    if block_depth > 0 || compound::is_compound_start(&full_line) {
+                        block_depth += compound::nesting_delta(&full_line);
+                        block_lines.push(full_line.clone());
+                        if block_depth > 0 {
+                            let _ = write!(io::stdout(), "> ");
+                            let _ = io::stdout().flush();
+                            continue;
+                        }
+                        let block = block_lines.join("\n");
+                        block_lines.clear();
+                        block_depth = 0;
+                        last_rc =
+                            compound::execute_block(&block, &mut last_rc, &history, &|rc: i32| {
+                                let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
+                                let _ = io::stdout().flush();
+                                std::process::exit(rc);
+                            });
+                        if history.last() != Some(&block) {
+                            history.push(block.clone());
+                            append_history(&block);
+                        }
                         let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
                         let _ = io::stdout().flush();
                         continue;
@@ -447,6 +525,10 @@ impl Shell {
                 0x03 => {
                     // Ctrl-C：中断当前行，新起一行
                     abort_line(&mut line, &mut cursor, &mut pending_line, &mut hist_idx);
+                }
+
+                0x1a => {
+                    // Ctrl-Z：无前台进程时忽略（有前台进程时由监控线程处理挂起）
                 }
 
                 0x0c => {

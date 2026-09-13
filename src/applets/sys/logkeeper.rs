@@ -9,6 +9,7 @@
 use crate::applet::Applet;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::ExitCode;
 
 pub struct Logkeeper;
@@ -16,6 +17,32 @@ pub static LOGKEEPER: &Logkeeper = &Logkeeper;
 
 /// kmsg 单条消息可能超过 8KB（扩 buffer 重试上限）。
 const MAX_BUF: usize = 1024 * 1024;
+
+/// 日志文件轮转阈值（1MB）：超过则改名为 `<file>.1`（保留一份历史）。
+const LOG_MAX_SIZE: u64 = 1024 * 1024;
+
+/// 检查并轮转日志文件；返回是否需要重新打开。
+pub(crate) fn rotate_if_needed(path: &str) -> std::io::Result<bool> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(false);
+    };
+    if meta.len() <= LOG_MAX_SIZE {
+        return Ok(false);
+    }
+    let backup = format!("{}.1", path);
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(path, &backup)?;
+    Ok(true)
+}
+
+/// 以 0600 打开日志文件（避免泄露服务输出）。
+fn open_log(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+}
 
 impl Applet for Logkeeper {
     fn name(&self) -> &'static str {
@@ -37,11 +64,7 @@ impl Applet for Logkeeper {
             eprintln!("logkeeper: cannot create {}: {}", parent.display(), e);
             return ExitCode::FAILURE;
         }
-        let mut log = match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(file)
-        {
+        let mut log = match open_log(file) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("logkeeper: cannot open {}: {}", file, e);
@@ -62,6 +85,7 @@ impl Applet for Logkeeper {
             unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
         }
         let mut buf = vec![0u8; 8192];
+        let mut written: u64 = 0;
         loop {
             match std::io::Read::read(&mut kmsg, &mut buf) {
                 Ok(0) => {
@@ -74,6 +98,22 @@ impl Applet for Logkeeper {
                         return ExitCode::FAILURE;
                     }
                     let _ = log.flush();
+                    written += n as u64;
+                    // 定期检查轮转（每次检查有 stat 开销，累计 256KB 才检查）
+                    if written >= 256 * 1024 {
+                        written = 0;
+                        match rotate_if_needed(file) {
+                            Ok(true) => match open_log(file) {
+                                Ok(f) => log = f,
+                                Err(e) => {
+                                    eprintln!("logkeeper: reopen {} failed: {}", file, e);
+                                    return ExitCode::FAILURE;
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(e) => eprintln!("logkeeper: rotate {} failed: {}", file, e),
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     // 暂时无新消息：休眠后重试
@@ -105,5 +145,26 @@ mod tests {
     fn name_and_help() {
         assert_eq!(LOGKEEPER.name(), "logkeeper");
         assert!(LOGKEEPER.help().contains("kmsg"));
+    }
+
+    #[test]
+    fn rotate_small_file_not_needed() {
+        let path = format!("/tmp/rbox_logkeeper_{}", std::process::id());
+        std::fs::write(&path, b"small").unwrap();
+        assert!(!rotate_if_needed(&path).unwrap());
+        assert!(std::path::Path::new(&path).exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotate_large_file_moves_backup() {
+        let path = format!("/tmp/rbox_logkeeper_big_{}", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.1", path));
+        std::fs::write(&path, vec![b'x'; (LOG_MAX_SIZE + 1) as usize]).unwrap();
+        assert!(rotate_if_needed(&path).unwrap());
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(std::path::Path::new(&format!("{}.1", path)).exists());
+        let _ = std::fs::remove_file(format!("{}.1", path));
     }
 }

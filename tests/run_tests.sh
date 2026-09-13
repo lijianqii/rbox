@@ -30,7 +30,7 @@ assert_contains_in() {
     local out="$1"
     local desc="$2"
     local pattern="$3"
-    if echo "$out" | tr -d '\r' | grep -q "$pattern"; then
+    if echo "$out" | tr -d '\r' | grep -q -- "$pattern"; then
         echo "  PASS  $desc"
         PASS=$((PASS + 1))
     else
@@ -47,13 +47,48 @@ assert_not_contains_in() {
     local out="$1"
     local desc="$2"
     local pattern="$3"
-    if echo "$out" | tr -d '\r' | grep -q "$pattern"; then
+    if echo "$out" | tr -d '\r' | grep -q -- "$pattern"; then
         echo "  FAIL  $desc (不应包含: '$pattern')"
         FAIL=$((FAIL + 1))
     else
         echo "  PASS  $desc"
         PASS=$((PASS + 1))
     fi
+}
+
+# 断言输出中存在与给定字符串完全相等的一行（-F 固定串 + -x 整行）
+# 用于关键行为：避免子串匹配造成的假阳性（如 "20" 匹配到任意含 20 的行）
+assert_line_in() {
+    local out="$1"
+    local desc="$2"
+    local pattern="$3"
+    if printf '%s\n' "$out" | tr -d '\r' | grep -qxF -- "$pattern"; then
+        echo "  PASS  $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  $desc (期望整行等于: '$pattern')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+assert_line() {
+    assert_line_in "$OUT" "$1" "$2"
+}
+
+# 断言输出中存在匹配正则的一整行（-E 扩展正则 + -x 整行）
+assert_line_regex_in() {
+    local out="$1"
+    local desc="$2"
+    local pattern="$3"
+    if printf '%s\n' "$out" | tr -d '\r' | grep -qxE -- "$pattern"; then
+        echo "  PASS  $desc"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL  $desc (期望整行匹配: '$pattern')"
+        FAIL=$((FAIL + 1))
+    fi
+}
+assert_line_regex() {
+    assert_line_regex_in "$OUT" "$1" "$2"
 }
 
 # ─── rgetty/rlogin 登录流程（使用生产 initramfs，console 为 rgetty）───
@@ -64,7 +99,7 @@ echo ""
 echo "[rgetty/rlogin 登录流程]"
 LOGIN_OUT=$(timeout 150 bash -c '
 {
-  sleep 18
+  sleep 28
   printf "root\n"; sleep 2
   printf "wrongpass\n"; sleep 2
   printf "root\n"; sleep 2
@@ -103,7 +138,7 @@ build_login_test_initramfs() {
 build_login_test_initramfs
 TIMEOUT_OUT=$(timeout 150 bash -c '
 {
-  sleep 18
+  sleep 28
   # 第一次登录：成功后每 3s 输入一次（< -t 8），持续 15s 不应超时；
   # K1..K5 中偶发单次丢失不影响结论（间隔仍 < 8s）
   printf "root\n"; sleep 2
@@ -137,7 +172,7 @@ assert_contains_in "$TIMEOUT_OUT" "超时后重新登录" "TIMEOUT_LOGIN_OK"
 #       $ 需转义为 \$，单引号用 \x27 代替，避免破坏外层引号。
 OUT=$(timeout 400 bash -c '
 {
-  sleep 15
+  sleep 20
   # 基本 applet
   printf "uname -m\n"; sleep 0.5
   printf "uname -n\n"; sleep 0.5
@@ -221,6 +256,12 @@ OUT=$(timeout 400 bash -c '
   printf "ls /tmp/glob_test/*.txt\n"; sleep 0.5
   printf "ls /tmp/glob_test/?.txt\n"; sleep 0.5
   printf "ls /tmp/glob_test/[ab].txt\n"; sleep 0.5
+  # 6.5 引号保护 glob（回归：引号内 * 不得展开为目录项）
+  printf "echo \"*\"\n"; sleep 0.5
+  printf "echo \x27*\x27\n"; sleep 0.5
+  # 6.6 内置命令重定向（回归：pwd > file）
+  printf "pwd > /tmp/t_pwd_redirect\n"; sleep 0.5
+  printf "cat /tmp/t_pwd_redirect && echo REDIRECT_OK\n"; sleep 0.5
   # 7. 历史扩展
   printf "echo hist_one\n"; sleep 0.5
   printf "echo hist_two\n"; sleep 0.5
@@ -248,6 +289,29 @@ OUT=$(timeout 400 bash -c '
   printf "sleep 3 &\n"; sleep 0.5
   printf "true\n"; sleep 0.5
   printf "echo bg_true_rc=\$?\n"; sleep 0.5
+  # 10.8 复合命令 / 别名 / 命令替换 / 作业控制
+  printf "if true\n"; sleep 0.3
+  printf "then\n"; sleep 0.3
+  printf "echo IF_BLOCK_OK\n"; sleep 0.3
+  printf "fi\n"; sleep 0.4
+  printf "for i in 11 22\n"; sleep 0.3
+  printf "do\n"; sleep 0.3
+  printf "echo FOR_\$i\n"; sleep 0.3
+  printf "done\n"; sleep 0.4
+  printf "while true\n"; sleep 0.3
+  printf "do\n"; sleep 0.3
+  printf "echo WHILE_ONCE\n"; sleep 0.3
+  printf "break\n"; sleep 0.3
+  printf "done\n"; sleep 0.4
+  printf "alias tll=\x27echo ALIAS_OK\x27\n"; sleep 0.3
+  printf "tll\n"; sleep 0.4
+  printf "echo SUBST_\$(echo INNER)\n"; sleep 0.4
+  printf "sleep 2 &\n"; sleep 0.3
+  printf "jobs\n"; sleep 0.4
+  printf "sleep 5\n"; sleep 0.5
+  printf "\x1a"; sleep 0.5
+  printf "jobs\n"; sleep 0.4
+  printf "bg\n"; sleep 0.4
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -260,7 +324,7 @@ OUT=$(timeout 400 bash -c '
   printf "basename /usr/bin/gcc\n"; sleep 0.5
   printf "basename /tmp/test.txt .txt\n"; sleep 0.5
   printf "dirname /usr/bin/gcc\n"; sleep 0.5
-  printf "date | head -c 3\n"; sleep 0.5
+  printf "date\n"; sleep 0.5
   # 12. env / ln
   printf "env | head -n 1\n"; sleep 0.5
   printf "ln -s /etc/hostname /tmp/linktest\n"; sleep 0.5
@@ -268,7 +332,7 @@ OUT=$(timeout 400 bash -c '
   # 13. echo -n
   printf "echo -n no_newline; echo after\n"; sleep 0.5
   # 14. ls -a / ls -1
-  printf "ls -a / | head -n 3\n"; sleep 0.5
+  printf "ls -a -1 / | head -n 3\n"; sleep 0.5
   printf "ls -1 / | head -n 1\n"; sleep 0.5
   # 15. rm -r
   printf "rm -r /tmp/glob_test\n"; sleep 0.5
@@ -281,6 +345,20 @@ OUT=$(timeout 400 bash -c '
   printf "ls /tmp/nested/deep/dir\n"; sleep 0.5
   # 18. tail
   printf "echo -e \x27aaa\\nbbb\\nccc\x27 | tail -n 1\n"; sleep 0.5
+  # 18.5 新增 applet：chmod/chown/find/kill/dmesg/mount/umount
+  printf "touch /tmp/t_newapp; chmod 600 /tmp/t_newapp; ls -l /tmp/t_newapp\n"; sleep 0.5
+  printf "chown 0:0 /tmp/t_newapp; echo chown_rc=\$?\n"; sleep 0.5
+  printf "mkdir -p /tmp/find_t/sub; touch /tmp/find_t/a.txt /tmp/find_t/sub/b.txt; find /tmp/find_t -name \x27*.txt\x27\n"; sleep 0.5
+  printf "find /tmp/find_t -type d\n"; sleep 0.5
+  printf "kill -0 1 && echo kill_ok\n"; sleep 0.5
+  printf "kill -l | head -n 1\n"; sleep 0.5
+  printf "dmesg -n 1 > /tmp/t_dmesg; wc -l < /tmp/t_dmesg; echo dmesg_done\n"; sleep 0.5
+  printf "mount | head -n 1\n"; sleep 0.5
+  printf "umount /nonexistent 2>/dev/null; echo umount_rc=\$?\n"; sleep 0.5
+  printf "kill -l 9\n"; sleep 0.5
+  printf "export FD=/tmp/find_d; mkdir -p \$FD/sub; touch \$FD/x.txt \$FD/sub/y.txt; find \$FD -maxdepth 1 -name \x27*.txt\x27\n"; sleep 0.5
+  printf "chmod u+x /tmp/t_newapp; ls -l /tmp/t_newapp\n"; sleep 0.5
+  printf "mount /nonexistent_fstab_entry\n"; sleep 0.5
   # 19. stderr 重定向 2>
   printf "ls /nonexistent_xyz 2> /tmp/stderr_out; cat /tmp/stderr_out\n"; sleep 0.5
   # 20. stderr 追加 2>>
@@ -315,11 +393,11 @@ echo "========================================"
 echo ""
 
 echo "[基本 applet]"
-assert_contains "uname -m -> aarch64" "aarch64"
-assert_contains "uname -n -> 主机名" "rbox"
-assert_contains "pwd -> /" "^/"
-assert_contains "echo hello -> hello" "hello"
-assert_contains "cat /etc/hostname" "rbox"
+assert_line "uname -m -> aarch64" "aarch64"
+assert_line "uname -n -> 主机名" "rbox"
+assert_line "pwd -> /" "/"
+assert_line "echo hello -> hello" "hello"
+assert_line "cat /etc/hostname" "rbox"
 
 echo ""
 echo "[文件操作]"
@@ -426,6 +504,11 @@ assert_contains "通配符 ? " "a.txt"
 assert_contains "通配符 [] " "a.txt"
 
 echo ""
+echo "[Shell: 引号保护 glob / 内置重定向]"
+assert_contains "双引号 * 不展开" "^\*$"
+assert_line "内置命令重定向成功" "REDIRECT_OK"
+
+echo ""
 echo "[Shell: 历史扩展]"
 assert_contains "!! 重复上一条" "hist_two"
 assert_contains "!n 第n条命令" "hist_one"
@@ -460,6 +543,17 @@ echo "[Shell: 后台/前台退出码]"
 assert_contains "后台+前台并发退出码" "bg_true_rc=0"
 
 echo ""
+echo "[Shell: 复合命令/别名/命令替换/作业控制]"
+assert_line "if 块执行" "IF_BLOCK_OK"
+assert_line "for 循环第一次" "FOR_11"
+assert_line "for 循环第二次" "FOR_22"
+assert_line "while + break" "WHILE_ONCE"
+assert_line "alias 展开" "ALIAS_OK"
+assert_line "命令替换 \$(...)" "SUBST_INNER"
+assert_contains "jobs 显示后台作业" "Running"
+assert_contains "Ctrl-Z 挂起作业" "Stopped"
+
+echo ""
 echo "[内存信息]"
 assert_contains "meminfo 显示 Mem 行" "Mem:"
 assert_contains "meminfo 显示 Swap 行" "Swap:"
@@ -483,20 +577,40 @@ assert_contains "head -n 2 截取两行" "line1"
 assert_contains "printf 格式化输出" "name=rbox-num=42"
 assert_contains "wc -c 字节计数" "6"
 assert_contains "grep 搜索匹配" "hel"
-assert_contains "basename 取文件名" "gcc"
-assert_contains "basename 去后缀" "test"
-assert_contains "dirname 取目录" "/usr/bin"
-assert_contains "date 日期输出" "20"
+assert_line "basename 取文件名" "gcc"
+assert_line "basename 去后缀" "test"
+assert_line "dirname 取目录" "/usr/bin"
+assert_line_regex "date 日期输出" "^[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]{1,2} [0-9]{2}:[0-9]{2}:[0-9]{2} UTC [0-9]{4}$"
 assert_contains "env 环境变量" "PATH"
 assert_contains "ln -s 符号链接创建" "rbox"
-assert_contains "ln -s 符号链接读取" "rbox"
+assert_line "ln -s 符号链接读取" "rbox"
 assert_contains "echo -n 无换行" "no_newlineafter"
-assert_contains "ls -a 包含 ." "\."
-assert_contains "ls -1 单列输出" "bin"
+assert_line "ls -a 包含 ." "."
+assert_line "ls -a 包含 .." ".."
+assert_line "ls -1 单列输出" "bin"
 assert_contains "rm -r 递归删除" "No such file"
 assert_contains "touch 创建文件" "touched_new"
 assert_contains "mkdir -p 嵌套目录" "dir"
 assert_contains "tail -n 1 末尾行" "ccc"
+
+echo ""
+echo "[新增 applet: chmod/chown/find/kill/dmesg/mount/umount]"
+assert_contains "chmod 600 生效" "-rw-------"
+assert_line "chown 成功" "chown_rc=0"
+assert_line "find -name 递归 a" "/tmp/find_t/a.txt"
+assert_line "find -name 递归 b" "/tmp/find_t/sub/b.txt"
+assert_line "find -type d 目录" "/tmp/find_t/sub"
+assert_line "kill -0 探测成功" "kill_ok"
+assert_contains "kill -l 列出信号" "HUP"
+assert_line "dmesg 命令执行完成" "dmesg_done"
+assert_not_contains_in "$OUT" "dmesg 输出非空" "^0$"
+assert_contains "mount 列出挂载表" " / "
+assert_line "umount 不存在目标失败" "umount_rc=1"
+assert_line "kill -l 9 -> KILL" "KILL"
+assert_line "find -maxdepth 只列顶层" "/tmp/find_d/x.txt"
+assert_not_contains_in "$OUT" "find -maxdepth 不列子目录" "/tmp/find_d/sub/y.txt"
+assert_contains "chmod u+x 生效" "-rwx------"
+assert_contains "mount 未知目标提示 fstab" "/etc/fstab"
 
 echo ""
 echo "[Shell: stderr 重定向]"
@@ -540,7 +654,7 @@ echo ""
 echo "[emergency/single 启动模式]"
 EMERGENCY_OUT=$(timeout 130 bash -c '
 {
-  sleep 15
+  sleep 25
   printf "echo EMERGENCY_SHELL_OK\n"; sleep 1
   printf "shutdown\n"; sleep 8
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' emergency"
@@ -551,7 +665,7 @@ assert_contains_in "$EMERGENCY_OUT" "应急 shell 可用" "EMERGENCY_SHELL_OK"
 
 SINGLE_OUT=$(timeout 130 bash -c '
 {
-  sleep 15
+  sleep 25
   printf "echo SINGLE_SHELL_OK\n"; sleep 1
   printf "shutdown\n"; sleep 8
 } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' single"
@@ -559,6 +673,75 @@ SINGLE_OUT=$(timeout 130 bash -c '
 assert_contains_in "$SINGLE_OUT" "single 模式进入单用户 shell" "single mode, emergency shell"
 assert_not_contains_in "$SINGLE_OUT" "single 跳过服务启动" "starting console-shell"
 assert_contains_in "$SINGLE_OUT" "单用户 shell 可用" "SINGLE_SHELL_OK"
+
+# ─── rescue 模式：default.target 的 Requires 失败 → 停止服务进 rescue shell ───
+echo ""
+echo "[rescue 启动降级]"
+RESCUE_TARGET=rootfs/etc/rbox/system/default.target.toml
+RESCUE_UNIT=rootfs/etc/rbox/system/rescue-fail.service.toml
+cp "$RESCUE_TARGET" /tmp/rbox_rescue_target_bak.toml
+cat > "$RESCUE_TARGET" <<'TOML'
+[Unit]
+Name = "default.target"
+Requires = ["rescue-fail"]
+
+[Install]
+WantedBy = []
+TOML
+cat > "$RESCUE_UNIT" <<'TOML'
+[Unit]
+Description = "Always-failing unit for rescue test"
+Name = "rescue-fail"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox false"
+
+[Install]
+WantedBy = ["default.target"]
+TOML
+(cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip > ../rescue-test.cpio.gz)
+mv /tmp/rbox_rescue_target_bak.toml "$RESCUE_TARGET"
+rm -f "$RESCUE_UNIT"
+RESCUE_OUT=$(timeout 130 bash -c '
+{
+  sleep 25
+  printf "echo RESCUE_SHELL_OK\n"; sleep 1
+  printf "shutdown\n"; sleep 8
+} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd rescue-test.cpio.gz -append '"'$APPEND'"'' 2>&1) || true
+rm -f rescue-test.cpio.gz
+assert_contains_in "$RESCUE_OUT" "target 未达成日志" "target default.target not reached"
+assert_contains_in "$RESCUE_OUT" "进入 rescue 模式" "rescue mode, emergency shell"
+assert_contains_in "$RESCUE_OUT" "rescue shell 可用" "RESCUE_SHELL_OK"
+assert_not_contains_in "$RESCUE_OUT" "rescue 未达到 target" "reached target default.target"
+
+# ─── 持久盘模式：root=/dev/vda + switch_root + 重启后数据保留 ───
+echo ""
+echo "[持久盘模式（ext4 + switch_root）]"
+if command -v mkfs.ext4 >/dev/null 2>&1 || [ -x /sbin/mkfs.ext4 ]; then
+    make disk >/dev/null 2>&1
+    DISK_OUT=$(timeout 180 bash -c '
+    {
+      sleep 30
+      printf "root\n"; sleep 2
+      printf "root\n"; sleep 2
+      printf "echo PERSIST_MARKER > /persist_test.txt; sync; echo disk_write_ok\n"; sleep 1
+      printf "reboot\n"; sleep 35
+      printf "root\n"; sleep 2
+      printf "root\n"; sleep 2
+      printf "cat /persist_test.txt\n"; sleep 1
+      printf "shutdown\n"; sleep 10
+    } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+      -kernel '"$KERNEL"' -initrd '"$INITRD"' \
+      -drive file=rootfs.ext4,format=raw,if=virtio \
+      -append "'"$APPEND"' root=/dev/vda"
+    ' 2>&1) || true
+    assert_contains_in "$DISK_OUT" "切换到持久根" "switching to persistent root /dev/vda"
+    assert_contains_in "$DISK_OUT" "磁盘写入成功" "disk_write_ok"
+    assert_contains_in "$DISK_OUT" "重启后数据保留" "PERSIST_MARKER"
+else
+    echo "  SKIP  持久盘模式（宿主机缺少 mkfs.ext4）"
+fi
 
 echo ""
 echo "========================================"

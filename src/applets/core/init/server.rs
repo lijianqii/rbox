@@ -2,8 +2,8 @@
 
 use crate::applets::core::control::status_socket;
 use crate::applets::core::init::services::{
-    EXEC_COMMAND_TIMEOUT, ServiceInstance, parse_environment, respawn_service,
-    run_command_with_timeout, start_forking_service, start_service, stop_service_instance,
+    EXEC_COMMAND_TIMEOUT, ServiceInstance, respawn_service, run_command_with_timeout,
+    start_forking_service, start_service, stop_service_instance, unit_environment,
 };
 use crate::applets::core::init::units::{Unit, parse_cmdline};
 use crate::applets::core::log;
@@ -210,7 +210,7 @@ fn do_start(
         Some(c) => c.clone(),
         None => return format!("{} has no ExecStart\n", name),
     };
-    let env = parse_environment(&unit.service.environment);
+    let env = unit_environment(unit);
     let inst = if unit.service.typ == "forking" {
         start_forking_service(unit, &cmd, &env)
     } else {
@@ -661,8 +661,8 @@ mod tests {
     fn cpu_percent_uses_delta_over_interval() {
         // 增量 30 ticks / (1s * CLK_TCK) * 100：精确值依赖 CLK_TCK，
         // 这里验证缺失 pid 返回 None 与 0 增量返回 0.0%
-        let prev = vec![pmem(1, 0, "a", 10, 10)];
-        let now = vec![pmem(1, 0, "a", 10, 10)];
+        let prev = [pmem(1, 0, "a", 10, 10)];
+        let now = [pmem(1, 0, "a", 10, 10)];
         let pm: HashMap<u32, &ProcMem> = prev.iter().map(|p| (p.pid, p)).collect();
         let nm: HashMap<u32, &ProcMem> = now.iter().map(|p| (p.pid, p)).collect();
         assert_eq!(cpu_percent_for(1, &pm, &nm, 1.0), Some(0.0));
@@ -675,8 +675,10 @@ mod tests {
         names
             .iter()
             .map(|n| {
-                let mut u = Unit::default();
-                u.name = n.to_string();
+                let u = Unit {
+                    name: n.to_string(),
+                    ..Default::default()
+                };
                 (n.to_string(), u)
             })
             .collect()

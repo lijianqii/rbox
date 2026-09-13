@@ -68,6 +68,31 @@ impl Applet for Rm {
     }
 }
 
+fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            if force {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no such file or directory",
+            ));
+        }
+    };
+
+    if meta.is_dir() {
+        if !recursive {
+            return Err(io::Error::other("is a directory"));
+        }
+        remove_recursive(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,29 +154,4 @@ mod tests {
         // Without -r, should fail but not panic
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-fn remove_one(path: &str, recursive: bool, force: bool) -> io::Result<()> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => {
-            if force {
-                return Ok(());
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "no such file or directory",
-            ));
-        }
-    };
-
-    if meta.is_dir() {
-        if !recursive {
-            return Err(io::Error::other("is a directory"));
-        }
-        remove_recursive(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    Ok(())
 }

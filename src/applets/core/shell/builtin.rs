@@ -1,5 +1,8 @@
 //! 内置命令：cd、exit、export、unset、pwd、history。
 
+use super::alias;
+use super::jobs;
+use super::params;
 use super::types::SimpleCmd;
 
 /// 内置命令执行结果。
@@ -12,10 +15,141 @@ pub enum BuiltinResult {
     NotBuiltin,
 }
 
+/// 命令名是否为内置命令（`execute_line` 据此决定是否应用重定向，
+/// 保证 `pwd > file` 等内置重定向与外部命令行为一致）。
+pub fn is_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "exit"
+            | "cd"
+            | "pwd"
+            | "export"
+            | "unset"
+            | "history"
+            | "alias"
+            | "unalias"
+            | "jobs"
+            | "fg"
+            | "bg"
+            | "read"
+            | "set"
+            | "shift"
+    )
+}
+
+/// 取下一个输入字节：优先消费前台命令监控线程缓存的 pending 队列，
+/// 再读 fd 0（否则 `read` 会与监控线程抢输入）。
+fn next_input_byte() -> Option<u8> {
+    if let Ok(mut q) = super::executor::pending_stdin().lock()
+        && let Some(b) = q.pop_front()
+    {
+        return Some(b);
+    }
+    loop {
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n == 1 {
+            return Some(b[0]);
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+}
+
+/// 从 stdin 读一行（raw 模式下逐字节读，tty 时回显 + 退格）。
+/// 返回 (内容, 是否以换行结束)。
+fn read_line_from_stdin(raw: bool) -> (String, bool) {
+    let fd = libc::STDIN_FILENO;
+    let tty = unsafe { libc::isatty(fd) } == 1;
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut complete = false;
+    while let Some(c) = next_input_byte() {
+        match c {
+            b'\n' => {
+                complete = true;
+                break;
+            }
+            b'\r' => {
+                complete = true;
+                if tty {
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
+                }
+                break;
+            }
+            0x7f | 0x08 => {
+                if bytes.pop().is_some() && tty {
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x08 \x08");
+                }
+            }
+            c => {
+                bytes.push(c);
+                if tty {
+                    let _ = std::io::Write::write_all(&mut std::io::stdout(), &[c]);
+                }
+            }
+        }
+    }
+    if tty {
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+    let mut line = String::from_utf8_lossy(&bytes).into_owned();
+    if !raw {
+        line = unescape_read(&line);
+    }
+    (line, complete)
+}
+
+/// `read` 默认模式：反斜杠转义下一字符。
+fn unescape_read(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// 按 IFS 空白拆分并赋值；最后一个变量取剩余部分；无变量时写 REPLY。
+fn assign_read_vars(line: &str, names: &[String]) {
+    if names.is_empty() {
+        unsafe {
+            std::env::set_var("REPLY", line);
+        }
+        return;
+    }
+    let mut rest = line.trim_start_matches([' ', '\t']);
+    for (i, name) in names.iter().enumerate() {
+        if i + 1 == names.len() {
+            let val = rest.trim_end_matches([' ', '\t']);
+            unsafe {
+                std::env::set_var(name, val);
+            }
+            break;
+        }
+        let end = rest.find([' ', '\t']).unwrap_or(rest.len());
+        let (field, tail) = rest.split_at(end);
+        unsafe {
+            std::env::set_var(name, field);
+        }
+        rest = tail.trim_start_matches([' ', '\t']);
+    }
+}
+
 /// 尝试执行内置命令。
 pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> BuiltinResult {
     if cmd.argv.is_empty() {
         return BuiltinResult::Done;
+    }
+    if !is_builtin(&cmd.argv[0]) {
+        return BuiltinResult::NotBuiltin;
     }
     match cmd.argv[0].as_str() {
         "exit" => {
@@ -84,6 +218,132 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             *last_rc = 0;
             BuiltinResult::Done
         }
+        "alias" => {
+            if cmd.argv.len() == 1 {
+                for line in alias::list_aliases() {
+                    println!("{}", line);
+                }
+                *last_rc = 0;
+            } else {
+                let mut rc = 0;
+                for arg in &cmd.argv[1..] {
+                    match arg.split_once('=') {
+                        Some((name, value)) => {
+                            if alias::set_alias(name, value).is_err() {
+                                eprintln!("alias: invalid alias name: '{}'", name);
+                                rc = 1;
+                            }
+                        }
+                        None => match alias::get_alias(arg) {
+                            Some(v) => println!("alias {}='{}'", arg, v),
+                            None => {
+                                eprintln!("alias: {}: not found", arg);
+                                rc = 1;
+                            }
+                        },
+                    }
+                }
+                *last_rc = rc;
+            }
+            BuiltinResult::Done
+        }
+        "unalias" => {
+            for arg in &cmd.argv[1..] {
+                alias::unalias(arg);
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "jobs" => {
+            for line in jobs::format_lines() {
+                println!("{}", line);
+            }
+            *last_rc = 0;
+            BuiltinResult::Done
+        }
+        "fg" => {
+            let spec = cmd.argv.get(1).map(String::as_str);
+            match jobs::take(spec) {
+                Some(job) => {
+                    jobs::resume(job.pgid);
+                    jobs::wait_pgid(job.pgid);
+                    println!("[{}] done  {}", job.id, job.command);
+                    *last_rc = 0;
+                }
+                None => {
+                    eprintln!("fg: no current job");
+                    *last_rc = 1;
+                }
+            }
+            BuiltinResult::Done
+        }
+        "bg" => {
+            let spec = cmd.argv.get(1).map(String::as_str);
+            match jobs::mark_running(spec) {
+                Some(job) => {
+                    jobs::resume(job.pgid);
+                    println!("[{}]+ {} &", job.id, job.command);
+                    *last_rc = 0;
+                }
+                None => {
+                    eprintln!("bg: no current job");
+                    *last_rc = 1;
+                }
+            }
+            BuiltinResult::Done
+        }
+        "read" => {
+            let raw = cmd.argv.iter().skip(1).any(|a| a == "-r");
+            let names: Vec<String> = cmd.argv[1..]
+                .iter()
+                .filter(|a| !a.starts_with('-'))
+                .cloned()
+                .collect();
+            let (line, complete) = read_line_from_stdin(raw);
+            if !complete && line.is_empty() {
+                *last_rc = 1; // EOF
+            } else {
+                assign_read_vars(&line, &names);
+                *last_rc = if complete { 0 } else { 1 };
+            }
+            BuiltinResult::Done
+        }
+        "set" => {
+            let rest = &cmd.argv[1..];
+            if rest.is_empty() {
+                for (k, v) in std::env::vars() {
+                    println!("{}={}", k, v);
+                }
+                *last_rc = 0;
+            } else if rest[0] == "--" {
+                params::set(rest[1..].to_vec());
+                *last_rc = 0;
+            } else {
+                eprintln!("set: only 'set -- args...' is supported");
+                *last_rc = 2;
+            }
+            BuiltinResult::Done
+        }
+        "shift" => {
+            let n = match cmd.argv.get(1) {
+                Some(s) => match s.parse::<usize>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("shift: invalid count '{}'", s);
+                        *last_rc = 2;
+                        return BuiltinResult::Done;
+                    }
+                },
+                None => 1,
+            };
+            if params::shift(n) {
+                *last_rc = 0;
+            } else {
+                eprintln!("shift: can't shift that many");
+                *last_rc = 1;
+            }
+            BuiltinResult::Done
+        }
         _ => BuiltinResult::NotBuiltin,
     }
 }
@@ -97,6 +357,37 @@ mod tests {
             argv: args.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn is_builtin_recognizes_all_builtins() {
+        for name in [
+            "exit", "cd", "pwd", "export", "unset", "history", "alias", "unalias", "jobs", "fg",
+            "bg", "read", "set", "shift",
+        ] {
+            assert!(is_builtin(name), "{} 应为内置命令", name);
+        }
+        for name in ["echo", "ls", "true", "", "PWD"] {
+            assert!(!is_builtin(name), "{} 不应为内置命令", name);
+        }
+    }
+
+    #[test]
+    fn unescape_read_strips_backslashes() {
+        assert_eq!(unescape_read(r"a\ b"), "a b");
+        assert_eq!(unescape_read("plain"), "plain");
+        assert_eq!(unescape_read("trail\\"), "trail");
+    }
+
+    #[test]
+    fn assign_read_vars_last_takes_rest() {
+        let names = vec!["A".to_string(), "B".to_string()];
+        assign_read_vars("one two three", &names);
+        assert_eq!(std::env::var("A").unwrap(), "one");
+        assert_eq!(std::env::var("B").unwrap(), "two three");
+        let names = vec!["C".to_string()];
+        assign_read_vars("  spaced  value  ", &names);
+        assert_eq!(std::env::var("C").unwrap(), "spaced  value");
     }
 
     #[test]

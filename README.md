@@ -2,11 +2,11 @@
 
 一个用 Rust 编写的 BusyBox 风格多合一（multi-call）二进制，交叉编译为 ARM64 (aarch64)，
 运行在 QEMU 全系统模拟中。包含一个 systemd 风格的 init（PID 1，TOML 配置）、
-一个支持管道/重定向/历史/Tab 补全的交互式 shell，以及 33 个常用命令。
+一个支持管道/重定向/历史/Tab 补全/复合命令/作业控制/脚本编程原语的交互式 shell，以及 65 个常用命令。
 
 ## 特性
 
-- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 33 个命令
+- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 65 个命令
 - **systemd 风格 init**：TOML 单元文件、依赖拓扑排序、`Type=simple/forking`、
   `Restart=on-failure/always`（固定 RestartSec 间隔 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
@@ -22,9 +22,13 @@
   - 命令历史（上下键浏览）、`!!` `!n` `!-n` 历史展开
   - 行编辑：左右键移动光标、Ctrl-A/E/U/W/L、Home/End
   - Tab 补全：命令补全 + 文件/路径补全（管道后也支持命令补全）
-  - 通配符 `*` `?` `[...]`、引号 `'...'` `"..."`、注释 `#`、续行 `\`
-  - 内置命令：`cd` `exit` `export` `unset` `pwd` `history`
-- **工程化**：Clippy 零警告、488 个单元测试、148 个集成断言、rustfmt、make strip、make doctor 环境自检
+  - 通配符 `*` `?` `[...]`（引号内不展开）、引号 `'...'` `"..."`、注释 `#`、续行 `\`
+  - 复合命令 `if/elif/else/fi`、`for ... in ... do ... done`、`while ... do ... done`（含 `break`/`continue`）
+  - 命令替换 `$(...)`、算术 `$(( ))`、别名 `alias`/`unalias`
+  - 位置参数 `$1..$9` `$#` `$@` + `set --` / `shift`，内置 `read`/`test`/`[`
+  - 作业控制：`jobs` / `fg %n` / `bg %n`，`&` 后台任务与 Ctrl-Z 挂起/恢复
+  - 内置命令：`cd` `exit` `export` `unset` `pwd` `history` `alias` `unalias` `jobs` `fg` `bg` `read` `set` `shift`
+- **工程化**：Clippy（--all-targets）零警告、727 个单元测试、182 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
 
 ## 快速开始
 
@@ -34,6 +38,10 @@ make run       # QEMU 全系统模拟启动
 make test      # 集成测试（QEMU 自动化验证）
 make unittest  # 宿主机单元测试
 make verify    # check + clippy + fmt + unittest 一键验证
+make verify-all # verify + QEMU 集成测试
+make build-musl # musl 静态构建（无 glibc 运行时依赖）
+make coverage  # 覆盖率（需 cargo-llvm-cov）
+make dist      # 发布包 dist/rbox-VERSION-aarch64.tar.gz
 ```
 
 依赖：Rust 工具链（`rustup target add aarch64-unknown-linux-gnu`）、
@@ -44,9 +52,9 @@ make verify    # check + clippy + fmt + unittest 一键验证
 ```
 src/applets/
 ├── core/     # 系统核心：init（PID 1）及内部模块、shell/、rgetty、rlogin、shutdown、reboot、status、rservice
-├── file/     # 文件操作：ls、cp、mv、rm、mkdir、touch、ln、cat
-├── text/     # 文本处理：head、tail、wc、grep、printf、echo、basename、dirname
-└── sys/      # 系统工具：true、false、pwd、uname、date、sleep、env
+├── file/     # 文件操作：ls、cp、mv、rm、mkdir、touch、ln、cat、chmod、chown、find、stat、du、df、readlink、realpath、mktemp、sync、dd、tar
+├── text/     # 文本处理：head、tail、wc、grep、printf、echo、basename、dirname、sort、uniq、cut、tr、tee
+└── sys/      # 系统工具：true、false、pwd、uname、date、sleep、env、kill、dmesg、mount、umount、meminfo、processes、logkeeper、test、id、hostname、uptime、timeout、pgrep、pkill、passwd、su
 ```
 
 详细设计见 [DESIGN.md](DESIGN.md)。

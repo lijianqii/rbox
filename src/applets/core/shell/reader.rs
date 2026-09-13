@@ -229,8 +229,12 @@ mod tests {
         assert_eq!(make_prompt("pending text"), "> ");
     }
 
+    /// 串行化 PS1 相关测试（环境变量全局共享，并行 set/remove 会互相干扰）。
+    static PS1_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn make_prompt_default() {
+        let _guard = PS1_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("PS1");
         }
@@ -239,6 +243,7 @@ mod tests {
 
     #[test]
     fn make_prompt_ps1() {
+        let _guard = PS1_LOCK.lock().unwrap();
         unsafe {
             std::env::set_var("PS1", r"\u@\h:\w$ ");
         }

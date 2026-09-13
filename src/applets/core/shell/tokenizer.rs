@@ -1,6 +1,24 @@
 //! 分词器：将输入行切分为 Token 序列。
 
-use super::types::Token;
+use super::types::{GLOB_ESCAPE, Token};
+
+/// 追加一个字面字符：若为 glob 元字符（`*` `?` `[`）则先插入保护标记，
+/// 使后续 `expand_glob` 不把它当通配符（引号/反斜杠保护）。
+fn push_literal(cur: &mut String, c: char) {
+    if matches!(c, '*' | '?' | '[') {
+        cur.push(GLOB_ESCAPE);
+    }
+    cur.push(c);
+}
+
+/// 追加一个“字面”字符（单引号内/反斜杠转义）：除 glob 元字符外，
+/// `$` 也加保护标记，使 `expand_vars` 不展开它（单引号语义）。
+fn push_escaped(cur: &mut String, c: char) {
+    if c == '$' {
+        cur.push(GLOB_ESCAPE);
+    }
+    push_literal(cur, c);
+}
 
 /// 将输入行切分为 Token 序列。
 ///
@@ -21,7 +39,7 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                     in_token = true;
                 }
                 _ => {
-                    cur.push(c);
+                    push_escaped(&mut cur, c);
                     in_token = true;
                 }
             }
@@ -39,7 +57,7 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                         match next {
                             '$' | '`' | '"' | '\\' => {
                                 chars.next();
-                                cur.push(next);
+                                push_escaped(&mut cur, next);
                             }
                             '\n' => {
                                 chars.next();
@@ -50,7 +68,7 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                         cur.push('\\');
                     }
                 }
-                _ => cur.push(c),
+                _ => push_literal(&mut cur, c),
             }
             continue;
         }
@@ -61,7 +79,7 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 if let Some(next) = chars.next()
                     && next != '\n'
                 {
-                    cur.push(next);
+                    push_escaped(&mut cur, next);
                     in_token = true;
                 }
             }
@@ -73,20 +91,49 @@ pub fn tokenize(line: &str) -> Vec<Token> {
                 in_dquote = true;
                 in_token = true;
             }
-            '2' if chars.peek() == Some(&'>') => {
-                // stderr 重定向：2> 或 2>>
+            '1' | '2' if chars.peek() == Some(&'>') => {
+                // stdout/stderr 重定向：1> 2> 1>> 2>> 1>&N 2>&N
+                let from: u8 = if c == '2' { 2 } else { 1 };
                 chars.next(); // consume '>'
                 flush_word(&mut tokens, &mut cur, &mut in_token);
-                if chars.peek() == Some(&'>') {
+                if chars.peek() == Some(&'&') {
                     chars.next();
-                    tokens.push(Token::RedirErrAppend);
+                    match read_fd(&mut chars) {
+                        Some(target) => tokens.push(Token::RedirDup(from, target)),
+                        None => {
+                            // `2>&` 缺目标：退化为普通重定向（后续会报缺文件名）
+                            tokens.push(if from == 2 {
+                                Token::RedirErr
+                            } else {
+                                Token::RedirOut
+                            });
+                        }
+                    }
+                } else if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(if from == 2 {
+                        Token::RedirErrAppend
+                    } else {
+                        Token::RedirAppend
+                    });
                 } else {
-                    tokens.push(Token::RedirErr);
+                    tokens.push(if from == 2 {
+                        Token::RedirErr
+                    } else {
+                        Token::RedirOut
+                    });
                 }
             }
             '>' => {
                 flush_word(&mut tokens, &mut cur, &mut in_token);
-                if chars.peek() == Some(&'>') {
+                if chars.peek() == Some(&'&') {
+                    // `>&N`：stdout 复制到 fd N
+                    chars.next();
+                    match read_fd(&mut chars) {
+                        Some(target) => tokens.push(Token::RedirDup(1, target)),
+                        None => tokens.push(Token::RedirOut),
+                    }
+                } else if chars.peek() == Some(&'>') {
                     chars.next();
                     tokens.push(Token::RedirAppend);
                 } else {
@@ -147,6 +194,22 @@ fn flush_word(tokens: &mut Vec<Token>, cur: &mut String, in_token: &mut bool) {
     }
 }
 
+/// 读取 fd 号（一个或多个数字）；无数字返回 None。
+fn read_fd(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<u8> {
+    let mut n: u32 = 0;
+    let mut any = false;
+    while let Some(&c) = chars.peek() {
+        if let Some(d) = c.to_digit(10) {
+            n = n * 10 + d;
+            any = true;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if any && n <= 9 { Some(n as u8) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,7 +244,10 @@ mod tests {
         let tokens = tokenize("echo 'a $B c'");
         assert_eq!(
             tokens,
-            vec![Token::Word("echo".into()), Token::Word("a $B c".into()),]
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("a {}$B c", GLOB_ESCAPE)),
+            ]
         );
     }
 
@@ -331,6 +397,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fd_dup_tokens() {
+        assert_eq!(
+            tokenize("cmd 2>&1"),
+            vec![Token::Word("cmd".into()), Token::RedirDup(2, 1),]
+        );
+        assert_eq!(
+            tokenize("cmd >&2"),
+            vec![Token::Word("cmd".into()), Token::RedirDup(1, 2),]
+        );
+        assert_eq!(
+            tokenize("cmd 1>&2"),
+            vec![Token::Word("cmd".into()), Token::RedirDup(1, 2),]
+        );
+    }
+
+    #[test]
+    fn stdout_digit_redirect() {
+        // 1> 与 > 等价
+        assert_eq!(
+            tokenize("echo hi 1> f"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hi".into()),
+                Token::RedirOut,
+                Token::Word("f".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize("echo hi 1>> f"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("hi".into()),
+                Token::RedirAppend,
+                Token::Word("f".into()),
+            ]
+        );
+    }
+
     // ─── here-doc ──────────────────────────────
 
     #[test]
@@ -372,6 +477,104 @@ mod tests {
         assert_eq!(
             tokens,
             vec![Token::Word("echo".into()), Token::Word("2".into()),]
+        );
+    }
+
+    // ─── 引号/转义保护 glob 元字符 ─────────────
+
+    #[test]
+    fn quoted_star_gets_glob_escape() {
+        let escaped = format!("{}*", GLOB_ESCAPE);
+        assert_eq!(
+            tokenize("echo \"*\""),
+            vec![Token::Word("echo".into()), Token::Word(escaped.clone())]
+        );
+        assert_eq!(
+            tokenize("echo '*'\''"),
+            vec![Token::Word("echo".into()), Token::Word(escaped.clone())]
+        );
+        assert_eq!(
+            tokenize(r"echo \*"),
+            vec![Token::Word("echo".into()), Token::Word(escaped.clone())]
+        );
+    }
+
+    #[test]
+    fn quoted_question_and_bracket_escaped() {
+        assert_eq!(
+            tokenize("echo \"?\""),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("{}?", GLOB_ESCAPE))
+            ]
+        );
+        assert_eq!(
+            tokenize("echo '[ab]'"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("{}[ab]", GLOB_ESCAPE))
+            ]
+        );
+    }
+
+    #[test]
+    fn unquoted_glob_chars_not_escaped() {
+        assert_eq!(
+            tokenize("echo *.txt"),
+            vec![Token::Word("echo".into()), Token::Word("*.txt".into())]
+        );
+        assert_eq!(
+            tokenize("echo a?b [cd]"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word("a?b".into()),
+                Token::Word("[cd]".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn single_quoted_dollar_is_literal() {
+        // 单引号内 $ 加保护标记，供 expand_vars 跳过展开
+        assert_eq!(
+            tokenize("echo '$VAR'"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("{}$VAR", GLOB_ESCAPE))
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_dollar_is_literal() {
+        assert_eq!(
+            tokenize(r"echo \$VAR"),
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("{}$VAR", GLOB_ESCAPE))
+            ]
+        );
+    }
+
+    #[test]
+    fn double_quoted_dollar_not_escaped() {
+        // 双引号内 $VAR 应正常展开（不标记）
+        assert_eq!(
+            tokenize("echo \"$VAR\""),
+            vec![Token::Word("echo".into()), Token::Word("$VAR".into())]
+        );
+    }
+
+    #[test]
+    fn mixed_quoted_and_unquoted_glob() {
+        // a"*"b* -> 引号内 * 受保护，末尾 * 仍为通配符
+        let tokens = tokenize("echo a\"*\"b*");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Word("echo".into()),
+                Token::Word(format!("a{}*b*", GLOB_ESCAPE))
+            ]
         );
     }
 

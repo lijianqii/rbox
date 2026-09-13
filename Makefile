@@ -11,7 +11,9 @@
 #   make all      - build + rootfs + initramfs
 
 TARGET   := aarch64-unknown-linux-gnu
+MUSL_TARGET := aarch64-unknown-linux-musl
 PROFILE  := release
+VERSION  := $(shell grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
 ROOTFS   := rootfs
 KERNEL   := kernel
 INITRD   := initramfs.cpio.gz
@@ -40,7 +42,8 @@ GLIBC_DIR := $(shell dirname $(shell aarch64-linux-gnu-gcc -print-file-name=libc
 # applet 列表：从 rbox --list 自动提取，避免与 src/applet.rs 手动同步
 APPLETS := $(shell cargo run --target x86_64-unknown-linux-gnu --quiet -- --list 2>/dev/null)
 
-.PHONY: all build strip rootfs initramfs rootfs-test run run-disk disk test unittest verify fmt kernel clean help
+.PHONY: all build strip rootfs initramfs rootfs-test run run-disk disk test unittest verify verify-all fmt kernel clean help \
+        build-musl coverage audit dist
 
 all: build rootfs initramfs
 
@@ -191,8 +194,43 @@ kernel:
 fmt:
 	cargo fmt --check
 
-# ─── 验证（CI 用）────────────────────────────────
+# ─── 验证（一键）────────────────────────────────
 verify: check clippy fmt unittest
+
+# verify-all：verify + QEMU 集成测试（需内核 Image 与交叉工具链）
+verify-all: verify test
+
+MUSL_LINKER := $(shell rustup which rust-lld 2>/dev/null || command -v rust-lld || echo rust-lld)
+
+# ─── musl 静态构建（无 glibc/libcrypt 运行时依赖）──
+build-musl:
+	@rustup target list --installed 2>/dev/null | grep -qx $(MUSL_TARGET) || { \
+		echo "错误: 未安装 $(MUSL_TARGET)，请先 rustup target add $(MUSL_TARGET)" >&2; exit 1; }
+	RUSTFLAGS="-C linker=$(MUSL_LINKER)" cargo build --target $(MUSL_TARGET) --release
+	@ls -la target/$(MUSL_TARGET)/release/rbox
+	@file target/$(MUSL_TARGET)/release/rbox | grep -q "statically linked" && echo "静态链接确认 OK"
+
+# ─── 覆盖率（需 cargo-llvm-cov）───────────────────
+coverage:
+	@command -v cargo-llvm-cov >/dev/null 2>&1 || { \
+		echo "需要 cargo-llvm-cov：cargo install cargo-llvm-cov" >&2; exit 1; }
+	cargo llvm-cov --target x86_64-unknown-linux-gnu --summary-only
+
+# ─── 依赖漏洞扫描（需 cargo-audit）────────────────
+audit:
+	@command -v cargo-audit >/dev/null 2>&1 || { \
+		echo "需要 cargo-audit：cargo install cargo-audit" >&2; exit 1; }
+	cargo audit
+
+# ─── 发布包（dist/rbox-VERSION-aarch64.tar.gz）────
+dist: strip
+	rm -rf dist/rbox-$(VERSION)-aarch64
+	mkdir -p dist/rbox-$(VERSION)-aarch64/bin dist/rbox-$(VERSION)-aarch64/etc
+	cp target/$(TARGET)/$(PROFILE)/rbox dist/rbox-$(VERSION)-aarch64/bin/
+	cp README.md DESIGN.md CHANGELOG.md LICENSE dist/rbox-$(VERSION)-aarch64/
+	cp -r rootfs/etc/. dist/rbox-$(VERSION)-aarch64/etc/
+	cd dist && tar czf rbox-$(VERSION)-aarch64.tar.gz rbox-$(VERSION)-aarch64
+	@echo "发布包: dist/rbox-$(VERSION)-aarch64.tar.gz"
 
 # ─── 环境自检 ────────────────────────────────────
 # 一次性验证宿主机环境：工具链 / QEMU / 内核 / 权限 / 残留控制 socket。
@@ -211,7 +249,7 @@ check:
 	cargo check --target x86_64-unknown-linux-gnu
 
 clippy:
-	cargo clippy --target x86_64-unknown-linux-gnu -- -D warnings
+	cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 
 # ─── 清理 ────────────────────────────────────────
 clean:
@@ -234,7 +272,12 @@ help:
 	@echo "  make test      - 集成测试"
 	@echo "  make unittest  - 宿主机单元测试 (x86_64)"
 	@echo "  make fmt       - cargo fmt --check 格式检查"
-	@echo "  make verify    - check + clippy + fmt + unittest（CI 用）"
+	@echo "  make verify    - check + clippy(--all-targets) + fmt + unittest"
+	@echo "  make verify-all - verify + QEMU 集成测试（需内核）"
+	@echo "  make build-musl - musl 静态构建（无 glibc 运行时依赖）"
+	@echo "  make coverage  - 覆盖率报告（需 cargo-llvm-cov）"
+	@echo "  make audit     - 依赖漏洞扫描（需 cargo-audit）"
+	@echo "  make dist      - 生成发布包 dist/rbox-VERSION-aarch64.tar.gz"
 	@echo "  make doctor    - 环境自检（工具链/QEMU/内核/权限/残留 socket）"
 	@echo "  make kernel    - 编译 ARM64 内核（源码缺失时自动从清华镜像下载）"
 	@echo "  make clean     - 清理产物"

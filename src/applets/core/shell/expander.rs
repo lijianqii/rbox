@@ -1,6 +1,7 @@
 //! 展开：变量展开、历史扩展、tilde 展开、通配符展开。
 
 use super::types::*;
+use crate::applets::glob::glob_match;
 
 // ─── Pipeline 展开入口 ─────────────────────────────────
 
@@ -10,14 +11,7 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
     for cmd in &pipeline.cmds {
         let mut new_argv = Vec::with_capacity(cmd.argv.len());
         for arg in &cmd.argv {
-            let expanded = expand_vars(arg, last_rc);
-            let expanded = expand_tilde(&expanded);
-            let globs = expand_glob(&expanded);
-            if globs.is_empty() {
-                new_argv.push(expanded);
-            } else {
-                new_argv.extend(globs);
-            }
+            new_argv.extend(expand_word(arg, last_rc));
         }
         new_cmds.push(SimpleCmd {
             argv: new_argv,
@@ -27,12 +21,28 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
             stderr_file: cmd.stderr_file.clone(),
             append: cmd.append,
             append_err: cmd.append_err,
+            dup_fds: cmd.dup_fds.clone(),
         });
     }
     Ok(Pipeline {
         cmds: new_cmds,
         background: pipeline.background,
     })
+}
+
+/// 展开单个词：变量 → tilde → glob；无 glob 匹配时返回去保护的字面词。
+/// 供 expand_pipeline 与复合命令（for 的词表）共用。
+pub fn expand_word(arg: &str, last_rc: i32) -> Vec<String> {
+    let expanded = expand_vars(arg, last_rc);
+    let expanded = expand_tilde(&expanded);
+    let globs = expand_glob(&expanded);
+    if globs.is_empty() {
+        // 无匹配（或引号保护下不含活跃通配符）：移除保护标记，
+        // 引号内的 * ? [ 变为字面字符
+        vec![unescape_glob(&expanded)]
+    } else {
+        globs
+    }
 }
 
 // ─── 变量展开 ──────────────────────────────────────────
@@ -43,6 +53,17 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if c == GLOB_ESCAPE {
+            // 保护标记：`$` 前的标记表示字面美元（单引号/转义），
+            // 其余标记保留给 expand_glob / unescape_glob
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                result.push('$');
+            } else {
+                result.push(c);
+            }
+            continue;
+        }
         if c == '$' {
             match chars.peek() {
                 Some('{') => {
@@ -65,6 +86,51 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                 Some('$') => {
                     chars.next();
                     result.push_str(&std::process::id().to_string());
+                }
+                Some('#') => {
+                    chars.next();
+                    result.push_str(&super::params::count().to_string());
+                }
+                Some('@') | Some('*') => {
+                    chars.next();
+                    result.push_str(&super::params::all().join(" "));
+                }
+                Some('(') => {
+                    // `$((...))` 算术展开（克隆迭代器探测第二个 '('）
+                    let mut probe = chars.clone();
+                    probe.next(); // consume '('
+                    if probe.peek() == Some(&'(') {
+                        chars.next();
+                        chars.next();
+                        let mut expr = String::new();
+                        let mut depth = 1usize;
+                        while let Some(ch) = chars.next() {
+                            match ch {
+                                '(' => {
+                                    depth += 1;
+                                    expr.push(ch);
+                                }
+                                ')' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        if chars.peek() == Some(&')') {
+                                            chars.next();
+                                        }
+                                        break;
+                                    }
+                                    expr.push(ch);
+                                }
+                                _ => expr.push(ch),
+                            }
+                        }
+                        result.push_str(&eval_arith(&expr).unwrap_or(0).to_string());
+                    } else {
+                        result.push('$');
+                    }
+                }
+                Some(&c2) if c2.is_ascii_digit() => {
+                    chars.next();
+                    result.push_str(&lookup_var(&c2.to_string(), last_rc));
                 }
                 Some(&c2) if c2.is_ascii_alphabetic() || c2 == '_' => {
                     let mut name = String::new();
@@ -90,13 +156,165 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
 }
 
 fn lookup_var(name: &str, last_rc: i32) -> String {
-    if name == "?" {
-        return last_rc.to_string();
+    match name {
+        "?" => return last_rc.to_string(),
+        "$" => return std::process::id().to_string(),
+        "#" => return super::params::count().to_string(),
+        "@" | "*" => return super::params::all().join(" "),
+        "0" => return "sh".to_string(),
+        _ => {}
     }
-    if name == "$" {
-        return std::process::id().to_string();
+    if let Ok(n) = name.parse::<usize>() {
+        return super::params::get(n.saturating_sub(1)).unwrap_or_default();
     }
     std::env::var(name).unwrap_or_default()
+}
+
+// ─── 算术展开 $((...)) ─────────────────────────────────
+
+/// 求值算术表达式（整数：+ - * / % 与括号，标识符取环境变量）。
+/// 非法表达式或除零返回 None（调用方按 0 处理并告警）。
+pub(crate) fn eval_arith(expr: &str) -> Option<i64> {
+    let mut p = ArithParser {
+        s: expr.as_bytes(),
+        pos: 0,
+    };
+    let v = p.expr()?;
+    p.ws();
+    if p.pos != p.s.len() {
+        return None;
+    }
+    Some(v)
+}
+
+struct ArithParser<'a> {
+    s: &'a [u8],
+    pos: usize,
+}
+
+impl ArithParser<'_> {
+    fn ws(&mut self) {
+        while self.pos < self.s.len() {
+            let c = self.s[self.pos];
+            if c.is_ascii_whitespace() || c == GLOB_ESCAPE as u8 {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.s.get(self.pos).copied()
+    }
+
+    /// expr := term (('+'|'-') term)*
+    fn expr(&mut self) -> Option<i64> {
+        let mut v = self.term()?;
+        loop {
+            self.ws();
+            match self.peek() {
+                Some(b'+') => {
+                    self.pos += 1;
+                    v = v.checked_add(self.term()?)?;
+                }
+                Some(b'-') => {
+                    self.pos += 1;
+                    v = v.checked_sub(self.term()?)?;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+
+    /// term := factor (('*'|'/'|'%') factor)*
+    fn term(&mut self) -> Option<i64> {
+        let mut v = self.factor()?;
+        loop {
+            self.ws();
+            match self.peek() {
+                Some(b'*') => {
+                    self.pos += 1;
+                    v = v.checked_mul(self.factor()?)?;
+                }
+                Some(b'/') => {
+                    self.pos += 1;
+                    let d = self.factor()?;
+                    if d == 0 {
+                        return None;
+                    }
+                    v = v.checked_div(d)?;
+                }
+                Some(b'%') => {
+                    self.pos += 1;
+                    let d = self.factor()?;
+                    if d == 0 {
+                        return None;
+                    }
+                    v = v.checked_rem(d)?;
+                }
+                _ => break,
+            }
+        }
+        Some(v)
+    }
+
+    /// factor := ('+'|'-')? primary
+    fn factor(&mut self) -> Option<i64> {
+        self.ws();
+        match self.peek() {
+            Some(b'-') => {
+                self.pos += 1;
+                Some(-self.factor()?)
+            }
+            Some(b'+') => {
+                self.pos += 1;
+                self.factor()
+            }
+            _ => self.primary(),
+        }
+    }
+
+    /// primary := NUMBER | IDENT | '(' expr ')' | '$' IDENT
+    fn primary(&mut self) -> Option<i64> {
+        self.ws();
+        if self.peek() == Some(b'(') {
+            self.pos += 1;
+            let v = self.expr()?;
+            self.ws();
+            if self.peek() != Some(b')') {
+                return None;
+            }
+            self.pos += 1;
+            return Some(v);
+        }
+        if self.peek() == Some(b'$') {
+            self.pos += 1;
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if start == self.pos {
+            return None;
+        }
+        let tok = std::str::from_utf8(&self.s[start..self.pos]).ok()?;
+        if let Ok(n) = tok.parse::<i64>() {
+            return Some(n);
+        }
+        // 标识符：环境变量值按整数解析，未设置/非数字按 0
+        Some(
+            std::env::var(tok)
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(0),
+        )
+    }
 }
 
 // ─── 历史扩展 ──────────────────────────────────────────
@@ -202,9 +420,43 @@ pub fn expand_tilde(s: &str) -> String {
 
 // ─── 通配符展开 ────────────────────────────────────────
 
+/// 词中是否含有未受保护的 glob 元字符（`*` `?` `[`）。
+/// `GLOB_ESCAPE` 标记后的字符视为字面（引号/转义保护）。
+fn has_active_glob(s: &str) -> bool {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == GLOB_ESCAPE {
+            chars.next(); // 跳过被保护的字符
+            continue;
+        }
+        if matches!(c, '*' | '?' | '[') {
+            return true;
+        }
+    }
+    false
+}
+
+/// 移除 glob 保护标记，使引号/转义保护的元字符变为字面字符。
+pub fn unescape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == GLOB_ESCAPE {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// 对含 `*` `?` `[]` 的词项执行 glob 匹配。
+/// 引号/反斜杠保护的元字符（带 `GLOB_ESCAPE` 标记）按字面匹配；
+/// 无活跃通配符时返回空 Vec（调用方保留原词并 unescape）。
 pub fn expand_glob(s: &str) -> Vec<String> {
-    if !s.contains('*') && !s.contains('?') && !s.contains('[') {
+    if !has_active_glob(s) {
         return Vec::new();
     }
 
@@ -244,78 +496,6 @@ pub fn expand_glob(s: &str) -> Vec<String> {
         matches.sort();
     }
     matches
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let t: Vec<char> = text.chars().collect();
-    glob_match_inner(&p, &t)
-}
-
-fn glob_match_inner(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return t.is_empty();
-    }
-    match p[0] {
-        '*' => {
-            if p.len() == 1 {
-                return true;
-            }
-            for i in 0..=t.len() {
-                if glob_match_inner(&p[1..], &t[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        '?' => {
-            if t.is_empty() {
-                return false;
-            }
-            glob_match_inner(&p[1..], &t[1..])
-        }
-        '[' => {
-            if t.is_empty() {
-                return false;
-            }
-            let mut idx = 1;
-            let mut negate = false;
-            if idx < p.len() && p[idx] == '!' {
-                negate = true;
-                idx += 1;
-            }
-            let mut matched = false;
-            while idx < p.len() && p[idx] != ']' {
-                if idx + 2 < p.len() && p[idx + 1] == '-' && p[idx + 2] != ']' {
-                    if t[0] >= p[idx] && t[0] <= p[idx + 2] {
-                        matched = true;
-                    }
-                    idx += 3;
-                } else {
-                    if t[0] == p[idx] {
-                        matched = true;
-                    }
-                    idx += 1;
-                }
-            }
-            let rest = if idx < p.len() {
-                &p[idx + 1..]
-            } else {
-                &p[idx..]
-            };
-            if matched != negate {
-                glob_match_inner(rest, &t[1..])
-            } else {
-                false
-            }
-        }
-        _ => {
-            if t.is_empty() || p[0] != t[0] {
-                return false;
-            }
-            glob_match_inner(&p[1..], &t[1..])
-        }
-    }
 }
 
 #[cfg(test)]
@@ -365,7 +545,46 @@ mod tests {
 
     #[test]
     fn expand_literal_dollar() {
-        assert_eq!(expand_vars("cost is $5", 0), "cost is $5");
+        // 孤立 $ 与非法字符保留字面
+        assert_eq!(expand_vars("cost is $", 0), "cost is $");
+        assert_eq!(expand_vars("cost is $%", 0), "cost is $%");
+    }
+
+    #[test]
+    fn expand_positional_params() {
+        super::super::params::set(vec!["a".into(), "b c".into()]);
+        assert_eq!(expand_vars("$1/$2", 0), "a/b c");
+        assert_eq!(expand_vars("$#", 0), "2");
+        assert_eq!(expand_vars("$@", 0), "a b c");
+        assert_eq!(expand_vars("${1}-${2}", 0), "a-b c");
+        assert_eq!(expand_vars("$9", 0), "");
+        super::super::params::set(Vec::new());
+    }
+
+    #[test]
+    fn protected_dollar_is_literal() {
+        // 单引号/转义产生的保护标记：$ 不展开
+        let escaped = format!("{}$VAR", GLOB_ESCAPE);
+        assert_eq!(expand_vars(&escaped, 0), "$VAR");
+        // 其他保护标记保留（给 glob 用）
+        let star = format!("{}*", GLOB_ESCAPE);
+        assert_eq!(expand_vars(&star, 0), star);
+    }
+
+    #[test]
+    fn arithmetic_eval() {
+        assert_eq!(eval_arith("1+2*3"), Some(7));
+        assert_eq!(eval_arith("(1+2)*3"), Some(9));
+        assert_eq!(eval_arith("10/3"), Some(3));
+        assert_eq!(eval_arith("10%3"), Some(1));
+        assert_eq!(eval_arith("-2+5"), Some(3));
+        assert_eq!(eval_arith("1/0"), None);
+        assert_eq!(eval_arith("1+"), None);
+        assert_eq!(expand_vars("$((1+2*3))", 0), "7");
+        assert_eq!(expand_vars("n=$((2+3))", 0), "n=5");
+        // 双引号内 * 带 glob 保护标记，算术求值需忽略标记
+        let quoted = format!("$((2{}*3))", GLOB_ESCAPE);
+        assert_eq!(expand_vars(&quoted, 0), "6");
     }
 
     // ─── 历史扩展 ──────────────────────────────
@@ -500,6 +719,82 @@ mod tests {
         assert!(glob_match("*.rs", "main.rs"));
         assert!(glob_match("file[0-9]?", "file5a"));
         assert!(!glob_match("file[0-9]?", "fileab"));
+    }
+
+    // ─── glob 保护（引号/转义）──────────────
+
+    #[test]
+    fn glob_escape_marker_protects_metachars() {
+        assert!(!has_active_glob(&format!("{}*", GLOB_ESCAPE)));
+        assert!(!has_active_glob(&format!("{}?", GLOB_ESCAPE)));
+        assert!(!has_active_glob(&format!("{}[ab]", GLOB_ESCAPE)));
+        assert!(has_active_glob("*"));
+        assert!(has_active_glob("?"));
+        assert!(has_active_glob("[ab]"));
+        // 混合：受保护的 * 不影响未保护的 *
+        assert!(has_active_glob(&format!("{}*x*", GLOB_ESCAPE)));
+        assert!(!has_active_glob("plain.txt"));
+    }
+
+    #[test]
+    fn unescape_glob_removes_marker() {
+        assert_eq!(unescape_glob(&format!("{}*", GLOB_ESCAPE)), "*");
+        assert_eq!(unescape_glob(&format!("a{}[b", GLOB_ESCAPE)), "a[b");
+        assert_eq!(unescape_glob("plain"), "plain");
+        // 多个标记
+        assert_eq!(
+            unescape_glob(&format!("{}*{}?", GLOB_ESCAPE, GLOB_ESCAPE)),
+            "*?"
+        );
+    }
+
+    #[test]
+    fn glob_match_respects_escape_marker() {
+        assert!(glob_match(&format!("{}*", GLOB_ESCAPE), "*"));
+        assert!(!glob_match(&format!("{}*", GLOB_ESCAPE), "abc"));
+        assert!(glob_match(&format!("a{}*b*", GLOB_ESCAPE), "a*bcd"));
+    }
+
+    #[test]
+    fn expand_pipeline_keeps_quoted_glob_literal() {
+        // 回归：echo "*" / echo '*' 不应展开为目录项
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec!["echo".into(), format!("{}*", GLOB_ESCAPE)],
+                ..Default::default()
+            }],
+            background: false,
+        };
+        let result = expand_pipeline(&p, 0).unwrap();
+        assert_eq!(
+            result.cmds[0].argv,
+            vec!["echo".to_string(), "*".to_string()]
+        );
+    }
+
+    #[test]
+    fn expand_pipeline_keeps_mixed_word_glob() {
+        // a*"b" -> 未保护的 * 仍展开（在无匹配目录下保留字面）
+        let p = Pipeline {
+            cmds: vec![SimpleCmd {
+                argv: vec![
+                    "echo".into(),
+                    format!(
+                        "rbox_no_such_prefix_{}*x{}y",
+                        std::process::id(),
+                        GLOB_ESCAPE
+                    ),
+                ],
+                ..Default::default()
+            }],
+            background: false,
+        };
+        let result = expand_pipeline(&p, 0).unwrap();
+        // 无匹配 -> 去掉保护标记后保留原词
+        assert_eq!(
+            result.cmds[0].argv[1],
+            format!("rbox_no_such_prefix_{}*xy", std::process::id())
+        );
     }
 
     // ─── expand_pipeline ──────────────────────

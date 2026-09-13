@@ -8,3 +8,9 @@ license = "MIT"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 libc = "0.2"
+
+[profile.release]
+# 体积/启动优化：thin LTO + 单 codegen 单元 + 自动 strip
+lto = "thin"
+codegen-units = 1
+strip = true

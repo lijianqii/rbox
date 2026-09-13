@@ -65,6 +65,9 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
                 cur.stderr_file = Some(f);
                 cur.append_err = true;
             }
+            Token::RedirDup(from, to) => {
+                cur.dup_fds.push((*from, *to));
+            }
             Token::Pipe => {
                 if cur.is_empty() {
                     return Err("syntax error: empty command before |".to_string());

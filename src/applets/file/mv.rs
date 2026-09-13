@@ -57,6 +57,25 @@ impl Applet for Mv {
     }
 }
 
+fn move_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
+    let dest_path = if dest_is_dir {
+        resolve_dest(src, dest)?
+    } else {
+        std::path::Path::new(dest).to_path_buf()
+    };
+
+    // 先尝试 rename（同文件系统下 O(1)）
+    match fs::rename(src, &dest_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // 跨文件系统：先 cp 再 rm
+            copy_recursive(src, &dest_path)?;
+            remove_recursive(src)?;
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,24 +137,5 @@ mod tests {
         let args = vec!["/nonexistent_src".to_string(), format!("{}/dst", dir)];
         let _ = MV.run(&args);
         let _ = fs::remove_dir_all(&dir);
-    }
-}
-
-fn move_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
-    let dest_path = if dest_is_dir {
-        resolve_dest(src, dest)?
-    } else {
-        std::path::Path::new(dest).to_path_buf()
-    };
-
-    // 先尝试 rename（同文件系统下 O(1)）
-    match fs::rename(src, &dest_path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // 跨文件系统：先 cp 再 rm
-            copy_recursive(src, &dest_path)?;
-            remove_recursive(src)?;
-            Ok(())
-        }
     }
 }

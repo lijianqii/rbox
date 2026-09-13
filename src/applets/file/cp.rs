@@ -2,10 +2,11 @@
 //!
 //! 用法：cp SOURCE DEST
 //!       cp SOURCE... DIRECTORY
-//! 不递归复制目录（保持简单）。
+//!       cp -r SOURCE... DIRECTORY
+//! `-r`/`-R` 递归复制目录（符号链接按内容复制？否：按链接本身复制）。
 
 use crate::applet::Applet;
-use crate::applets::file::util::{is_dir, resolve_dest};
+use crate::applets::file::util::{copy_recursive, is_dir, resolve_dest};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
@@ -18,10 +19,28 @@ impl Applet for Cp {
         "cp"
     }
     fn help(&self) -> &'static str {
-        "cp SOURCE DEST | cp SOURCE... DIR - copy files"
+        "cp [-r] SOURCE DEST | cp SOURCE... DIR - copy files (recursive with -r)"
     }
     fn run(&self, args: &[String]) -> ExitCode {
-        let files: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let mut recursive = false;
+        let mut end_of_options = false;
+        let mut files: Vec<&str> = Vec::new();
+        for a in args {
+            if !end_of_options {
+                match a.as_str() {
+                    "--" => {
+                        end_of_options = true;
+                        continue;
+                    }
+                    "-r" | "-R" | "--recursive" => {
+                        recursive = true;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            files.push(a.as_str());
+        }
         if files.len() < 2 {
             eprintln!("cp: missing operand");
             return ExitCode::FAILURE;
@@ -34,7 +53,7 @@ impl Applet for Cp {
 
         if files.len() == 2 {
             // 单源
-            if let Err(e) = copy_one(files[0], dest, dest_is_dir) {
+            if let Err(e) = copy_one(files[0], dest, dest_is_dir, recursive) {
                 eprintln!("cp: {}: {}", files[0], e);
                 had_error = true;
             }
@@ -45,7 +64,7 @@ impl Applet for Cp {
                 return ExitCode::FAILURE;
             }
             for src in &files[..files.len() - 1] {
-                if let Err(e) = copy_one(src, dest, true) {
+                if let Err(e) = copy_one(src, dest, true, recursive) {
                     eprintln!("cp: {}: {}", src, e);
                     had_error = true;
                 }
@@ -58,6 +77,44 @@ impl Applet for Cp {
             ExitCode::SUCCESS
         }
     }
+}
+
+fn copy_one(src: &str, dest: &str, dest_is_dir: bool, recursive: bool) -> io::Result<()> {
+    let src_meta = fs::symlink_metadata(src)?;
+    let dest_path = if dest_is_dir {
+        resolve_dest(src, dest)?
+    } else {
+        std::path::Path::new(dest).to_path_buf()
+    };
+    if src_meta.is_dir() {
+        if !recursive {
+            return Err(io::Error::other("omitting directory (use -r)"));
+        }
+        return copy_recursive(src, &dest_path);
+    }
+    // 符号链接：复制链接本身（与 cp -r 一致，不跟随）
+    if src_meta.file_type().is_symlink() {
+        let target = fs::read_link(src)?;
+        let _ = fs::remove_file(&dest_path);
+        return std::os::unix::fs::symlink(target, &dest_path);
+    }
+
+    let mut f_in = fs::File::open(src)?;
+    let mut f_out = fs::File::create(&dest_path)?;
+
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f_in.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        f_out.write_all(&buf[..n])?;
+    }
+
+    // 尝试保留权限
+    let _ = fs::set_permissions(&dest_path, fs::metadata(src)?.permissions());
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -120,34 +177,38 @@ mod tests {
         let _ = CP.run(&args);
         let _ = fs::remove_dir_all(&dir);
     }
-}
 
-fn copy_one(src: &str, dest: &str, dest_is_dir: bool) -> io::Result<()> {
-    let src_meta = fs::metadata(src)?;
-    if src_meta.is_dir() {
-        return Err(io::Error::other("omitting directory (not supported)"));
+    #[test]
+    fn cp_dir_requires_recursive() {
+        let dir = tmpdir();
+        let srcdir = format!("{}/srcdir", dir);
+        fs::create_dir_all(&srcdir).unwrap();
+        fs::write(format!("{}/a.txt", srcdir), "a").unwrap();
+        // 无 -r：失败
+        let _ = CP.run(&[srcdir.clone(), format!("{}/dst", dir)]);
+        assert!(!std::path::Path::new(&format!("{}/dst", dir)).exists());
+        // -r：成功
+        let _ = CP.run(&["-r".to_string(), srcdir.clone(), format!("{}/dst", dir)]);
+        assert_eq!(
+            fs::read_to_string(format!("{}/dst/a.txt", dir)).unwrap(),
+            "a"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
-    let dest_path = if dest_is_dir {
-        resolve_dest(src, dest)?
-    } else {
-        std::path::Path::new(dest).to_path_buf()
-    };
-
-    let mut f_in = fs::File::open(src)?;
-    let mut f_out = fs::File::create(&dest_path)?;
-
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f_in.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        f_out.write_all(&buf[..n])?;
+    #[test]
+    fn cp_recursive_into_existing_dir() {
+        let dir = tmpdir();
+        let srcdir = format!("{}/src", dir);
+        let dstdir = format!("{}/dstdir", dir);
+        fs::create_dir_all(&srcdir).unwrap();
+        fs::create_dir_all(&dstdir).unwrap();
+        fs::write(format!("{}/f.txt", srcdir), "x").unwrap();
+        let _ = CP.run(&["-r".to_string(), srcdir.clone(), dstdir.clone()]);
+        assert_eq!(
+            fs::read_to_string(format!("{}/src/f.txt", dstdir)).unwrap(),
+            "x"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
-
-    // 尝试保留权限
-    let _ = fs::set_permissions(&dest_path, fs::metadata(src)?.permissions());
-
-    Ok(())
 }

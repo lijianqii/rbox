@@ -1,5 +1,8 @@
 //! Shell 数据结构：Token、SimpleCmd、Pipeline、CommandList。
 
+/// glob 保护标记（定义见共享工具 [`crate::applets::glob`]）。
+pub(crate) use crate::applets::glob::GLOB_ESCAPE;
+
 /// 分词器产生的 Token。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -17,6 +20,8 @@ pub enum Token {
     RedirErr,
     /// `2>>` stderr 重定向（追加）。
     RedirErrAppend,
+    /// `N>&M` 文件描述符复制（from -> to）。
+    RedirDup(u8, u8),
     /// `|` 管道。
     Pipe,
     /// `;` 命令分隔。
@@ -40,6 +45,8 @@ pub struct SimpleCmd {
     pub stderr_file: Option<String>,
     pub append: bool,
     pub append_err: bool,
+    /// `N>&M` 描述符复制（按出现顺序应用，pre_exec 中 dup2）。
+    pub dup_fds: Vec<(u8, u8)>,
 }
 
 impl SimpleCmd {
@@ -96,6 +103,7 @@ mod tests {
         assert!(cmd.heredoc.is_none());
         assert!(!cmd.append);
         assert!(!cmd.append_err);
+        assert!(cmd.dup_fds.is_empty());
     }
 
     #[test]
@@ -144,5 +152,12 @@ mod tests {
         assert_ne!(Token::Pipe, Token::Semicolon);
         assert_eq!(Token::Word("a".into()), Token::Word("a".into()));
         assert_ne!(Token::Word("a".into()), Token::Word("b".into()));
+    }
+
+    #[test]
+    fn glob_escape_constant_is_control_char() {
+        // 必须是不会出现在正常文本中的控制字符，避免与真实内容冲突
+        assert!(GLOB_ESCAPE.is_control());
+        assert_ne!(GLOB_ESCAPE, '\0');
     }
 }

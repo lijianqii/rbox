@@ -5,5 +5,7 @@ pub mod file;
 pub mod sys;
 pub mod text;
 
-/// 跨模块共享工具（进程信息收集 / 单位格式化）。
+/// 跨模块共享工具（进程信息收集 / 单位格式化 / glob 匹配 / fstab 解析）。
+pub(crate) mod fstab;
+pub(crate) mod glob;
 pub(crate) mod proc;

@@ -83,7 +83,7 @@ fn list_path(path: &str, show_all: bool, long: bool, one: bool) -> std::io::Resu
             let name = entry.file_name().to_string_lossy().into_owned();
             entries.push(name);
         }
-        entries = filter_entries(entries, show_all);
+        entries = visible_entries(entries, show_all);
 
         if long {
             let items = collect_metadata(path, &entries)?;
@@ -276,6 +276,17 @@ fn filter_entries(mut entries: Vec<String>, show_all: bool) -> Vec<String> {
     entries
 }
 
+/// 计算要列出的条目：-a 时显式加入 `.` 与 `..`（与 POSIX ls 一致，
+/// Rust 的 read_dir 不返回它们），并按名字排序。
+fn visible_entries(entries: Vec<String>, show_all: bool) -> Vec<String> {
+    let mut entries = filter_entries(entries, show_all);
+    if show_all {
+        entries.insert(0, ".".to_string());
+        entries.insert(1, "..".to_string());
+    }
+    entries
+}
+
 /// 将 mtime 格式化为 `Mon DD HH:MM`（ctime 风格）。
 fn format_time(mtime: i64) -> String {
     // 简单格式化：使用 ctime 风格的简短形式 "Mon DD HH:MM"
@@ -340,6 +351,16 @@ mod tests {
     fn filter_empty() {
         let entries: Vec<String> = vec![];
         assert_eq!(filter_entries(entries, false), Vec::<String>::new());
+    }
+
+    #[test]
+    fn visible_entries_includes_dot_dirs_when_all() {
+        let names = vec!["b".to_string(), ".hidden".to_string(), "a".to_string()];
+        assert_eq!(
+            visible_entries(names.clone(), true),
+            vec![".", "..", ".hidden", "a", "b"]
+        );
+        assert_eq!(visible_entries(names, false), vec!["a", "b"]);
     }
 
     #[test]

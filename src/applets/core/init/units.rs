@@ -46,6 +46,10 @@ pub(crate) struct UnitSection {
     #[serde(default)]
     #[serde(rename = "Requisite")]
     pub(crate) requisite: Vec<String>,
+    /// 反向排序依赖：本单元必须先于这些单元启动（同 Before=）
+    #[serde(default)]
+    #[serde(rename = "Before")]
+    pub(crate) before: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -92,6 +96,22 @@ pub(crate) struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "Environment")]
     pub(crate) environment: Vec<String>,
+    /// 环境变量文件（每行 KEY=VALUE）；路径以 `-` 开头表示文件缺失不报错
+    #[serde(default)]
+    #[serde(rename = "EnvironmentFile")]
+    pub(crate) environment_file: Option<String>,
+    /// 服务工作目录（缺省继承 init 的 cwd）
+    #[serde(default)]
+    #[serde(rename = "WorkingDirectory")]
+    pub(crate) working_directory: Option<String>,
+    /// 停止超时秒数（SIGTERM 后等待时间，超时 SIGKILL；默认 5）
+    #[serde(default = "default_timeout_stop")]
+    #[serde(rename = "TimeoutStopSec")]
+    pub(crate) timeout_stop_sec: u64,
+    /// 停止模式：control-group（默认，杀整个进程组）/ process / mixed / none
+    #[serde(default = "default_kill_mode")]
+    #[serde(rename = "KillMode")]
+    pub(crate) kill_mode: String,
     /// stdout/stderr 重定向文件（可选）
     #[serde(default)]
     #[serde(rename = "LogFile")]
@@ -116,6 +136,12 @@ fn default_start_limit_interval() -> u64 {
 }
 fn default_timeout_start() -> u64 {
     10
+}
+fn default_timeout_stop() -> u64 {
+    5
+}
+fn default_kill_mode() -> String {
+    "control-group".to_string()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -198,6 +224,28 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     Ok(units)
 }
 
+/// 计算单元的排序依赖：Requires/After/Wants + 反向 Before +
+/// target 的 WantedBy 反边（声明 Before=name 的单元必须先启动）。
+pub(crate) fn sort_deps(name: &str, unit: &Unit, units: &HashMap<String, Unit>) -> Vec<String> {
+    let mut deps = unit.unit.requires.clone();
+    deps.extend(unit.unit.after.iter().cloned());
+    deps.extend(unit.unit.wants.iter().cloned());
+    // Before= 反边：其他单元声明 Before=本单元 -> 先启动它们
+    for (other_name, other) in units.iter() {
+        if other.unit.before.iter().any(|b| b == name) {
+            deps.push(other_name.clone());
+        }
+    }
+    if unit.is_target {
+        for (other_name, other) in units.iter() {
+            if other.install.wanted_by.iter().any(|w| w == name) {
+                deps.push(other_name.clone());
+            }
+        }
+    }
+    deps
+}
+
 /// 从 default.target 出发，计算服务的启动顺序（拓扑排序）。
 /// Requires= 和 After= 都构成"必须先启动"的边。
 pub(crate) fn compute_start_order(
@@ -234,21 +282,12 @@ pub(crate) fn compute_start_order(
             }
         };
 
-        let mut deps = unit.unit.requires.clone();
-        deps.extend(unit.unit.after.iter().cloned());
-        deps.extend(unit.unit.wants.iter().cloned());
         // Wants：尽力依赖，参与排序（先启动）但失败不传播；
-        // Requisite：不参与排序（不激活依赖），仅在启动前检查状态
+        // Requisite：不参与排序（不激活依赖），仅在启动前检查状态；
+        // Before：反向边（其他单元声明 Before=name 时先启动它们）；
         // target 节点：把所有 WantedBy=该 target 的服务拉进来（反向依赖）
-        if unit.is_target {
-            for (other_name, other) in units.iter() {
-                if other.install.wanted_by.iter().any(|w| w == name) {
-                    deps.push(other_name.clone());
-                }
-            }
-        }
-        for dep in &deps {
-            visit(dep, units, order, visited)?;
+        for dep in sort_deps(name, unit, units) {
+            visit(&dep, units, order, visited)?;
         }
 
         order.push(name.to_string());
@@ -323,6 +362,7 @@ mod tests {
                 requires: requires.iter().map(|s| s.to_string()).collect(),
                 wants: Vec::new(),
                 requisite: Vec::new(),
+                before: Vec::new(),
             },
             service: ServiceSection {
                 typ: "simple".to_string(),
@@ -336,6 +376,10 @@ mod tests {
                 timeout_start_sec: 10,
                 pidfile: None,
                 environment: Vec::new(),
+                environment_file: None,
+                working_directory: None,
+                timeout_stop_sec: 5,
+                kill_mode: "control-group".to_string(),
                 logfile: None,
                 user: None,
                 group: None,

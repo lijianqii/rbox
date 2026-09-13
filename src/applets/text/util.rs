@@ -117,6 +117,50 @@ pub(crate) fn each_input(
     ok
 }
 
+/// 从 stdin 读全部行；返回是否成功。
+fn read_stdin_lines(out: &mut Vec<String>) -> bool {
+    let mut buf = Vec::new();
+    if std::io::stdin().lock().read_to_end(&mut buf).is_ok() {
+        for line in String::from_utf8_lossy(&buf).lines() {
+            out.push(line.to_string());
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// 读取所有输入为行列表（无文件或 `-` 读 stdin）；返回 (行列表, 是否全部成功)。
+/// 供 sort/uniq/cut 等需要全量处理后再输出的命令使用。
+pub(crate) fn read_input_lines(files: &[String], app: &str) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut ok = true;
+    if files.is_empty() {
+        ok = read_stdin_lines(&mut out);
+    } else {
+        for file in files {
+            if file == "-" {
+                if !read_stdin_lines(&mut out) {
+                    ok = false;
+                }
+                continue;
+            }
+            match read_file_fully(file) {
+                Ok(bytes) => {
+                    for line in String::from_utf8_lossy(&bytes).lines() {
+                        out.push(line.to_string());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{}: {}: {}", app, file, e);
+                    ok = false;
+                }
+            }
+        }
+    }
+    (out, ok)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

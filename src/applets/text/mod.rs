@@ -1,10 +1,15 @@
 //! 文本与字符串处理 applet。
 pub mod basename;
+pub mod cut;
 pub mod dirname;
 pub mod echo;
 pub mod grep;
 pub mod head;
 pub mod printf;
+pub mod sort;
 pub mod tail;
+pub mod tee;
+pub mod tr;
+pub mod uniq;
 pub(crate) mod util;
 pub mod wc;

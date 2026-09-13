@@ -9,11 +9,15 @@
 //!   回收僵尸/孤儿进程；shell 退出后重新 fork。
 //! - 通过 unix socket 响应控制请求（server 模块：status/start/stop/restart/reload）。
 
+pub(crate) mod boot;
 pub(crate) mod mount;
 pub(crate) mod server;
 pub(crate) mod services;
+pub(crate) mod shutdown;
+pub(crate) mod signals;
 pub(crate) mod syscall;
 pub(crate) mod units;
+pub(crate) mod watchdog;
 
 use crate::applet::Applet;
 use crate::applets::core::init::mount::{
@@ -21,46 +25,17 @@ use crate::applets::core::init::mount::{
 };
 use crate::applets::core::init::server::{create_status_listener, handle_control_connection};
 use crate::applets::core::init::services::{
-    ServiceInstance, finish_daemonize, parse_environment, respawn_service, schedule_restart,
-    spawn_fresh_shell, start_forking_service, start_service, stop_service_instance,
+    ServiceInstance, finish_daemonize, respawn_service, schedule_restart, start_forking_service,
+    start_service, stop_service_instance, unit_environment,
 };
-use crate::applets::core::init::syscall::{kill_all, reboot_syscall, sync_fs};
-use crate::applets::core::init::units::{Unit, compute_start_order, load_all_units};
+use crate::applets::core::init::units::{Unit, compute_start_order, load_all_units, sort_deps};
 use crate::applets::core::{LogLevel, log, log_at};
 use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// 全局关机标志：SIGTERM 信号处理器设置，主循环检查。
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// 全局重启标志：SIGINT 信号处理器设置，主循环检查。
-static REBOOT_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// self-pipe 写端 fd：信号处理器写 1 字节唤醒主循环 poll；-1 表示未创建。
-static SIGNAL_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
-
-/// 信号处理器：SIGTERM 设置关机标志，SIGINT 设置重启标志，SIGCHLD 仅唤醒；
-/// 统一写 self-pipe 通知主循环（async-signal-safe：仅原子操作 + write）。
-extern "C" fn signal_handler(sig: i32) {
-    match sig {
-        libc::SIGINT => REBOOT_REQUESTED.store(true, Ordering::SeqCst),
-        libc::SIGTERM => SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst),
-        _ => {} // SIGCHLD：仅唤醒主循环收割子进程
-    }
-    let fd = SIGNAL_PIPE_WRITE.load(Ordering::SeqCst);
-    if fd >= 0 {
-        let byte: u8 = 1;
-        unsafe { libc::write(fd, &byte as *const u8 as *const libc::c_void, 1) };
-    }
-}
-
-/// 是否已请求关机或重启。
-pub(crate) fn shutdown_requested() -> bool {
-    SHUTDOWN_REQUESTED.load(Ordering::SeqCst) || REBOOT_REQUESTED.load(Ordering::SeqCst)
-}
 
 pub struct Init;
 pub static INIT: &Init = &Init;
@@ -78,7 +53,7 @@ impl Applet for Init {
 
         if is_pid1 {
             log("rbox init: starting as PID 1");
-            install_signal_handlers();
+            signals::install_signal_handlers();
         } else {
             log("rbox init: running in test mode (not PID 1)");
         }
@@ -99,10 +74,10 @@ impl Applet for Init {
 
         // 1.5 内核 cmdline 的 single/emergency：跳过单元加载，直接进应急/单用户 shell
         if is_pid1 {
-            match boot_mode_from_cmdline() {
-                BootMode::Emergency => return run_emergency_shell("emergency"),
-                BootMode::Single => return run_emergency_shell("single"),
-                BootMode::Normal => {}
+            match boot::boot_mode_from_cmdline() {
+                boot::BootMode::Emergency => return boot::run_emergency_shell("emergency"),
+                boot::BootMode::Single => return boot::run_emergency_shell("single"),
+                boot::BootMode::Normal => {}
             }
         }
 
@@ -117,7 +92,7 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: failed to load units: {}", e),
                 );
-                return run_emergency_shell("no units");
+                return boot::run_emergency_shell("no units");
             }
         };
 
@@ -133,7 +108,7 @@ impl Applet for Init {
                     LogLevel::Error,
                     &format!("rbox init: dependency error: {}", e),
                 );
-                return run_emergency_shell("no units");
+                return boot::run_emergency_shell("no units");
             }
         };
 
@@ -153,6 +128,18 @@ impl Applet for Init {
                     continue;
                 };
                 if unit.is_target {
+                    // target 也检查 Requires：依赖失败时标记未达成，触发 rescue
+                    if let Some(failed_dep) = failed_required_dep(unit, &started_ok) {
+                        log_at(
+                            LogLevel::Error,
+                            &format!(
+                                "rbox init: target {} not reached because required unit {} failed",
+                                unit_name, failed_dep
+                            ),
+                        );
+                        started_ok.insert((*unit_name).clone(), false);
+                        continue;
+                    }
                     log(&format!("rbox init: reached target {}", unit_name));
                     started_ok.insert((*unit_name).clone(), true);
                     continue;
@@ -212,9 +199,30 @@ impl Applet for Init {
                     }
                 }
             }
+            // 启动后短暂等待，检测后续层 Requires 依赖的“秒退”服务
+            // （spawn 成功但启动窗口内非零退出），供依赖传播与 rescue 降级使用
+            let needed: std::collections::HashSet<String> = order
+                .iter()
+                .filter(|n| depths[*n] > depth)
+                .filter_map(|n| units.get(n))
+                .flat_map(|u| u.unit.requires.iter().cloned())
+                .collect();
+            detect_immediate_failures(&mut services, &mut started_ok, &needed);
         }
 
         log("rbox init: startup complete");
+
+        // 启动失败降级：default.target 未达成 -> 停止已启动服务并进入 rescue shell
+        if started_ok.get(default_target) != Some(&true) {
+            log_at(
+                LogLevel::Error,
+                "rbox init: boot target not reached, entering rescue mode",
+            );
+            for svc in services.iter_mut().rev() {
+                stop_service_instance(svc);
+            }
+            return boot::run_emergency_shell("rescue");
+        }
 
         // 5. 主循环：回收子进程、响应控制请求，等待关机标志。
         //    服务状态用 Mutex 共享给控制连接线程（见 reap_with_shutdown）。
@@ -243,21 +251,32 @@ fn early_root_handoff() -> bool {
         cmdline = std::fs::read_to_string("/proc/cmdline");
     }
     let cmdline = cmdline.unwrap_or_default();
-    let root_dev = cmdline
+    let root_spec = cmdline
         .split_whitespace()
         .find_map(|kv| kv.strip_prefix("root="))
         .map(|v| v.split(',').next().unwrap_or(v).to_string())
         .unwrap_or_default();
-    if root_dev.is_empty() {
+    if root_spec.is_empty() {
         return false;
     }
+    // 解析 UUID=/PARTUUID=/LABEL=（依赖 /dev/disk/by-* 符号链接，需 udev/mdev 填充）
+    let Some(root_dev) = resolve_root_spec(&root_spec, "/dev/disk") else {
+        log_at(
+            LogLevel::Error,
+            &format!(
+                "rbox init: cannot resolve root={} (missing /dev/disk/by-* links)",
+                root_spec
+            ),
+        );
+        return false;
+    };
 
     // 2. 若当前根已经是 ext4（持久 rootfs）则跳过。
     //    不能用 /proc/mounts 判断：chroot 后挂载表仍显示 rootfs，
     //    但进程根实际已是 ext4，会导致二次切换。
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c"/".as_ptr(), &mut st) } == 0
-        && st.f_type == libc::EXT4_SUPER_MAGIC as libc::c_long
+        && st.f_type as u64 == libc::EXT4_SUPER_MAGIC as u64
     {
         return false; // 已是持久 rootfs
     }
@@ -322,6 +341,26 @@ fn early_root_handoff() -> bool {
     false
 }
 
+/// 解析 root= 规格：`UUID=`/`PARTUUID=`/`LABEL=` 查 `<disk_base>/by-*` 符号链接；
+/// 其他规格（/dev/vda 等）原样返回；无法解析返回 None。
+pub(crate) fn resolve_root_spec(spec: &str, disk_base: &str) -> Option<String> {
+    let (subdir, key) = if let Some(k) = spec.strip_prefix("UUID=") {
+        ("by-uuid", k)
+    } else if let Some(k) = spec.strip_prefix("PARTUUID=") {
+        ("by-partuuid", k)
+    } else if let Some(k) = spec.strip_prefix("LABEL=") {
+        ("by-label", k)
+    } else {
+        return Some(spec.to_string());
+    };
+    let path = format!("{}/{}/{}", disk_base, subdir, key);
+    if std::path::Path::new(&path).exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// 简单 mount 封装（不解析选项）。
 fn libc_mount(src: &str, tgt: &str, fstype: &str) -> std::io::Result<()> {
     use std::ffi::CString;
@@ -373,14 +412,11 @@ fn compute_depths(order: &[String], units: &HashMap<String, Unit>) -> HashMap<St
             let Some(unit) = units.get(name) else {
                 continue;
             };
-            let deps = unit
-                .unit
-                .requires
-                .iter()
-                .chain(unit.unit.after.iter())
-                .chain(unit.unit.wants.iter())
-                .chain(unit.unit.requisite.iter());
+            let mut deps = sort_deps(name, unit, units);
+            // Requisite 不参与拓扑激活，但计入深度：保证前置检查时依赖已在本层之前尝试启动
+            deps.extend(unit.unit.requisite.iter().cloned());
             let depth = deps
+                .iter()
                 .filter_map(|d| depths.get(d))
                 .max()
                 .map(|m| m + 1)
@@ -435,7 +471,7 @@ fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
             unit.name, unit.unit.description, cmd
         ));
     }
-    let env = parse_environment(&unit.service.environment);
+    let env = unit_environment(unit);
     if unit.service.typ == "forking" {
         match start_forking_service(unit, cmd, &env) {
             Some(inst) => (true, Some(inst)),
@@ -446,6 +482,60 @@ fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
             Some(inst) => (true, Some(inst)),
             None => (false, None),
         }
+    }
+}
+
+/// 检测启动阶段“秒退”的服务：spawn 成功但启动窗口内非零退出（Type=simple）。
+/// 仅等待 `needed`（后续层 Requires 依赖的单元）中无 Restart 策略的服务；
+/// 将失败单元写入 started_ok，供 Requires 依赖传播与 rescue 降级使用。
+fn detect_immediate_failures(
+    services: &mut [ServiceInstance],
+    started_ok: &mut HashMap<String, bool>,
+    needed: &std::collections::HashSet<String>,
+) {
+    if needed.is_empty() {
+        return;
+    }
+    // 最长等待 1s（10ms 轮询）；全部待检服务退出后提前结束。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let mut pending = false;
+        for svc in services.iter_mut() {
+            if !needed.contains(&svc.name)
+                || svc.waiting_daemonize
+                || svc.stopped
+                || svc.restart_always
+                || svc.restart_on_failure
+            {
+                continue;
+            }
+            let Some(child) = svc.child.as_mut() else {
+                continue;
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let failed = !status.success();
+                    log_at(
+                        LogLevel::Warn,
+                        &format!(
+                            "rbox init: service {} exited during startup (code {:?})",
+                            svc.name,
+                            status.code()
+                        ),
+                    );
+                    svc.child = None;
+                    if failed {
+                        started_ok.insert(svc.name.clone(), false);
+                    }
+                }
+                Ok(None) => pending = true,
+                Err(_) => {}
+            }
+        }
+        if !pending || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -461,204 +551,6 @@ fn failed_requisite_dep<'a>(
         .requisite
         .iter()
         .find(|dep| !matches!(started_ok.get(*dep), Some(true)))
-}
-
-/// 单元加载/依赖解析失败时的降级路径：循环拉起一个 emergency shell。
-/// 轮询等待 shell 退出并同时响应关机标志（SIGTERM 到来时不再等 shell 退出）。
-/// 启动模式：内核 cmdline 的 `single`/`emergency` 单词决定。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BootMode {
-    /// 正常启动（默认）
-    Normal,
-    /// 单用户模式：跳过服务，进 root shell
-    Single,
-    /// 应急模式：跳过服务，进 emergency shell
-    Emergency,
-}
-
-/// 从 /proc/cmdline 解析启动模式：包含单词 `emergency` 或 `single` 时生效
-/// （精确单词匹配，避免误匹配 root=/dev/single 之类参数）。
-fn boot_mode_from_cmdline() -> BootMode {
-    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
-    let words: Vec<&str> = cmdline.split_whitespace().collect();
-    boot_mode_from_words(&words)
-}
-
-/// 从 cmdline 单词列表解析启动模式（纯函数，便于单测）。
-fn boot_mode_from_words(words: &[&str]) -> BootMode {
-    if words.contains(&"emergency") {
-        BootMode::Emergency
-    } else if words.contains(&"single") {
-        BootMode::Single
-    } else {
-        BootMode::Normal
-    }
-}
-
-/// 打开硬件看门狗（打开即启动计数）。失败静默禁用（无设备环境不阻塞启动）。
-fn open_watchdog(path: &str) -> Option<i32> {
-    use std::ffi::CString;
-    let p = CString::new(path).ok()?;
-    let fd = unsafe { libc::open(p.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        log_at(
-            LogLevel::Warn,
-            &format!(
-                "rbox init: watchdog unavailable ({}): watchdog disabled",
-                path
-            ),
-        );
-        None
-    } else {
-        log(&format!("rbox init: watchdog enabled on {}", path));
-        Some(fd)
-    }
-}
-
-/// 喂狗：写入任意字节。成功返回 true；失败返回 false（调用方禁用喂狗）。
-fn feed_watchdog(fd: i32) -> bool {
-    unsafe { libc::write(fd, b"V".as_ptr() as *const libc::c_void, 1) == 1 }
-}
-
-/// poll 超时与喂狗截止取 min：空闲时也能定时醒来喂狗。
-/// `watchdog_active=false` 时原样返回（无喂狗约束）。
-fn watchdog_poll_timeout(
-    current_ms: i32,
-    last_feed: &std::time::Instant,
-    interval: &std::time::Duration,
-    watchdog_active: bool,
-) -> i32 {
-    if !watchdog_active {
-        return current_ms;
-    }
-    let since = last_feed.elapsed();
-    let remain = if since >= *interval {
-        0
-    } else {
-        (*interval - since).as_millis().min(i32::MAX as u128) as i32
-    };
-    if current_ms < 0 {
-        remain // 原无限等待：改为按喂狗间隔唤醒
-    } else {
-        current_ms.min(remain)
-    }
-}
-
-/// 应急/单用户 shell：跳过单元加载，循环 spawn root shell；
-/// shell 退出后重新拉起，期间响应关机标志（terminate shell 后进入关机流程）。
-/// `reason` 用于日志区分（no units / emergency / single）。
-fn run_emergency_shell(reason: &str) -> ExitCode {
-    log_at(
-        LogLevel::Error,
-        &format!("rbox init: {} mode, emergency shell", reason),
-    );
-    // 应急/单用户模式也喂狗：避免诊断期间被硬件看门狗复位打断
-    let cfg = crate::config::load();
-    let watchdog_interval = std::time::Duration::from_secs(cfg.init.watchdog_interval);
-    let mut watchdog_fd = if cfg.init.watchdog_interval > 0 {
-        open_watchdog(&cfg.init.watchdog_path)
-    } else {
-        None
-    };
-    let mut last_feed = std::time::Instant::now();
-    loop {
-        if let Some(fd) = watchdog_fd
-            && last_feed.elapsed() >= watchdog_interval
-        {
-            if feed_watchdog(fd) {
-                last_feed = std::time::Instant::now();
-            } else {
-                log_at(
-                    LogLevel::Warn,
-                    "rbox init: watchdog write failed, disabling",
-                );
-                watchdog_fd = None;
-            }
-        }
-        if shutdown_requested() {
-            return do_shutdown(&mut []);
-        }
-        let mut child = match spawn_fresh_shell() {
-            Some(c) => c,
-            None => {
-                log("rbox init: cannot spawn emergency shell, waiting");
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                continue;
-            }
-        };
-        // 轮询等待 shell 退出；期间响应关机标志（终止 shell 后进入关机流程）
-        loop {
-            if shutdown_requested() {
-                let _ = kill_all(libc::SIGTERM);
-                let _ = child.wait();
-                break;
-            }
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-/// 安装 SIGTERM/SIGINT/SIGCHLD 信号处理器（sigaction + SA_RESTART）。
-/// SIGCHLD 用于唤醒主循环收割子进程；SA_NOCLDSTOP 忽略子进程停止事件。
-/// SIGHUP/SIGPIPE/SIGQUIT 显式忽略：PID 1 不能被这些信号终止
-/// （tty 断开/写断管道/终端退格符都会触发，一旦命中即 kernel panic）。
-fn install_signal_handlers() {
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        // 未设 SA_SIGINFO：内核按 sa_handler 形式调用单参数处理器。
-        // sa_sigaction 与 sa_handler 为 union，这里直接以函数指针赋值。
-        sa.sa_sigaction = signal_handler as extern "C" fn(i32) as usize;
-        sa.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-        libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
-        // 以下三个信号保持运行，绝不终止 PID 1：
-        // - SIGHUP：控制终端断开（串口拔出/会话首进程挂断）
-        // - SIGPIPE：写已关闭的管道（日志/控制连接等）
-        // - SIGQUIT：终端 \ 不应能 core dump PID 1
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
-        libc::signal(libc::SIGQUIT, libc::SIG_IGN);
-    }
-}
-
-/// 创建 self-pipe（两端 nonblocking + close-on-exec），返回 (读端, 写端)。
-fn create_signal_pipe() -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    unsafe {
-        if libc::pipe(fds.as_mut_ptr()) != 0 {
-            return (-1, -1);
-        }
-        for fd in fds {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags >= 0 {
-                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-            let fdflags = libc::fcntl(fd, libc::F_GETFD);
-            if fdflags >= 0 {
-                libc::fcntl(fd, libc::F_SETFD, fdflags | libc::FD_CLOEXEC);
-            }
-        }
-    }
-    (fds[0], fds[1])
-}
-
-/// 清空 self-pipe 读端（多次信号合并为一次，读空避免积压）。
-fn drain_signal_pipe(fd: i32) {
-    let mut buf = [0u8; 64];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
-        }
-    }
 }
 
 /// 计算 poll 超时（毫秒）：最近的 restart 退避或 daemon 化超时；无则 -1（无限等待）。
@@ -699,15 +591,15 @@ fn reap_with_shutdown(
     status_listener: Option<UnixListener>,
 ) -> ExitCode {
     // 创建 self-pipe：信号处理器写 1 字节唤醒主循环 poll
-    let (signal_pipe_read, signal_pipe_write) = create_signal_pipe();
-    SIGNAL_PIPE_WRITE.store(signal_pipe_write, Ordering::SeqCst);
+    let (signal_pipe_read, signal_pipe_write) = signals::create_signal_pipe();
+    signals::set_signal_pipe_write(signal_pipe_write);
 
     // 硬件看门狗：主循环存活期间周期喂狗（poll 定时唤醒），
     // 主循环挂死（死锁/异常）即停止喂狗 -> 硬件超时复位整机
     let cfg = crate::config::load();
     let watchdog_interval = std::time::Duration::from_secs(cfg.init.watchdog_interval);
     let mut watchdog_fd = if cfg.init.watchdog_interval > 0 {
-        open_watchdog(&cfg.init.watchdog_path)
+        watchdog::open_watchdog(&cfg.init.watchdog_path)
     } else {
         None
     };
@@ -788,7 +680,7 @@ fn reap_with_shutdown(
             // 1b. 到达 RestartSec 退避时间点则重新拉起
             if let Some(at) = svc.next_restart_at
                 && std::time::Instant::now() >= at
-                && !shutdown_requested()
+                && !signals::shutdown_requested()
                 && !svc.stopped
             {
                 svc.next_restart_at = None;
@@ -808,15 +700,15 @@ fn reap_with_shutdown(
         reap_orphans(services);
 
         // 3. 关机/重启标志
-        if shutdown_requested() {
-            return do_shutdown(services);
+        if signals::shutdown_requested() {
+            return shutdown::do_shutdown(services);
         }
 
         // 3.5 喂狗：主循环存活证明（poll 唤醒即喂）；设备失效则禁用
         if let Some(fd) = watchdog_fd
             && last_feed.elapsed() >= watchdog_interval
         {
-            if feed_watchdog(fd) {
+            if watchdog::feed_watchdog(fd) {
                 last_feed = std::time::Instant::now();
             } else {
                 log_at(
@@ -830,7 +722,7 @@ fn reap_with_shutdown(
         // 4. 事件等待：poll 监听 self-pipe 与 status socket。
         //    超时为最近的 restart 退避 / daemon 化超时 / 喂狗截止
         //    （无定时则按喂狗间隔唤醒，保证空闲时也能定时喂狗）。
-        let timeout = watchdog_poll_timeout(
+        let timeout = watchdog::watchdog_poll_timeout(
             compute_next_timeout(services),
             &last_feed,
             &watchdog_interval,
@@ -854,7 +746,7 @@ fn reap_with_shutdown(
         let n = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout) };
         if n > 0 {
             if fds[0].revents & libc::POLLIN != 0 {
-                drain_signal_pipe(signal_pipe_read);
+                signals::drain_signal_pipe(signal_pipe_read);
             }
             // 响应控制请求（rbox status / rservice）：独立线程处理，不阻塞主循环
             if fds[1].revents & libc::POLLIN != 0
@@ -912,97 +804,6 @@ fn reap_orphans(services: &mut [ServiceInstance]) {
     }
 }
 
-/// 关机总超时（秒）：逐服务 stop + 残留进程回收共用此 deadline，
-/// 到点后直接 SIGKILL 全部残留进程，避免被忽略 SIGTERM 的进程拖住。
-const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
-
-/// 执行有序关机：逆序停止服务，杀残留进程，再 power off。
-fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
-    log("rbox init: shutting down");
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);
-    for svc in services.iter_mut().rev() {
-        if std::time::Instant::now() >= deadline {
-            log_at(
-                LogLevel::Warn,
-                "rbox init: shutdown deadline reached, skipping remaining services",
-            );
-            break;
-        }
-        stop_service_instance(svc);
-    }
-    log("rbox init: sending SIGTERM to all processes");
-    let _ = kill_all(libc::SIGTERM);
-    // 等待所有子进程退出（受总 deadline 约束）；到点升级 SIGKILL，避免忽略
-    // SIGTERM 的进程无限拖延关机。
-    loop {
-        if std::time::Instant::now() >= deadline {
-            log("rbox init: sending SIGKILL to all processes");
-            let _ = kill_all(libc::SIGKILL);
-            // 给 SIGKILL 一个极短收割窗口（最多 1 秒）
-            let kill_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-            while std::time::Instant::now() < kill_deadline {
-                let mut status: libc::c_int = 0;
-                let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-                if pid < 0 {
-                    break; // ECHILD：无子进程
-                }
-                if pid == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-            }
-            break;
-        }
-        let mut status: libc::c_int = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if pid < 0 {
-            break; // ECHILD：无子进程
-        }
-        if pid == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        // pid > 0：已收割一个，立即继续收割其余
-    }
-    sync_fs();
-    // 有序关机：先把根文件系统 remount 只读，再触发 reboot 系统调用
-    // （initramfs 根已是 tmpfs/rootfs 且不可 remount ro 时忽略失败，仅尽力而为）
-    let root = std::ffi::CString::new("/").unwrap();
-    let opts = std::ffi::CString::new("remount,ro").unwrap();
-    let _ = unsafe {
-        libc::mount(
-            std::ptr::null(),
-            root.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT,
-            opts.as_ptr() as *const libc::c_void,
-        )
-    };
-    let is_reboot = REBOOT_REQUESTED.load(Ordering::SeqCst);
-    if is_reboot {
-        log("rbox init: rebooting");
-    } else {
-        log("rbox init: power off");
-    }
-    let action = if is_reboot {
-        libc::RB_AUTOBOOT
-    } else {
-        libc::RB_POWER_OFF
-    };
-    if let Err(e) = reboot_syscall(action) {
-        log_at(
-            LogLevel::Error,
-            &format!("rbox init: reboot syscall failed: {}", e),
-        );
-        // 重启失败时回退到关机；仍失败则挂起等待人工干预
-        if is_reboot {
-            let _ = reboot_syscall(libc::RB_POWER_OFF);
-        }
-    }
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1028,34 +829,6 @@ mod tests {
         ok.insert("a.service".to_string(), true);
         ok.insert("b.service".to_string(), false);
         assert_eq!(failed_required_dep(&u, &ok), Some(&"b.service".to_string()));
-    }
-
-    #[test]
-    fn boot_mode_from_words_matches_exact_words() {
-        assert_eq!(boot_mode_from_words(&[]), BootMode::Normal);
-        assert_eq!(
-            boot_mode_from_words(&["console=ttyAMA0", "rdinit=/init"]),
-            BootMode::Normal
-        );
-        assert_eq!(
-            boot_mode_from_words(&["root=/dev/vda", "single"]),
-            BootMode::Single
-        );
-        assert_eq!(boot_mode_from_words(&["emergency"]), BootMode::Emergency);
-        // emergency 优先于 single（systemd 语义：emergency 更深）
-        assert_eq!(
-            boot_mode_from_words(&["single", "emergency"]),
-            BootMode::Emergency
-        );
-        // 非精确单词不误匹配（root=/dev/single 之类）
-        assert_eq!(
-            boot_mode_from_words(&["root=/dev/single"]),
-            BootMode::Normal
-        );
-        assert_eq!(
-            boot_mode_from_words(&["console=ttyAMA0,emergency"]),
-            BootMode::Normal
-        );
     }
 
     #[test]
@@ -1168,40 +941,25 @@ mod tests {
     }
 
     #[test]
-    #[test]
-    fn watchdog_poll_timeout_infinite_becomes_interval() {
-        // 原无限等待（-1）：有喂狗约束时改为按喂狗间隔唤醒
-        let last = std::time::Instant::now();
-        let iv = std::time::Duration::from_secs(10);
-        let t = watchdog_poll_timeout(-1, &last, &iv, true);
-        assert!((9000..=10000).contains(&t), "t={t}");
+    fn resolve_root_spec_plain_device() {
+        assert_eq!(
+            resolve_root_spec("/dev/vda", "/dev/disk"),
+            Some("/dev/vda".to_string())
+        );
     }
 
     #[test]
-    fn watchdog_poll_timeout_min_with_existing() {
-        // 已有更短超时（如 restart 退避 1s）保持；更长超时被喂狗截止压缩
-        let last = std::time::Instant::now();
-        let iv = std::time::Duration::from_secs(10);
-        assert_eq!(watchdog_poll_timeout(500, &last, &iv, true), 500);
-        let t = watchdog_poll_timeout(30_000, &last, &iv, true);
-        assert!((9000..=10000).contains(&t), "t={t}");
-    }
-
-    #[test]
-    fn watchdog_poll_timeout_inactive_passthrough() {
-        // 未启用喂狗（无设备）：原超时原样返回，不影响事件驱动
-        let last = std::time::Instant::now();
-        let iv = std::time::Duration::from_secs(10);
-        assert_eq!(watchdog_poll_timeout(-1, &last, &iv, false), -1);
-        assert_eq!(watchdog_poll_timeout(200, &last, &iv, false), 200);
-    }
-
-    #[test]
-    fn watchdog_poll_timeout_due_now() {
-        // 已到喂狗时间：立即返回 0（poll 不等待，直接醒来喂狗）
-        let last = std::time::Instant::now() - std::time::Duration::from_secs(10);
-        let iv = std::time::Duration::from_secs(10);
-        assert_eq!(watchdog_poll_timeout(-1, &last, &iv, true), 0);
+    fn resolve_root_spec_uuid_lookup() {
+        let base = format!("/tmp/rbox_disk_{}", std::process::id());
+        std::fs::create_dir_all(format!("{}/by-uuid", base)).unwrap();
+        std::fs::write(format!("{}/by-uuid/abc-123", base), "").unwrap();
+        assert_eq!(
+            resolve_root_spec("UUID=abc-123", &base),
+            Some(format!("{}/by-uuid/abc-123", base))
+        );
+        assert_eq!(resolve_root_spec("UUID=missing", &base), None);
+        assert_eq!(resolve_root_spec("LABEL=nope", &base), None);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
