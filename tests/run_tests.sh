@@ -97,25 +97,49 @@ assert_line_regex() {
 # respawn 重新登录。
 echo ""
 echo "[rgetty/rlogin 登录流程]"
-LOGIN_OUT=$(timeout 150 bash -c '
-{
-  sleep 32
-  printf "root\n"; sleep 2
-  printf "wrongpass\n"; sleep 2
-  printf "root\n"; sleep 2
-  printf "wrongpass2\n"; sleep 2
-  printf "root\n"; sleep 2
-  printf "root\n"; sleep 2
-  printf "echo LOGIN_OK\n"; sleep 1
-  printf "ls -l /proc/self/fd/0\n"; sleep 1
-  printf "exit\n"; sleep 3
-  printf "root\n"; sleep 2
-  printf "root\n"; sleep 2
-  printf "echo LOGIN_AGAIN\n"; sleep 1
-  printf "shutdown\n"; sleep 8
-} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
-  -kernel '"$KERNEL"' -initrd '"$INITRD"' -append '"'$APPEND'"'
-' 2>&1) || true
+# FIFO + 提示符等待驱动（取代固定 sleep）：命令完成即发下一条
+LOGIN_OUT_FILE=/tmp/rbox_login_out.$$
+LOGIN_FIFO=/tmp/rbox_login_fifo.$$
+rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
+mkfifo "$LOGIN_FIFO"
+timeout 200 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
+  < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 &
+LOGIN_QPID=$!
+exec 9> "$LOGIN_FIFO"
+# 等待模式出现；from 为字节偏移（等待"新一次"出现）。恒返回 0，失败由断言报告
+wait_login_from() {
+    local pat="$1" from="${2:-0}" tries="${3:-250}"
+    for _ in $(seq "$tries"); do
+        tail -c +$((from + 1)) "$LOGIN_OUT_FILE" 2>/dev/null | grep -qF -- "$pat" && return 0
+        sleep 0.2
+    done
+    return 0
+}
+wait_login() { wait_login_from "$1" 0 "${2:-250}"; }
+send_login() { printf '%s\n' "$1" >&9; }
+wait_login "user: " 300
+send_login root; wait_login "passwd" 100
+send_login wrongpass; wait_login "Login incorrect" 100
+send_login root; wait_login "passwd" 100
+send_login wrongpass2; wait_login "Login incorrect" 100
+send_login root; wait_login "passwd" 100
+send_login root
+send_login "echo LOGIN_OK"; wait_login "LOGIN_OK" 100
+send_login "ls -l /proc/self/fd/0"; wait_login "/dev/ttyAMA0" 100
+LOGIN_POS=$(wc -c < "$LOGIN_OUT_FILE")
+send_login exit; wait_login_from "user: " "$LOGIN_POS" 100
+send_login root; wait_login "passwd" 100
+send_login root
+send_login "echo LOGIN_AGAIN"; wait_login "LOGIN_AGAIN" 100
+send_login shutdown
+wait "$LOGIN_QPID" 2>/dev/null || true
+# 会话收尾：确保 QEMU 完全退出，避免残留负载影响后续会话（按 PID，勿用 pkill -f）
+kill -0 "$LOGIN_QPID" 2>/dev/null && kill "$LOGIN_QPID" 2>/dev/null
+sleep 1
+exec 9>&-
+LOGIN_OUT=$(cat "$LOGIN_OUT_FILE")
+rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 assert_contains_in "$LOGIN_OUT" "rgetty 登录提示" "user: "
 assert_contains_in "$LOGIN_OUT" "登录前 issue 横幅" "██"
 assert_contains_in "$LOGIN_OUT" "错误密码被拒绝" "Login incorrect"
