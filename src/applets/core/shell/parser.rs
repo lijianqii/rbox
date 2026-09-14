@@ -80,8 +80,8 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
                 cur.append_err = append;
             }
             Token::RedirHereString => {
-                let w = next_word(&mut iter, "<<<")?;
-                cur.here_string = Some(w);
+                // busybox ash 实测：`<<<` 为语法错误
+                return Err("syntax error: unexpected redirection".to_string());
             }
             Token::RedirInOut => {
                 let f = next_word(&mut iter, "<>")?;
@@ -114,11 +114,8 @@ pub fn build_command_list(tokens: &[Token]) -> Result<CommandList, String> {
                     });
             }
             Token::PipeBoth => {
-                if cur.is_empty() {
-                    return Err("syntax error: empty command before |&".to_string());
-                }
-                cur.stderr_to_pipe = true;
-                cur_cmds.push(std::mem::take(&mut cur));
+                // busybox ash 实测：`|&` 为语法错误
+                return Err("syntax error: unexpected \"&\"".to_string());
             }
             Token::Pipe => {
                 if cur.is_empty() {
@@ -361,15 +358,9 @@ mod tests {
         assert_eq!(cmd.stdout_file.as_deref(), Some("out"));
         assert_eq!(cmd.stderr_file.as_deref(), Some("out"));
 
-        let cl = build_command_list(&tokenize("cat <<< hi")).unwrap();
-        assert_eq!(
-            cl.segments[0].pipeline.cmds[0].here_string.as_deref(),
-            Some("hi")
-        );
-
-        let cl = build_command_list(&tokenize("a |& b")).unwrap();
-        assert_eq!(cl.segments[0].pipeline.cmds.len(), 2);
-        assert!(cl.segments[0].pipeline.cmds[0].stderr_to_pipe);
+        // busybox ash 实测：`<<<` 与 `|&` 为语法错误
+        assert!(build_command_list(&tokenize("cat <<< hi")).is_err());
+        assert!(build_command_list(&tokenize("a |& b")).is_err());
 
         let cl = build_command_list(&tokenize("cmd >&-")).unwrap();
         assert_eq!(cl.segments[0].pipeline.cmds[0].close_fds, vec![1]);

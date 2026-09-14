@@ -465,6 +465,7 @@ impl Shell {
 
         // 加载 profile（路径可配置；默认 /etc/profile）
         builtin::init_pwd();
+        options::set_interactive(true);
         let profile_path = &crate::config::load().paths.profile;
         let mut boot_rc: i32 = 0;
         let mut boot_history: Vec<String> = Vec::new();

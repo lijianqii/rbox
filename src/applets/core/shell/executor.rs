@@ -82,7 +82,12 @@ pub fn execute_line(
     // 历史扩展：!! -> 上一条命令，!n -> 第 n 条，!$ -> 上一条命令的最后一个参数
     let expanded_line = expand_history(line, history);
     // 别名展开（命令位置首词）、反引号与 $(...) 命令替换
-    let expanded_line = alias::expand_alias(&expanded_line);
+    // POSIX：别名不在非交互式 shell 中展开
+    let expanded_line = if super::options::interactive() {
+        alias::expand_alias(&expanded_line)
+    } else {
+        expanded_line
+    };
     let expanded_line = expand_backticks(&expanded_line);
     let expanded_line = expand_command_subst(&expanded_line);
     let line = expanded_line.as_str();

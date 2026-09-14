@@ -19,6 +19,8 @@ static IGNOREEOF: AtomicBool = AtomicBool::new(false);
 static BRACEEXPAND: AtomicBool = AtomicBool::new(true);
 static PHYSICAL: AtomicBool = AtomicBool::new(false);
 static HISTORY: AtomicBool = AtomicBool::new(true);
+/// 交互式 shell 标志（别名展开等仅交互模式生效）。
+static INTERACTIVE: AtomicBool = AtomicBool::new(false);
 /// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
 static NOUNSET_VIOLATION: AtomicBool = AtomicBool::new(false);
 /// 退出请求（`exit` 之外的内部退出：set -e 触发等）；-1 表示无。
@@ -26,6 +28,12 @@ static EXIT_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 /// `return` 请求（source/函数帧消费）；-1 表示无。
 static RETURN_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 
+pub(crate) fn interactive() -> bool {
+    INTERACTIVE.load(Ordering::SeqCst)
+}
+pub(crate) fn set_interactive(v: bool) {
+    INTERACTIVE.store(v, Ordering::SeqCst);
+}
 pub(crate) fn braceexpand() -> bool {
     BRACEEXPAND.load(Ordering::SeqCst)
 }

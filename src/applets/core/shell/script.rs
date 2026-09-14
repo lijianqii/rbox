@@ -251,6 +251,7 @@ pub(crate) fn run_source(
     // 脚本模式也需捕获 INT/TERM 以执行 trap（幂等）
     trap::install_handlers();
     crate::applets::core::shell::builtin::init_pwd();
+    crate::applets::core::shell::options::set_interactive(interactive);
     let lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
     let mut i = 0;
     let mut last_rc = 0;

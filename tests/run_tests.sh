@@ -332,8 +332,6 @@ OUT=$(timeout 400 bash -c '
   printf "sh /tmp/scr.sh arg1\n"; sleep 1.2
   printf "sh -ec \x27false\x27; echo e_rc=\$?\n"; sleep 0.5
   printf "ls /nonexistent_rbox &> /tmp/both.txt; cat /tmp/both.txt\n"; sleep 0.6
-  printf "cat <<< here_string_ok\n"; sleep 0.5
-  printf "ls /nonexistent_rbox |& grep -o \x27No such file\x27\n"; sleep 0.5
   printf "p=/a/b/c.txt; echo \"\${p##*/} \${p%%/*} \${UNSET_X:-DEF}\"\n"; sleep 0.5
   printf "echo \x27r1 r2\x27 > /tmp/rin.txt; read a b < /tmp/rin.txt; echo \"read:\$a:\$b\"\n"; sleep 0.5
   printf "sleep 0.2 & wait \$!; echo wait_ok=\$?\n"; sleep 0.6
@@ -659,8 +657,6 @@ assert_line "命令替换读文件" "file:rbox"
 assert_line "EXIT trap" "EXIT_TRAP"
 assert_line "set -e 退出码" "e_rc=1"
 assert_contains "&> 同时捕获 stderr" "No such file"
-assert_line "here-string" "here_string_ok"
-assert_contains "|& 管道 stderr" "No such file"
 assert_line "参数前后缀删除" "c.txt /a/b DEF"
 assert_line "read 变量拆分" "read:r1:r2"
 assert_line "wait 返回码" "wait_ok=0"

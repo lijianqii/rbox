@@ -43,6 +43,8 @@
 - 修复内置命令任意 fd 重定向的 fd 生命周期：文件先迁移到高位 fd（F_DUPFD_CLOEXEC）
   再 dup2 到目标，guard 记录"原先关闭"状态并在 Drop 恢复；`exec N<` 跨行持久化、
   `read -u N` 命令内重定向均正常
+- busybox ash 实测口径对齐：`<<<`/`|&` 改为语法错误（删除该扩展）；
+  别名仅在交互式 shell 展开（POSIX，`-c`/脚本不展开）
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -77,7 +79,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 793 个、QEMU 集成断言 263 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 793 个、QEMU 集成断言 261 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
