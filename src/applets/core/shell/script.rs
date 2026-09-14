@@ -359,7 +359,17 @@ pub(crate) fn run_source(
             }
         }
         let mut rc;
-        if line.trim_start().starts_with('(') {
+        let starts_subshell = line.trim_start().starts_with('(')
+            && extract_subshell(line.trim_start())
+                .map(|(_, tail)| {
+                    let t = tail.trim_start();
+                    !(t.starts_with('|')
+                        || t.starts_with("&&")
+                        || t.starts_with("||")
+                        || t.starts_with('&'))
+                })
+                .unwrap_or(true);
+        if starts_subshell {
             // 子 shell：fork 执行，隔离变量与 cwd
             let mut text = line.clone();
             let mut depth = paren_delta(&text);
@@ -751,7 +761,20 @@ pub(crate) fn run_interactive_line(
         }
     }
     let t = line.trim_start();
-    if t.starts_with('(') || t.starts_with('{') || t.starts_with("! ") {
+    let pure_group = if t.starts_with('(') {
+        extract_subshell(t)
+            .map(|(_, tail)| {
+                let tt = tail.trim_start();
+                !(tt.starts_with('|')
+                    || tt.starts_with("&&")
+                    || tt.starts_with("||")
+                    || tt.starts_with('&'))
+            })
+            .unwrap_or(true)
+    } else {
+        t.starts_with('{')
+    };
+    if pure_group || t.starts_with("! ") {
         return run_segment(&line, history, exit_fn, rc);
     }
     if starts_compound_keyword(t) {

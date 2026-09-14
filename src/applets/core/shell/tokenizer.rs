@@ -105,6 +105,50 @@ pub fn tokenize(line: &str) -> Vec<Token> {
 
         match c {
             '#' if !in_token => break,
+            '(' if !in_token => {
+                // 子 shell 段 `( ... )`：整体捕获（内部 ; & | < > 不是分隔符）
+                cur.push('(');
+                let mut depth = 1;
+                let mut in_dq = false;
+                let mut in_sq = false;
+                while let Some(nc) = chars.next() {
+                    cur.push(nc);
+                    if in_sq {
+                        if nc == '\'' {
+                            in_sq = false;
+                        }
+                        continue;
+                    }
+                    if in_dq {
+                        if nc == '\\' {
+                            if let Some(n2) = chars.next() {
+                                cur.push(n2);
+                            }
+                        } else if nc == '"' {
+                            in_dq = false;
+                        }
+                        continue;
+                    }
+                    match nc {
+                        '\'' => in_sq = true,
+                        '"' => in_dq = true,
+                        '\\' => {
+                            if let Some(n2) = chars.next() {
+                                cur.push(n2);
+                            }
+                        }
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                in_token = true;
+            }
             '$' if chars.peek() == Some(&'(') => {
                 // $(...) / $((...))：整体复制（内部 ; & | < > 不是分隔符）
                 cur.push('$');

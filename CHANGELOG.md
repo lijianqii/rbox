@@ -32,6 +32,9 @@
   `set +o braceexpand` 生效时关闭花括号展开；`${!v}` 报 bad substitution；
   `read -p` 非 tty 时静默
 - `wait -n`（等待任一运行中作业）与 `read -u FD`；后台作业通知仅 `set -m` 时打印
+- 管道段子 shell `cmd | ( ... )`：tokenizer 整体捕获 `( ... )`，expander 转为
+  `rbox --subshell` 子进程执行（环境变量/cwd 继承；函数/别名不继承）；
+  行首子 shell 后接管道（`( ... ) | cat`）交由管道路径处理
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -66,7 +69,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 792 个、QEMU 集成断言 252 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 792 个、QEMU 集成断言 255 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

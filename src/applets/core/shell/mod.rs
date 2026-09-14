@@ -30,7 +30,7 @@ mod options;
 mod params;
 mod parser;
 mod reader;
-mod script;
+pub(crate) mod script;
 mod tokenizer;
 mod trap;
 pub(crate) mod types;

@@ -68,6 +68,17 @@ fn main() -> ExitCode {
             "--version" | "-V" | "version" => return print_version(),
             // 隐藏模式：管道/子 shell 中执行 shell 内置命令
             "--builtin" => return run_builtin_subprocess(&raw_args[2..]),
+            // 隐藏模式：管道段中的子 shell（`cmd | ( ... )`）
+            "--subshell" => {
+                let src = raw_args[2..].join(" ");
+                let rc = crate::applets::core::shell::script::run_source(
+                    &src,
+                    &[],
+                    &|rc: i32| std::process::exit(rc),
+                    false,
+                );
+                return ExitCode::from(rc as u8);
+            }
             _ => {}
         }
         (sub.as_str(), &raw_args[2..])
