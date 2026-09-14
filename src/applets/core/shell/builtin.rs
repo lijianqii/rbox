@@ -108,7 +108,7 @@ fn wait_input(timeout: Option<u64>) -> bool {
 fn read_line_from_stdin(opts: &ReadOpts) -> (String, bool) {
     let fd = libc::STDIN_FILENO;
     let tty = unsafe { libc::isatty(fd) } == 1;
-    if let Some(p) = &opts.prompt {
+    if tty && let Some(p) = &opts.prompt {
         let _ = std::io::Write::write_all(&mut std::io::stdout(), p.as_bytes());
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -326,7 +326,8 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         }
         "cd" => {
             // -P 物理路径（解析符号链接）；-L 逻辑路径（默认，保留 .. 文本语义）
-            let mut physical = false;
+            // `set -o physical` 时默认 -P
+            let mut physical = crate::applets::core::shell::options::physical();
             let mut positional: Vec<&str> = Vec::new();
             for a in cmd.argv[1..].iter().map(String::as_str) {
                 match a {

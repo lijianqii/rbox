@@ -66,8 +66,12 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
 /// 供 expand_pipeline 与复合命令（for 的词表）共用。
 pub fn expand_word(arg: &str, last_rc: i32) -> Vec<String> {
     let mut out = Vec::new();
-    for w in expand_braces(arg) {
-        out.extend(expand_word_single(&w, last_rc));
+    if super::options::braceexpand() {
+        for w in expand_braces(arg) {
+            out.extend(expand_word_single(&w, last_rc));
+        }
+    } else {
+        out.extend(expand_word_single(arg, last_rc));
     }
     out
 }
@@ -399,6 +403,11 @@ fn expand_braced(spec: &str, last_rc: i32) -> String {
     // 去除引号保护标记（如 `${p:1:3}` 中 `}` 前的标记）
     let spec_clean = spec.replace(GLOB_ESCAPE, "");
     let spec = spec_clean.as_str();
+    if spec.starts_with('!') {
+        // ash：bad substitution
+        eprintln!("shell: syntax error: bad substitution");
+        return String::new();
+    }
     if let Some(name) = spec.strip_prefix('#') {
         return lookup_var(name, last_rc).chars().count().to_string();
     }

@@ -16,12 +16,28 @@ static ALLEXPORT: AtomicBool = AtomicBool::new(false);
 static MONITOR: AtomicBool = AtomicBool::new(false);
 static NOTIFY: AtomicBool = AtomicBool::new(false);
 static IGNOREEOF: AtomicBool = AtomicBool::new(false);
+static BRACEEXPAND: AtomicBool = AtomicBool::new(true);
+static PHYSICAL: AtomicBool = AtomicBool::new(false);
+static HISTORY: AtomicBool = AtomicBool::new(true);
 /// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
 static NOUNSET_VIOLATION: AtomicBool = AtomicBool::new(false);
 /// 退出请求（`exit` 之外的内部退出：set -e 触发等）；-1 表示无。
 static EXIT_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 /// `return` 请求（source/函数帧消费）；-1 表示无。
 static RETURN_REQUESTED: AtomicI32 = AtomicI32::new(-1);
+
+pub(crate) fn braceexpand() -> bool {
+    BRACEEXPAND.load(Ordering::SeqCst)
+}
+pub(crate) fn physical() -> bool {
+    PHYSICAL.load(Ordering::SeqCst)
+}
+pub(crate) fn history_enabled() -> bool {
+    HISTORY.load(Ordering::SeqCst)
+}
+pub(crate) fn set_history(v: bool) {
+    HISTORY.store(v, Ordering::SeqCst);
+}
 
 pub(crate) fn errexit() -> bool {
     ERREXIT.load(Ordering::SeqCst)
@@ -136,16 +152,27 @@ pub(crate) fn option_string() -> String {
 pub(crate) fn named_options() -> Vec<(&'static str, bool)> {
     vec![
         ("allexport", allexport()),
+        ("braceexpand", braceexpand()),
+        ("emacs", false),
         ("errexit", errexit()),
+        ("errtrace", false),
+        ("functrace", false),
+        ("history", history_enabled()),
+        ("interactive", unsafe { libc::isatty(0) } == 1),
         ("ignoreeof", ignoreeof()),
         ("monitor", monitor()),
         ("noclobber", noclobber()),
         ("noexec", noexec()),
         ("noglob", noglob()),
         ("nolog", false),
+        ("keyword", false),
         ("notify", notify()),
         ("nounset", nounset()),
+        ("onecmd", false),
+        ("physical", physical()),
         ("pipefail", pipefail()),
+        ("posix", false),
+        ("privileged", false),
         ("verbose", verbose()),
         ("vi", false),
         ("xtrace", xtrace()),
@@ -156,16 +183,25 @@ pub(crate) fn named_options() -> Vec<(&'static str, bool)> {
 pub(crate) fn set_named(name: &str, on: bool) -> bool {
     match name {
         "allexport" => set_allexport(on),
+        "emacs" => {}
         "errexit" => set_errexit(on),
+        "errtrace" => {}
+        "functrace" => {}
+        "history" => set_history(on),
+        "interactive" => {}
         "ignoreeof" => set_ignoreeof(on),
         "monitor" => set_monitor(on),
         "noclobber" => set_noclobber(on),
         "noexec" => set_noexec(on),
         "noglob" => set_noglob(on),
+        "keyword" => {}
         "nolog" => {}
         "notify" => set_notify(on),
         "nounset" => set_nounset(on),
+        "onecmd" => {}
         "pipefail" => set_pipefail(on),
+        "posix" => {}
+        "privileged" => {}
         "verbose" => set_verbose(on),
         "vi" => {}
         "xtrace" => set_xtrace(on),
@@ -288,6 +324,28 @@ mod tests {
         assert!(pipefail());
         assert!(named_options().iter().any(|(n, v)| *n == "pipefail" && *v));
         assert!(named_options().iter().any(|(n, _)| *n == "noclobber"));
+        for name in [
+            "braceexpand",
+            "emacs",
+            "errtrace",
+            "functrace",
+            "history",
+            "interactive",
+            "keyword",
+            "onecmd",
+            "physical",
+            "posix",
+            "privileged",
+        ] {
+            assert!(
+                named_options().iter().any(|(n, _)| *n == name),
+                "set -o 缺少 {}",
+                name
+            );
+        }
+        // ash 实测：braceexpand/physical 可列出但不可设置
+        assert!(!set_named("braceexpand", false));
+        assert!(!set_named("physical", true));
         assert!(set_named("ignoreeof", true));
         assert!(ignoreeof());
         assert!(set_named("ignoreeof", false));

@@ -27,6 +27,10 @@
   （`SPLIT_ESCAPE` 标记区间），tokenizer 在双引号结束处插入变量名边界标记；
   `a"b c"$z`、`"$x"suf` 等与 busybox ash 实测一致
 - 内联函数定义 `function f { ...; }; f` 支持（`}` 处切分函数体与后续命令）
+- `set -o` 补全 ash 实测选项名（braceexpand/emacs/errtrace/functrace/history/
+  interactive/keyword/onecmd/physical/posix/privileged，其中前两者按 ash 实测不可设置）；
+  `set +o braceexpand` 生效时关闭花括号展开；`${!v}` 报 bad substitution；
+  `read -p` 非 tty 时静默
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -61,7 +65,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 792 个、QEMU 集成断言 249 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 792 个、QEMU 集成断言 251 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
