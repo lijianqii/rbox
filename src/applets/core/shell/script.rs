@@ -110,17 +110,54 @@ pub(crate) fn parse_function_header(line: &str) -> Option<(String, String)> {
     Some((name, rest[1..].to_string()))
 }
 
+/// 内联函数体：找顶层 `}`，返回 (函数体, 后续命令)。
+fn split_inline_brace(s: &str) -> Option<(String, Option<String>)> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_sq = false;
+    let mut in_dq = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_sq {
+            if c == b'\'' {
+                in_sq = false;
+            }
+            continue;
+        }
+        if in_dq {
+            if c == b'"' {
+                in_dq = false;
+            }
+            continue;
+        }
+        match c {
+            b'\'' => in_sq = true,
+            b'"' => in_dq = true,
+            b'{' => depth += 1,
+            b'}' => {
+                if depth == 0 {
+                    let inner = s[..i].trim().to_string();
+                    let rest = s[i + 1..].trim().trim_start_matches(';').trim();
+                    return Some((inner, (!rest.is_empty()).then(|| rest.to_string())));
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// 收集函数定义体：处理内联 `{ ... }` 与跨行 `{` ... `}`。
 /// 返回 (函数名, 函数体文本, 额外消耗的行数)。
 pub(crate) fn collect_function(
     line: &str,
     rest_lines: &[String],
-) -> Option<(String, String, usize)> {
+) -> Option<(String, String, usize, Option<String>)> {
     let (name, after) = parse_function_header(line)?;
     let after = after.trim();
-    // 内联：`{ cmd; }`
-    if let Some(inner) = after.strip_suffix('}') {
-        return Some((name, inner.trim().to_string(), 0));
+    // 内联：`{ cmd; }` 或 `{ cmd; }; 后续命令`
+    if let Some((inner, tail)) = split_inline_brace(after) {
+        return Some((name, inner, 0, tail));
     }
     let mut body = String::new();
     if !after.is_empty() {
@@ -132,12 +169,12 @@ pub(crate) fn collect_function(
         consumed += 1;
         let t = l.trim();
         if t == "}" {
-            return Some((name, body, consumed));
+            return Some((name, body, consumed, None));
         }
         if let Some(inner) = t.strip_suffix('}') {
             body.push_str(inner);
             body.push('\n');
-            return Some((name, body, consumed));
+            return Some((name, body, consumed, None));
         }
         body.push_str(l);
         body.push('\n');
@@ -272,9 +309,12 @@ pub(crate) fn run_source(
             i += consumed;
         }
         // 函数定义
-        if let Some((name, body, consumed)) = collect_function(&line, &lines[i..]) {
+        if let Some((name, body, consumed, tail)) = collect_function(&line, &lines[i..]) {
             functions::define(&name, &body);
             i += consumed;
+            if let Some(t) = tail {
+                last_rc = execute_line(&t, &mut last_rc, history, exit_fn);
+            }
             continue;
         }
         // `cmd && ( ... )` / `cmd || { ...; }`：条件执行组
@@ -1126,7 +1166,7 @@ mod tests {
     #[test]
     fn collect_function_multiline() {
         let rest = s(&["  echo one", "  echo two", "}", "echo after"]);
-        let (name, body, consumed) = collect_function("f() {", &rest).unwrap();
+        let (name, body, consumed, _) = collect_function("f() {", &rest).unwrap();
         assert_eq!(name, "f");
         assert!(body.contains("echo one") && body.contains("echo two"));
         assert_eq!(consumed, 3);
@@ -1134,7 +1174,8 @@ mod tests {
 
     #[test]
     fn collect_function_inline() {
-        let (name, body, consumed) = collect_function("f() { echo hi; }", &[]).unwrap();
+        let (name, body, consumed, tail) = collect_function("f() { echo hi; }", &[]).unwrap();
+        assert!(tail.is_none());
         assert_eq!(name, "f");
         assert_eq!(body, "echo hi;");
         assert_eq!(consumed, 0);

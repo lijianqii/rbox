@@ -319,6 +319,7 @@ OUT=$(timeout 400 bash -c '
   printf "cat > /tmp/scr.sh <<\x27EOF\x27\n"; sleep 0.3
   printf "echo \"script:\$1:\$#\"\n"; sleep 0.3
   printf "f() { echo \"func:\$1\"; return 3; }\n"; sleep 0.3
+  printf "function g { echo IFUNC_OK; }; g\n"; sleep 0.3
   printf "f hi; echo \"rc=\$?\"\n"; sleep 0.3
   printf "case x in x) echo CASE_OK;; esac\n"; sleep 0.3
   printf "until false; do echo UNTIL_OK; break; done\n"; sleep 0.3
@@ -625,6 +626,7 @@ assert_line "sh -c 模式" "C_MODE_OK"
 assert_line "脚本位置参数" "script:arg1:1"
 assert_line "函数定义与 return" "func:hi"
 assert_line "函数返回码" "rc=3"
+assert_line "内联 function 定义+调用" "IFUNC_OK"
 assert_line "case 语句" "CASE_OK"
 assert_line "until 循环" "UNTIL_OK"
 assert_line "嵌套 break 2" "loop:1a"
