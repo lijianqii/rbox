@@ -57,6 +57,7 @@ pub fn is_builtin(name: &str) -> bool {
 /// 从指定 fd 取下一个输入字节（`read -u FD`；默认 fd 0）。
 fn next_input_byte_fd(fd: i32) -> Option<u8> {
     if fd == libc::STDIN_FILENO
+        && !super::executor::stdin_redirected()
         && let Ok(mut q) = super::executor::pending_stdin().lock()
         && let Some(b) = q.pop_front()
     {

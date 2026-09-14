@@ -339,11 +339,16 @@ pub(crate) struct BuiltinRedirectGuard {
     saved_dups: Vec<(i32, i32)>,
     /// 被关闭的 fd（恢复时 dup2(saved, fd)）。
     saved_closes: Vec<(i32, i32)>,
+    /// 本次是否重定向了 stdin（Drop 时清除全局标记）。
+    stdin_redirect: bool,
 }
 
 impl Drop for BuiltinRedirectGuard {
     fn drop(&mut self) {
         use std::io::Write;
+        if self.stdin_redirect {
+            STDIN_REDIRECTED.store(false, Ordering::SeqCst);
+        }
         // 先把 Rust 侧缓冲写出，再恢复 fd，避免输出落到错误的目标
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
@@ -400,6 +405,13 @@ impl Drop for BuiltinRedirectGuard {
 
 /// `exec` 无参数时置位：让内置重定向 guard 不恢复（永久重定向）。
 static PERSIST_REDIRECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 内置命令执行期间 stdin 被重定向（`read x < file`）：此时不得消费 REPL 预读缓冲。
+static STDIN_REDIRECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// stdin 是否处于内置重定向中。
+pub(crate) fn stdin_redirected() -> bool {
+    STDIN_REDIRECTED.load(Ordering::SeqCst)
+}
 
 /// 请求持久化内置重定向（供 `exec` 使用）。
 pub(crate) fn persist_builtin_redirects() {
@@ -501,12 +513,15 @@ pub(crate) fn apply_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectG
         saved_err: None,
         saved_dups: Vec::new(),
         saved_closes: Vec::new(),
+        stdin_redirect: false,
     };
     unsafe {
         if let Some(f) = in_file {
             let saved = libc::dup(libc::STDIN_FILENO);
             if saved >= 0 && libc::dup2(f.as_raw_fd(), libc::STDIN_FILENO) >= 0 {
                 guard.saved_in = Some(saved);
+                guard.stdin_redirect = true;
+                STDIN_REDIRECTED.store(true, Ordering::SeqCst);
             } else if saved >= 0 {
                 libc::close(saved);
             }
@@ -1263,51 +1278,67 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
     // shell 主线程在 wait() 中阻塞，无法读 stdin，所以需要单独线程。
     let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let monitor_stop = stop_flag.clone();
-    let monitor = std::thread::spawn(move || {
-        let mut buf = [0u8; 1];
-        loop {
-            if monitor_stop.load(Ordering::Relaxed) {
-                return;
-            }
-            // 非阻塞 read，避免线程无法退出
-            let stdin_fd = std::io::stdin().as_raw_fd();
-            let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, 1) };
-            // 恢复阻塞
-            unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags) };
-
-            if n == 1 {
-                if buf[0] == 0x03 {
-                    // Ctrl-C：向子进程组发送 SIGINT
-                    let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
-                    if pgid > 0 {
-                        unsafe {
-                            libc::kill(-pgid, libc::SIGINT);
-                        }
-                    }
+    // 仅交互式 shell 且 stdin 为 tty 时监听 Ctrl-C 字节；
+    // 子 shell/脚本不得读取 stdin（否则会吞掉父进程的待处理输入）；
+    // 前台命令为嵌套交互式 shell（`sh`）时也不监听，否则会抢走子 shell 的输入
+    let is_nested_shell = pipeline
+        .cmds
+        .first()
+        .and_then(|c| c.argv.first())
+        .map(|a| a == "sh")
+        .unwrap_or(false);
+    let monitor = if super::options::interactive()
+        && !is_nested_shell
+        && unsafe { libc::isatty(libc::STDIN_FILENO) } == 1
+    {
+        Some(std::thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            loop {
+                if monitor_stop.load(Ordering::Relaxed) {
                     return;
-                } else if buf[0] == 0x1a {
-                    // Ctrl-Z：向子进程组发送 SIGTSTP（挂起，由 WUNTRACED 感知）
-                    let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
-                    if pgid > 0 {
-                        unsafe {
-                            libc::kill(-pgid, libc::SIGTSTP);
-                        }
-                    }
-                    return;
-                } else {
-                    // 非 Ctrl-C 字节：缓存到 pending 队列，主循环随后消费。
-                    // （TIOCSTI 推回会追加到 tty 输入队列队尾，与主线程并发
-                    //   读 stdin 时乱序/错位，改为共享队列保序）
-                    pending_stdin().lock().unwrap().push_back(buf[0]);
                 }
-            } else {
-                // 没有数据，短暂休眠后重试
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // 非阻塞 read，避免线程无法退出
+                let stdin_fd = std::io::stdin().as_raw_fd();
+                let flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+                unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+                let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, 1) };
+                // 恢复阻塞
+                unsafe { libc::fcntl(stdin_fd, libc::F_SETFL, flags) };
+
+                if n == 1 {
+                    if buf[0] == 0x03 {
+                        // Ctrl-C：向子进程组发送 SIGINT
+                        let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
+                        if pgid > 0 {
+                            unsafe {
+                                libc::kill(-pgid, libc::SIGINT);
+                            }
+                        }
+                        return;
+                    } else if buf[0] == 0x1a {
+                        // Ctrl-Z：向子进程组发送 SIGTSTP（挂起，由 WUNTRACED 感知）
+                        let pgid = FOREGROUND_PGID.load(Ordering::Relaxed);
+                        if pgid > 0 {
+                            unsafe {
+                                libc::kill(-pgid, libc::SIGTSTP);
+                            }
+                        }
+                        return;
+                    } else {
+                        // 非 Ctrl-C 字节：缓存到 pending 队列，主循环随后消费。
+                        // （TIOCSTI 推回会追加到 tty 输入队列队尾，与主线程并发
+                        //   读 stdin 时乱序/错位，改为共享队列保序）
+                        pending_stdin().lock().unwrap().push_back(buf[0]);
+                    }
+                } else {
+                    // 没有数据，短暂休眠后重试
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
             }
-        }
-    });
+        }))
+    } else {
+        None
+    };
 
     // 等待所有子进程，返回最后一个的退出码；检测到挂起则登记作业
     let mut last_code = 0;
@@ -1330,7 +1361,9 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
 
     // 停止 stdin 监控线程
     stop_flag.store(true, Ordering::Relaxed);
-    let _ = monitor.join();
+    if let Some(m) = monitor {
+        let _ = m.join();
+    }
 
     // 收割等待期间累积的后台僵尸（SIGCHLD 被屏蔽，处理器未执行）
     // 记录退出状态供 wait/jobs 使用
