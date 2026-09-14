@@ -931,7 +931,7 @@ fn split_assignments(cmds: &mut [SimpleCmd], last_rc: i32) -> bool {
                 ok = false;
                 break;
             }
-            let val = crate::applets::core::shell::expander::expand_vars(v, last_rc);
+            let val = crate::applets::core::shell::expander::expand_vars_clean(v, last_rc);
             assigns.push((k.to_string(), val));
             cmd.argv.remove(0);
         }

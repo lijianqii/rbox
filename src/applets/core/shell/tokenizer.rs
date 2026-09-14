@@ -55,6 +55,24 @@ pub fn tokenize(line: &str) -> Vec<Token> {
         if in_dquote {
             match c {
                 '"' => {
+                    // 变量名与后续字面量的边界：`"$x"suf` 中 `$x` 不应吞掉 `suf`
+                    let tail = cur
+                        .rsplit(|ch: char| {
+                            ch == '$'
+                                || ch == NO_SPLIT_ESCAPE
+                                || ch == SPLIT_ESCAPE
+                                || ch == GLOB_ESCAPE
+                        })
+                        .next()
+                        .unwrap_or("");
+                    if !tail.is_empty()
+                        && tail
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        && cur.contains('$')
+                    {
+                        cur.push(NO_SPLIT_ESCAPE);
+                    }
                     in_dquote = false;
                     in_token = true;
                 }
@@ -860,7 +878,7 @@ mod tests {
             tokenize("echo \"$VAR\""),
             vec![
                 Token::Word("echo".into()),
-                Token::Word(format!("{}$VAR", NO_SPLIT_ESCAPE))
+                Token::Word(format!("{}$VAR{}", NO_SPLIT_ESCAPE, NO_SPLIT_ESCAPE))
             ]
         );
     }

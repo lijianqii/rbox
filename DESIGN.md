@@ -426,7 +426,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、247 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、248 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -468,7 +468,7 @@ enum Token {
 | rescue 启动降级 | target Requires 失败 → 停止服务进 rescue shell | 4 |
 | 持久盘模式 | switch_root、写入、重启后数据保留 | 3 |
 | Shell: ash 对齐与覆盖补齐 | 子 shell/花括号组/`!`/反引号/`:`/readonly/getopts/ulimit、位运算与三元、参数子串、`for` 无 in、复合重定向、任意 fd/`<>`/`>|`、noclobber、`$-`/`set -o`/`$RANDOM`/`set -f`、CDPATH、`cd -L/-P`、`pwd -P`、`kill %job`/`kill -l` 表格、`&&`/`||` 组、`$ENV`、ignoreeof（Ctrl-D） | 44 |
-| **合计** | | **247** |
+| **合计** | | **248** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -489,10 +489,9 @@ enum Token {
   stage（`std::process::Child` 与手工 fork 混合、管道 fd 手工接线、作业控制登记），
   计划把 `execute_pipeline` 的 children 抽象为
   `enum Stage { Spawned(Child), Forked(pid) }` 后实现
-- 混合引号/展开词的分割精度：`z="1 2"; printf "[%s]" a"b c"$z` 当前拆成
-  `[ab][c1][2]`，bash/ash 为 `[ab c1][2]`（只有未加引号的展开才参与 IFS 拆分）。
-  修复方案：`expand_vars` 对未加引号展开值包裹 `SPLIT_ESCAPE` 标记，拆分时仅处理
-  标记区间；同步让 `expand_glob` 忽略元数据标记、赋值路径使用去标记包装
+- 混合引号词分割已按 POSIX 修复：`expand_vars` 对未加引号展开值包裹 `SPLIT_ESCAPE`
+  标记，`split_marked` 仅拆分标记区间；tokenizer 在双引号结束处补边界标记，
+  避免 `"$x"suf` 的变量名吞掉 `suf`（已与 busybox ash 实测一致）
 
 ### 终端模式（Tab 补全的前提）
 
@@ -855,11 +854,11 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 41 个测试组、247 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 41 个测试组、248 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
-单元测试（791 个）使用 `make coverage`（cargo-llvm-cov）可生成覆盖率报告，当前整体约
+单元测试（792 个）使用 `make coverage`（cargo-llvm-cov）可生成覆盖率报告，当前整体约
 73% 行覆盖 / 83% 函数覆盖。Shell 各模块行覆盖：expander 94%、tokenizer 88%、parser 99%、
 compound 86%、options 85%、alias 96%、trap 94%、jobs 78%、completion 81%、reader 77%、
 script 65%、builtin 62%、executor 55%、mod（REPL 主循环）26%。REPL 主循环、fork/exec 子

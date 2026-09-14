@@ -156,7 +156,7 @@ pub(crate) fn expand_heredoc_body(body: &str, expand: bool) -> String {
     let with_cmd = executor::expand_command_subst(body);
     let mut out = String::new();
     for line in with_cmd.lines() {
-        out.push_str(&super::expander::expand_vars(line, 0));
+        out.push_str(&super::expander::expand_vars_clean(line, 0));
         out.push('\n');
     }
     out

@@ -89,27 +89,58 @@ fn expand_word_single(arg: &str, last_rc: i32) -> Vec<String> {
             return globs;
         }
     }
-    let literal = unescape_glob(&expanded);
     if has_unquoted_expansion {
-        // POSIX 词分割：未加引号的展开按 IFS（默认空白）拆分
+        // POSIX 词分割：仅未加引号的展开区间按 IFS 拆分
         let ifs = std::env::var("IFS").unwrap_or_else(|_| " \t\n".to_string());
-        let fields = split_ifs(&literal, &ifs);
+        let fields = split_marked(&expanded, &ifs);
         if fields.len() > 1 {
             return fields;
         }
     }
-    vec![literal]
+    vec![unescape_glob(&expanded)]
 }
 
-/// 按 IFS 拆分（IFS 全为空白时等价于 split_whitespace；否则按字符切分）。
-pub(crate) fn split_ifs(text: &str, ifs: &str) -> Vec<String> {
-    if ifs.chars().all(char::is_whitespace) {
-        return text.split_whitespace().map(str::to_string).collect();
-    }
-    text.split(|c| ifs.contains(c))
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// 去除词分割元数据（递归展开时由外层决定是否拆分）。
+fn strip_split(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != NO_SPLIT_ESCAPE && *c != SPLIT_ESCAPE)
         .collect()
+}
+
+/// 标记感知的 IFS 词分割：仅 `SPLIT_ESCAPE` 区间（未加引号展开）参与拆分。
+fn split_marked(s: &str, ifs: &str) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut splittable = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            SPLIT_ESCAPE => {
+                splittable = !splittable;
+                continue;
+            }
+            NO_SPLIT_ESCAPE => continue,
+            GLOB_ESCAPE => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if splittable && ifs.contains(c) {
+            fields.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    fields.push(cur);
+    fields.into_iter().filter(|f| !f.is_empty()).collect()
+}
+
+/// 展开变量并去除词分割元数据（赋值/heredoc 等不做词分割的场景）。
+pub fn expand_vars_clean(s: &str, last_rc: i32) -> String {
+    unescape_glob(&expand_vars(s, last_rc))
 }
 
 /// 花括号展开：`{a,b}`、`{1..5}`、`{a..e}`（引号内不展开）。
@@ -232,10 +263,15 @@ fn expand_range(spec: &str) -> Option<Vec<String>> {
 pub fn expand_vars(s: &str, last_rc: i32) -> String {
     let mut result = String::new();
     let mut chars = s.chars().peekable();
+    let mut split_next = false;
 
     while let Some(c) = chars.next() {
-        if c == NO_SPLIT_ESCAPE || c == SPLIT_ESCAPE {
-            // 引号/分割元数据标记：跳过，展开照常
+        if c == NO_SPLIT_ESCAPE {
+            split_next = false;
+            continue;
+        }
+        if c == SPLIT_ESCAPE {
+            split_next = true;
             continue;
         }
         if c == GLOB_ESCAPE {
@@ -250,6 +286,7 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
             continue;
         }
         if c == '$' {
+            let start = result.len();
             match chars.peek() {
                 Some('{') => {
                     chars.next();
@@ -341,6 +378,15 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                     result.push('$');
                 }
             }
+            if split_next && result.len() > start {
+                // 未加引号的展开：包裹分割标记，供词分割阶段识别区间
+                let val: String = result[start..].to_string();
+                result.truncate(start);
+                result.push(SPLIT_ESCAPE);
+                result.push_str(&val);
+                result.push(SPLIT_ESCAPE);
+            }
+            split_next = false;
         } else {
             result.push(c);
         }
@@ -408,14 +454,14 @@ fn expand_braced(spec: &str, last_rc: i32) -> String {
             match op {
                 ":-" => {
                     return if val.is_empty() {
-                        expand_vars(arg, last_rc)
+                        expand_vars(&strip_split(arg), last_rc)
                     } else {
                         val
                     };
                 }
                 ":=" => {
                     return if val.is_empty() {
-                        let v = expand_vars(arg, last_rc);
+                        let v = expand_vars(&strip_split(arg), last_rc);
                         // SAFETY: shell 单线程
                         unsafe {
                             std::env::set_var(name, &v);
@@ -444,7 +490,7 @@ fn expand_braced(spec: &str, last_rc: i32) -> String {
                     return if val.is_empty() {
                         String::new()
                     } else {
-                        expand_vars(arg, last_rc)
+                        expand_vars(&strip_split(arg), last_rc)
                     };
                 }
                 "##" => return remove_prefix(&val, &unescape_glob(arg), true),
@@ -459,7 +505,7 @@ fn expand_braced(spec: &str, last_rc: i32) -> String {
                         let (p, r) = arg.split_once('/').unwrap_or((arg, ""));
                         (p, r, false)
                     };
-                    let rep = expand_vars(rep, last_rc);
+                    let rep = expand_vars(&strip_split(rep), last_rc);
                     return if all {
                         val.replace(pat, &rep)
                     } else {
@@ -1141,6 +1187,8 @@ pub fn unescape_glob(s: &str) -> String {
 /// 引号/反斜杠保护的元字符（带 `GLOB_ESCAPE` 标记）按字面匹配；
 /// 无活跃通配符时返回空 Vec（调用方保留原词并 unescape）。
 pub fn expand_glob(s: &str) -> Vec<String> {
+    let cleaned = strip_split(s);
+    let s = cleaned.as_str();
     if !has_active_glob(s) {
         return Vec::new();
     }
@@ -1844,5 +1892,24 @@ mod tests {
             let n: u32 = out.parse().expect("$RANDOM 应为数字");
             assert!(n < 65536, "$RANDOM 越界: {}", n);
         }
+    }
+
+    #[test]
+    fn mixed_quote_field_split() {
+        unsafe { std::env::set_var("RBOX_T_MIX", "1 2") };
+        // 未加引号展开参与拆分；引号部分保留
+        assert_eq!(
+            expand_word(&format!("ab c{}$RBOX_T_MIX", SPLIT_ESCAPE), 0),
+            vec!["ab c1", "2"]
+        );
+        // 双引号内展开不拆分（前后字面保留）
+        assert_eq!(
+            expand_word(
+                &format!("pre{}$RBOX_T_MIX{}suf", NO_SPLIT_ESCAPE, NO_SPLIT_ESCAPE),
+                0
+            ),
+            vec!["pre1 2suf"]
+        );
+        unsafe { std::env::remove_var("RBOX_T_MIX") };
     }
 }

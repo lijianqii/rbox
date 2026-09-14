@@ -388,6 +388,7 @@ OUT=$(timeout 400 bash -c '
   printf "sleep 3 & jobs -p; kill %%+\n"; sleep 0.8
   printf "set -b; echo \"notify:\$-\"; set +b\n"; sleep 0.5
   printf "readonly RO3=9; readonly -p\n"; sleep 0.5
+  printf "z2=\"1 2\"; printf \"[%%s]\" a\"b c\"\$z2; echo\n"; sleep 0.6
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -684,6 +685,7 @@ assert_line "ignoreeof 后 shell 存活" "EOF_GUARD_OK"
 assert_line_regex "jobs -p 输出 PID" "^[0-9]+$"
 assert_line "set -b 反映到 \$-" "notify:b"
 assert_contains "readonly -p 引号格式" "readonly RO3='9'"
+assert_line "混合引号词分割（ash 一致）" "[ab c1][2]"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"
