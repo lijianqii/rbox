@@ -398,6 +398,15 @@ OUT=$(timeout 400 bash -c '
   printf "( echo ps3; echo ps4 ) | cat\n"; sleep 0.7
   printf "v9=5; echo hi | ( echo \"env:\$v9\" )\n"; sleep 0.7
   printf "x9=1; export x9; export -n x9; echo \"x9:\$x9\"; env | grep \"^x9=\" || echo x9_not_exported\n"; sleep 0.7
+  # 10.15 REPL 函数定义（单行/多行/尾随命令）
+  printf "fr1() { echo RF1_OK; }\n"; sleep 0.5
+  printf "fr1\n"; sleep 0.5
+  printf "fr2() {\n"; sleep 0.4
+  printf " echo RF2_A\n"; sleep 0.4
+  printf " echo RF2_B\n"; sleep 0.4
+  printf "}\n"; sleep 0.5
+  printf "fr2\n"; sleep 0.5
+  printf "fr3() { echo RF3_OK; }; fr3\n"; sleep 0.6
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -704,6 +713,10 @@ assert_line "管道段子 shell（前置）" "ps3"
 assert_line "子 shell 段继承环境变量" "env:5"
 assert_line "export -n 保留 shell 变量" "x9:1"
 assert_line "export -n 后子进程不可见" "x9_not_exported"
+assert_line "REPL 单行函数定义" "RF1_OK"
+assert_line "REPL 多行函数定义（一）" "RF2_A"
+assert_line "REPL 多行函数定义（二）" "RF2_B"
+assert_line "REPL 函数定义 + 尾随命令" "RF3_OK"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

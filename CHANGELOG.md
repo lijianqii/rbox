@@ -39,6 +39,7 @@
   重新 `export` 可移回环境
 - 管道段子 shell 继承函数/别名/位置参数（状态编码经 `--subshell` 参数传递）；
   函数定义可出现在 `;` 之后（`x=7; f() { ...; }; f`）
+- 交互 REPL 支持函数定义（单行 `f() { ...; }`、多行 `f() {` … `}`、`f() { ...; }; f`）
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -73,7 +74,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 793 个、QEMU 集成断言 257 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 793 个、QEMU 集成断言 261 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

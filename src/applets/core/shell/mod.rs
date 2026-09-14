@@ -494,6 +494,9 @@ impl Shell {
         // 复合命令（if/for/while）累积状态：block_depth > 0 表示块未闭合
         let mut block_lines: Vec<String> = Vec::new();
         let mut block_depth: i32 = 0;
+        // 函数定义累积状态（REPL）：func_depth > 0 表示函数体未闭合
+        let mut func_lines: Vec<String> = Vec::new();
+        let mut func_depth: i32 = 0;
 
         // raw mode guard（终端时启用，管道时为 None）
         let _raw_guard = enable_raw_mode();
@@ -575,6 +578,43 @@ impl Shell {
                     }
 
                     // 复合命令（if/for/while）：累积到完整块后整体执行
+                    // 函数定义（REPL）：单行/多行累积后 define
+                    if func_depth > 0 || script::parse_function_header(&full_line).is_some() {
+                        func_lines.push(full_line.clone());
+                        func_depth += script::brace_delta(&full_line);
+                        if func_depth > 0 {
+                            let _ = write!(io::stdout(), "{}", make_continuation_prompt());
+                            let _ = io::stdout().flush();
+                            continue;
+                        }
+                        let mut tail_opt: Option<String> = None;
+                        if let Some((name, body, _, tail)) =
+                            script::collect_function(&func_lines[0], &func_lines[1..])
+                        {
+                            functions::define(&name, &body);
+                            tail_opt = tail;
+                        }
+                        func_lines.clear();
+                        func_depth = 0;
+                        if let Some(t) = tail_opt
+                            && !t.trim().is_empty()
+                        {
+                            last_rc =
+                                script::run_interactive_line(&t, last_rc, &history, &|rc: i32| {
+                                    let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
+                                    let _ = io::stdout().flush();
+                                    run_exit_trap(&history, rc);
+                                    std::process::exit(rc);
+                                });
+                        }
+                        if history.last() != Some(&full_line) {
+                            history.push(full_line.clone());
+                            append_history(&full_line);
+                        }
+                        let _ = write!(io::stdout(), "{}", make_prompt(&pending_line));
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
                     if block_depth > 0 || compound::is_compound_start(&full_line) {
                         block_depth += compound::nesting_delta(&full_line);
                         block_lines.push(full_line.clone());

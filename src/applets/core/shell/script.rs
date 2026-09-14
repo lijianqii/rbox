@@ -941,7 +941,7 @@ fn paren_delta(line: &str) -> i32 {
 }
 
 /// 行内独立 `{`/`}` 记号深度增量。
-fn brace_delta(line: &str) -> i32 {
+pub(crate) fn brace_delta(line: &str) -> i32 {
     let mut depth = 0;
     for tok in line.split(|c: char| c.is_whitespace() || c == ';') {
         match tok {
