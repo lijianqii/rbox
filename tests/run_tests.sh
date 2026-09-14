@@ -397,6 +397,7 @@ OUT=$(timeout 400 bash -c '
   printf "echo ps1 | ( cat; echo ps2 )\n"; sleep 0.7
   printf "( echo ps3; echo ps4 ) | cat\n"; sleep 0.7
   printf "v9=5; echo hi | ( echo \"env:\$v9\" )\n"; sleep 0.7
+  printf "x9=1; export x9; export -n x9; echo \"x9:\$x9\"; env | grep \"^x9=\" || echo x9_not_exported\n"; sleep 0.7
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -701,6 +702,8 @@ assert_line "wait -n 返回首个完成作业" "wn:0"
 assert_line "管道段子 shell（后置）" "ps2"
 assert_line "管道段子 shell（前置）" "ps3"
 assert_line "子 shell 段继承环境变量" "env:5"
+assert_line "export -n 保留 shell 变量" "x9:1"
+assert_line "export -n 后子进程不可见" "x9_not_exported"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

@@ -590,6 +590,9 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
         "0" => return super::params::get0(),
         _ => {}
     }
+    if let Some(v) = super::builtin::unexported_var(name) {
+        return v;
+    }
     if let Ok(n) = name.parse::<usize>() {
         return match super::params::get(n.saturating_sub(1)) {
             Some(v) => v,

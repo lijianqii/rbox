@@ -289,6 +289,33 @@ pub(crate) fn init_pwd() {
     }
 }
 
+/// 未导出变量：`export -n` 后保留在 shell 内，不传给子进程。
+static UNEXPORTED: std::sync::Mutex<Option<std::collections::HashMap<String, String>>> =
+    std::sync::Mutex::new(None);
+
+/// 查询未导出变量值。
+pub(crate) fn unexported_var(name: &str) -> Option<String> {
+    UNEXPORTED
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|map| map.get(name).cloned()))
+}
+
+/// 记录（Some）或移除（None）未导出变量。
+pub(crate) fn set_unexported(name: &str, val: Option<String>) {
+    if let Ok(mut m) = UNEXPORTED.lock() {
+        let map = m.get_or_insert_with(std::collections::HashMap::new);
+        match val {
+            Some(v) => {
+                map.insert(name.to_string(), v);
+            }
+            None => {
+                map.remove(name);
+            }
+        }
+    }
+}
+
 /// 设置环境变量（shell 单线程）。
 fn setenv(k: &str, v: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: shell 单线程
@@ -413,6 +440,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Done
         }
         "export" => {
+            let mut unexport = false;
             for arg in &cmd.argv[1..] {
                 if arg == "-p" {
                     let mut vars: Vec<(String, String)> = std::env::vars().collect();
@@ -422,14 +450,42 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                     }
                     continue;
                 }
+                if arg == "-n" {
+                    unexport = true;
+                    continue;
+                }
                 if let Some(eq) = arg.find('=') {
                     let (k, v) = arg.split_at(eq);
+                    let val = v[1..].to_string();
+                    if unexport {
+                        set_unexported(k, Some(val));
+                        // SAFETY: single-threaded shell
+                        unsafe {
+                            std::env::remove_var(k);
+                        }
+                    } else {
+                        set_unexported(k, None);
+                        // SAFETY: single-threaded shell
+                        unsafe {
+                            std::env::set_var(k, &val);
+                        }
+                    }
+                } else if unexport {
+                    if let Ok(val) = std::env::var(arg) {
+                        set_unexported(arg, Some(val));
+                        // SAFETY: single-threaded shell
+                        unsafe {
+                            std::env::remove_var(arg);
+                        }
+                    }
+                } else if let Some(val) = unexported_var(arg) {
+                    // 重新 export：未导出变量移回环境
+                    set_unexported(arg, None);
                     // SAFETY: single-threaded shell
                     unsafe {
-                        std::env::set_var(k, &v[1..]);
+                        std::env::set_var(arg, &val);
                     }
                 }
-                // `export VAR`（无 =）：变量已在环境中即为导出，no-op
             }
             *last_rc = 0;
             BuiltinResult::Done
@@ -450,6 +506,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 } else if is_readonly(arg) {
                     eprintln!("unset: {}: is read only", arg);
                 } else {
+                    set_unexported(arg, None);
                     // SAFETY: single-threaded shell
                     unsafe {
                         std::env::remove_var(arg);
@@ -1683,5 +1740,23 @@ mod tests {
         // 回到起点，避免影响其他测试
         let _ = std::env::set_current_dir(&start);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn export_n_keeps_shell_var() {
+        let mut rc = 0;
+        try_builtin(&make_cmd(&["export", "RBOX_T_EXP=7"]), &mut rc, &[]);
+        assert_eq!(std::env::var("RBOX_T_EXP").unwrap(), "7");
+        try_builtin(&make_cmd(&["export", "-n", "RBOX_T_EXP"]), &mut rc, &[]);
+        assert!(std::env::var("RBOX_T_EXP").is_err());
+        assert_eq!(unexported_var("RBOX_T_EXP").as_deref(), Some("7"));
+        // 重新 export 回到环境
+        try_builtin(&make_cmd(&["export", "RBOX_T_EXP"]), &mut rc, &[]);
+        assert_eq!(std::env::var("RBOX_T_EXP").unwrap(), "7");
+        assert!(unexported_var("RBOX_T_EXP").is_none());
+        set_unexported("RBOX_T_EXP", None);
+        unsafe {
+            std::env::remove_var("RBOX_T_EXP");
+        }
     }
 }
