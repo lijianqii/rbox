@@ -818,6 +818,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                     || cmd.stdout_file.is_some()
                     || cmd.stderr_file.is_some()
                     || !cmd.dup_fds.is_empty()
+                    || !cmd.fd_redirects.is_empty()
                 {
                     super::executor::persist_builtin_redirects();
                 }
