@@ -1213,7 +1213,7 @@ fn execute_pipeline(pipeline: &Pipeline, cmdline: &str) -> i32 {
             let pgid = first.id() as i32;
             params::set_last_bg(pgid);
             let id = jobs::add_job(pgid, cmdline, jobs::JobState::Running);
-            if id > 0 {
+            if id > 0 && super::options::monitor() {
                 println!("[{}] {}", id, pgid);
             }
         }

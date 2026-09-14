@@ -54,15 +54,17 @@ pub fn is_builtin(name: &str) -> bool {
 
 /// 取下一个输入字节：优先消费前台命令监控线程缓存的 pending 队列，
 /// 再读 fd 0（否则 `read` 会与监控线程抢输入）。
-fn next_input_byte() -> Option<u8> {
-    if let Ok(mut q) = super::executor::pending_stdin().lock()
+/// 从指定 fd 取下一个输入字节（`read -u FD`；默认 fd 0）。
+fn next_input_byte_fd(fd: i32) -> Option<u8> {
+    if fd == libc::STDIN_FILENO
+        && let Ok(mut q) = super::executor::pending_stdin().lock()
         && let Some(b) = q.pop_front()
     {
         return Some(b);
     }
     loop {
         let mut b = [0u8; 1];
-        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
         if n == 1 {
             return Some(b[0]);
         }
@@ -76,6 +78,8 @@ fn next_input_byte() -> Option<u8> {
 /// `read` 选项。
 #[derive(Debug, Default, Clone)]
 struct ReadOpts {
+    /// 输入 fd（`read -u FD`，默认 0）。
+    fd: i32,
     raw: bool,
     silent: bool,
     timeout: Option<u64>,
@@ -106,7 +110,7 @@ fn wait_input(timeout: Option<u64>) -> bool {
 
 /// 从 stdin 读一行（带选项）。返回 (内容, 是否正常结束)。
 fn read_line_from_stdin(opts: &ReadOpts) -> (String, bool) {
-    let fd = libc::STDIN_FILENO;
+    let fd = opts.fd;
     let tty = unsafe { libc::isatty(fd) } == 1;
     if tty && let Some(p) = &opts.prompt {
         let _ = std::io::Write::write_all(&mut std::io::stdout(), p.as_bytes());
@@ -115,7 +119,7 @@ fn read_line_from_stdin(opts: &ReadOpts) -> (String, bool) {
     let echo = tty && !opts.silent;
     let mut bytes: Vec<u8> = Vec::new();
     let mut complete = false;
-    while let Some(c) = next_input_byte() {
+    while let Some(c) = next_input_byte_fd(fd) {
         if !wait_input(opts.timeout) {
             break; // 超时：返回已读内容
         }
@@ -599,6 +603,17 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                             }
                         }
                     }
+                    "-u" => {
+                        i += 1;
+                        match args.get(i).and_then(|v| v.parse::<i32>().ok()) {
+                            Some(fd) => opts.fd = fd,
+                            None => {
+                                eprintln!("read: option -u requires an argument");
+                                *last_rc = 2;
+                                return BuiltinResult::Done;
+                            }
+                        }
+                    }
                     "-d" => {
                         i += 1;
                         match args.get(i).and_then(|v| v.as_bytes().first().copied()) {
@@ -766,6 +781,10 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         "wait" => {
             jobs::reap_children();
             let specs: Vec<String> = cmd.argv[1..].to_vec();
+            if specs.first().map(String::as_str) == Some("-n") {
+                *last_rc = jobs::wait_any();
+                return BuiltinResult::Done;
+            }
             if specs.is_empty() {
                 *last_rc = jobs::wait_all();
             } else {

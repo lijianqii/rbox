@@ -276,6 +276,40 @@ pub(crate) fn wait_all() -> i32 {
 }
 
 /// `jobs` 输出行（show_pid 时附 PID）。
+/// 表中运行中作业的 pgid（跳过已停止作业，避免 `wait -n` 永久阻塞）。
+pub(crate) fn all_pgids() -> Vec<i32> {
+    table()
+        .lock()
+        .map(|t| {
+            t.iter()
+                .filter(|j| matches!(j.state, JobState::Running))
+                .map(|j| j.pgid)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 等待任一作业结束（`wait -n`）；返回其退出码，无作业返回 127。
+pub(crate) fn wait_any() -> i32 {
+    // 先取作业集合：list() 会清理已退出项，需在清理前记录 pgid 以取回状态
+    let pgids = all_pgids();
+    if pgids.is_empty() {
+        return 127;
+    }
+    loop {
+        reap_children();
+        for pgid in &pgids {
+            if let Some(code) = take_status(*pgid) {
+                return code;
+            }
+        }
+        if pgids.iter().all(|p| !pgid_alive(*p)) {
+            return 127;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 pub(crate) fn format_lines(show_pid: bool) -> Vec<String> {
     list()
         .iter()

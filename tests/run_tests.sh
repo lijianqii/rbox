@@ -392,6 +392,7 @@ OUT=$(timeout 400 bash -c '
   printf "z2=\"1 2\"; printf \"[%%s]\" a\"b c\"\$z2; echo\n"; sleep 0.6
   printf "set -o > /tmp/o2.txt; grep braceexpand /tmp/o2.txt\n"; sleep 0.5
   printf "v=x; x=y; echo \"bad:\${!v}\"\n"; sleep 0.5
+  printf "sleep 1 & sleep 0.2 & wait -n; echo \"wn:\$?\"; wait\n"; sleep 1.6
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -692,6 +693,7 @@ assert_contains "readonly -p 引号格式" "readonly RO3='9'"
 assert_line "混合引号词分割（ash 一致）" "[ab c1][2]"
 assert_contains "set -o 含 braceexpand" "braceexpand"
 assert_contains "\${!v} 报 bad substitution" "bad substitution"
+assert_line "wait -n 返回首个完成作业" "wn:0"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"
