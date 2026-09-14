@@ -407,6 +407,12 @@ OUT=$(timeout 400 bash -c '
   printf "}\n"; sleep 0.5
   printf "fr2\n"; sleep 0.5
   printf "fr3() { echo RF3_OK; }; fr3\n"; sleep 0.6
+  # 10.16 read -u / exec fd 重定向（fd 生命周期）
+  printf "echo u1 > /tmp/uu.txt\n"; sleep 0.4
+  printf "read -u 3 a 3< /tmp/uu.txt; echo \"du:[\$a]\"\n"; sleep 0.6
+  printf "exec 3< /tmp/uu.txt\n"; sleep 0.5
+  printf "read -u 3 b\n"; sleep 0.5
+  printf "echo \"dc:[\$b]\"; exec 3<&-\n"; sleep 0.6
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -717,6 +723,8 @@ assert_line "REPL 单行函数定义" "RF1_OK"
 assert_line "REPL 多行函数定义（一）" "RF2_A"
 assert_line "REPL 多行函数定义（二）" "RF2_B"
 assert_line "REPL 函数定义 + 尾随命令" "RF3_OK"
+assert_line "read -u 命令内 fd 重定向" "du:[u1]"
+assert_line "exec 3< 跨行持久化" "dc:[u1]"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

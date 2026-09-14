@@ -346,7 +346,9 @@ impl Drop for BuiltinRedirectGuard {
         if PERSIST_REDIRECTS.swap(false, Ordering::SeqCst) {
             unsafe {
                 for (saved, _) in self.saved_dups.drain(..) {
-                    libc::close(saved);
+                    if saved >= 0 {
+                        libc::close(saved);
+                    }
                 }
                 if let Some(fd) = self.saved_out.take() {
                     libc::close(fd);
@@ -362,8 +364,12 @@ impl Drop for BuiltinRedirectGuard {
         }
         unsafe {
             for (saved, from) in self.saved_dups.iter().rev() {
-                libc::dup2(*saved, *from);
-                libc::close(*saved);
+                if *saved >= 0 {
+                    libc::dup2(*saved, *from);
+                    libc::close(*saved);
+                } else {
+                    libc::close(*from);
+                }
             }
             self.saved_dups.clear();
             for (saved, fd) in self.saved_closes.iter().rev() {
@@ -469,6 +475,21 @@ pub(crate) fn apply_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectG
         }
     }
 
+    // 文件 fd 迁移到高位：目标 fd 关闭时 open 可能恰好占用目标 fd 本身，
+    // 会使 dup2 成为空操作、并在 File drop 时关闭目标 fd
+    let extra_files: Vec<(u8, std::fs::File)> = extra_files
+        .into_iter()
+        .map(|(fd, f)| {
+            use std::os::unix::io::FromRawFd;
+            let new_fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 10) };
+            if new_fd >= 0 {
+                (fd, unsafe { std::fs::File::from_raw_fd(new_fd) })
+            } else {
+                (fd, f)
+            }
+        })
+        .collect();
+
     let mut guard = BuiltinRedirectGuard {
         saved_in: None,
         saved_out: None,
@@ -513,7 +534,8 @@ pub(crate) fn apply_redirects(cmd: &SimpleCmd) -> Result<Option<BuiltinRedirectG
         for (fd, f) in &extra_files {
             let fd = *fd as i32;
             let saved = libc::dup(fd);
-            if saved >= 0 && libc::dup2(f.as_raw_fd(), fd) >= 0 {
+            // saved < 0 表示目标 fd 原先关闭：Drop 时恢复为关闭
+            if libc::dup2(f.as_raw_fd(), fd) >= 0 {
                 guard.saved_dups.push((saved, fd));
             } else if saved >= 0 {
                 libc::close(saved);
