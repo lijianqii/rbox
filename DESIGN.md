@@ -426,7 +426,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、251 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、252 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -468,7 +468,7 @@ enum Token {
 | rescue 启动降级 | target Requires 失败 → 停止服务进 rescue shell | 4 |
 | 持久盘模式 | switch_root、写入、重启后数据保留 | 3 |
 | Shell: ash 对齐与覆盖补齐 | 子 shell/花括号组/`!`/反引号/`:`/readonly/getopts/ulimit、位运算与三元、参数子串、`for` 无 in、复合重定向、任意 fd/`<>`/`>|`、noclobber、`$-`/`set -o`/`$RANDOM`/`set -f`、CDPATH、`cd -L/-P`、`pwd -P`、`kill %job`/`kill -l` 表格、`&&`/`||` 组、`$ENV`、ignoreeof（Ctrl-D） | 44 |
-| **合计** | | **251** |
+| **合计** | | **252** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -854,7 +854,7 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 ### 测试覆盖
 
-集成测试共 41 个测试组、251 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 41 个测试组、252 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
@@ -914,7 +914,7 @@ make unittest
 | core/* | rservice 3、status 2、log 4、shutdown 1、reboot 1、control 3、rgetty 11、rlogin 12 | 37 |
 | proc / glob / fstab（共享工具） | 进程信息收集/单位格式化；glob 匹配；fstab 解析 | 15 |
 | main | applet 注册表唯一性/查找/--help 处理 | 7 |
-| **合计** | | **764** |
+| **合计** | | **252** |
 
 测试结果示例：
 
