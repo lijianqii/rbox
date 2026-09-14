@@ -472,13 +472,27 @@ enum Token {
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
-**已知限制**：
-- Ctrl-A 被 QEMU `-nographic` 截获，自动化测试无法覆盖
-- 不支持进程替换 `<()`/`>()`；`cmd | ( ... )` 管道中的子 shell 段不支持（`cmd && ( ... )`、`cmd || { ...; }` 支持）
-- 无数组、无 `declare`/`typeset`、无 `set -a` 之外的 `set -o posix` 兼容项
-- 词分割为近似实现：混合引号与未引号展开的同一词按保守策略不拆分
-- 交互体验：无 Ctrl-R 历史搜索、kill ring/撤销；补全无变量/选项补全
-- 命令替换内为子进程语义：内置命令（cd/export 等）在 `$()` 内不生效
+**已知限制**（按性质分类）：
+
+*非缺口（BusyBox ash 本身不支持，属对齐目标之外）*：
+- 进程替换 `<()`/`>()`（bash/ksh 扩展，ash 无）
+- 数组、`declare`/`typeset`、`[[ ]]`、`${var//pat/rep}`（bash 扩展，ash 无）
+- Ctrl-R 反向历史搜索、kill ring/撤销（BusyBox ash 行编辑无此功能；ash 支持
+  Ctrl-A/E/K/U/W、上下键历史、Tab 补全）
+- Ctrl-A 被 QEMU `-nographic` 截获（测试基础设施限制，交互式 `make run` 正常）
+
+*POSIX 语义说明（非缺陷）*：
+- 命令替换 `$()` 在子 shell 中执行，其中的 `cd`/变量赋值不影响父 shell（POSIX 规定）
+
+*真实缺口（ash/POSIX 支持，本实现暂缺，已列入后续计划）*：
+- `cmd | ( ... )`：管道段中的子 shell。`&&`/`||` + 组已支持；管道段需要 fork 型
+  stage（`std::process::Child` 与手工 fork 混合、管道 fd 手工接线、作业控制登记），
+  计划把 `execute_pipeline` 的 children 抽象为
+  `enum Stage { Spawned(Child), Forked(pid) }` 后实现
+- 混合引号/展开词的分割精度：`z="1 2"; printf "[%s]" a"b c"$z` 当前拆成
+  `[ab][c1][2]`，bash/ash 为 `[ab c1][2]`（只有未加引号的展开才参与 IFS 拆分）。
+  修复方案：`expand_vars` 对未加引号展开值包裹 `SPLIT_ESCAPE` 标记，拆分时仅处理
+  标记区间；同步让 `expand_glob` 忽略元数据标记、赋值路径使用去标记包装
 
 ### 终端模式（Tab 补全的前提）
 
