@@ -343,6 +343,7 @@ pub(crate) fn run_source(
                         || t.starts_with('{')
                         || t.starts_with("! ")
                         || starts_compound_keyword(t)
+                        || parse_function_header(t).is_some()
                     {
                         split_at = Some(idx);
                         break;
@@ -354,7 +355,16 @@ pub(crate) fn run_source(
                     if !head.trim().is_empty() {
                         last_rc = execute_line(&head, &mut last_rc, history, exit_fn);
                     }
-                    line = tail;
+                    // 尾段是函数定义：先定义，再执行其后的命令
+                    if let Some((name, body, consumed, ftail)) =
+                        collect_function(&tail, &lines[i..])
+                    {
+                        functions::define(&name, &body);
+                        i += consumed;
+                        line = ftail.unwrap_or_default();
+                    } else {
+                        line = tail;
+                    }
                 }
             }
         }
@@ -745,6 +755,7 @@ pub(crate) fn run_interactive_line(
                     || t.starts_with('{')
                     || t.starts_with("! ")
                     || starts_compound_keyword(t)
+                    || parse_function_header(t).is_some()
                 {
                     split_at = Some(idx);
                     break;

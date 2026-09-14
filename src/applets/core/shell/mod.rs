@@ -16,18 +16,18 @@
 //! - Ctrl-C SIGINT 转发：中断前台运行命令而不退出 shell。
 //! - `~` 展开。
 
-mod alias;
+pub(crate) mod alias;
 pub(crate) mod builtin;
 mod completion;
 mod compound;
 mod executor;
 mod expander;
-mod functions;
+pub(crate) mod functions;
 #[cfg(test)]
 mod fuzz;
 mod jobs;
 mod options;
-mod params;
+pub(crate) mod params;
 mod parser;
 mod reader;
 pub(crate) mod script;

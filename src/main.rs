@@ -30,6 +30,34 @@ fn run_builtin_subprocess(args: &[String]) -> ExitCode {
     ExitCode::from(rc as u8)
 }
 
+/// 恢复 `--subshell` 子进程的 shell 状态（函数/别名/位置参数）。
+fn restore_subshell_state(state: &str) {
+    use crate::applets::core::shell::{alias, functions, params};
+    let mut parts = state.split('\x1d');
+    let defs = parts.next().unwrap_or("");
+    for entry in defs.split('\x1e') {
+        if entry.is_empty() {
+            continue;
+        }
+        let mut f = entry.splitn(3, '\x1f');
+        let kind = f.next().unwrap_or("");
+        let name = f.next().unwrap_or("");
+        let body = f.next().unwrap_or("");
+        match kind {
+            "F" => functions::define(name, body),
+            "A" => {
+                let _ = alias::set_alias(name, body);
+            }
+            _ => {}
+        }
+    }
+    if let Some(ps) = parts.next()
+        && !ps.is_empty()
+    {
+        params::set(ps.split('\x1f').map(str::to_string).collect());
+    }
+}
+
 fn main() -> ExitCode {
     // PID 1 崩溃保护：panic → abort 会导致 PID 1 死亡（kernel panic），
     // 这里把 panic 信息写一行到 /dev/kmsg，便于事后从 dmesg/console 定位死因。
@@ -70,7 +98,10 @@ fn main() -> ExitCode {
             "--builtin" => return run_builtin_subprocess(&raw_args[2..]),
             // 隐藏模式：管道段中的子 shell（`cmd | ( ... )`）
             "--subshell" => {
-                let src = raw_args[2..].join(" ");
+                let src = raw_args.get(2).cloned().unwrap_or_default();
+                if let Some(state) = raw_args.get(3) {
+                    restore_subshell_state(state);
+                }
                 let rc = crate::applets::core::shell::script::run_source(
                     &src,
                     &[],

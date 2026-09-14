@@ -17,6 +17,14 @@ pub(crate) fn define(name: &str, body: &str) {
 }
 
 /// 取函数体。
+/// 全部函数（name, body），用于子 shell 状态传递。
+pub(crate) fn all_pairs() -> Vec<(String, String)> {
+    functions()
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn get(name: &str) -> Option<String> {
     functions().lock().ok()?.get(name).cloned()
 }

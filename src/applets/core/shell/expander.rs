@@ -25,6 +25,19 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
             new_argv.push(exe);
             new_argv.push("--subshell".to_string());
             new_argv.push(inner);
+            // 传递函数/别名/位置参数（\x1e 分隔条目，\x1f 分隔字段，\x1d 分隔参数段）
+            let mut state = String::new();
+            for (n, b) in super::functions::all_pairs() {
+                state.push_str(&format!("F\x1f{}\x1f{}", n, b));
+                state.push('\x1e');
+            }
+            for (n, v) in super::alias::all_pairs() {
+                state.push_str(&format!("A\x1f{}\x1f{}", n, v));
+                state.push('\x1e');
+            }
+            state.push('\x1d');
+            state.push_str(&super::params::all().join("\x1f"));
+            new_argv.push(state);
         } else {
             for arg in &cmd.argv {
                 new_argv.extend(expand_word(arg, last_rc));

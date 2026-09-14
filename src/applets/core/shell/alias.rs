@@ -36,6 +36,14 @@ pub(crate) fn unalias(name: &str) {
 }
 
 /// 查询别名。
+/// 全部别名（name, value），用于子 shell 状态传递。
+pub(crate) fn all_pairs() -> Vec<(String, String)> {
+    aliases()
+        .lock()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn get_alias(name: &str) -> Option<String> {
     aliases().lock().ok()?.get(name).cloned()
 }

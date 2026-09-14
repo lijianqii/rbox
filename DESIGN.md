@@ -486,7 +486,8 @@ enum Token {
 
 *真实缺口（ash/POSIX 支持，本实现暂缺，已列入后续计划）*：
 - 管道段子 shell `cmd | ( ... )` 已实现（`rbox --subshell` 子进程 + tokenizer 整体捕获
-  `( ... )`）；子进程继承环境变量/cwd/umask，但不继承函数/别名/位置参数
+  `( ... )`）；子进程继承环境变量/cwd/umask，函数/别名/位置参数经状态编码参数传递
+  （`\x1e`/`\x1f`/`\x1d` 分隔），已与 ash 实测一致；交互 REPL 内暂不支持函数定义
 
 - 混合引号词分割已按 POSIX 修复：`expand_vars` 对未加引号展开值包裹 `SPLIT_ESCAPE`
   标记，`split_marked` 仅拆分标记区间；tokenizer 在双引号结束处补边界标记，
