@@ -352,6 +352,18 @@ fn append_history(line: &str) {
     }
 }
 
+/// 加载 $ENV（POSIX 交互式启动文件）；返回是否加载。
+pub(crate) fn load_env_file(rc: &mut i32, history: &mut [String]) -> bool {
+    if let Ok(env_file) = std::env::var("ENV")
+        && !env_file.is_empty()
+        && std::path::Path::new(&env_file).exists()
+    {
+        source_file(&env_file, rc, history);
+        return true;
+    }
+    false
+}
+
 /// 执行 source 命令：逐行读取文件并执行。
 fn source_file(path: &str, last_rc: &mut i32, history: &mut [String]) -> i32 {
     let content = match std::fs::read_to_string(path) {
@@ -452,6 +464,7 @@ impl Shell {
         }
 
         // 加载 profile（路径可配置；默认 /etc/profile）
+        builtin::init_pwd();
         let profile_path = &crate::config::load().paths.profile;
         let mut boot_rc: i32 = 0;
         let mut boot_history: Vec<String> = Vec::new();
@@ -459,12 +472,7 @@ impl Shell {
             source_file(profile_path, &mut boot_rc, &mut boot_history);
         }
         // $ENV：POSIX 交互式 shell 启动文件
-        if let Ok(env_file) = std::env::var("ENV")
-            && !env_file.is_empty()
-            && std::path::Path::new(&env_file).exists()
-        {
-            source_file(&env_file, &mut boot_rc, &mut boot_history);
-        }
+        let _ = load_env_file(&mut boot_rc, &mut boot_history);
 
         // 交互式启动文件：$HOME/.profile（若存在且与 /etc/profile 不同）
         if let Ok(home) = std::env::var("HOME") {
@@ -858,6 +866,29 @@ fn run_exit_trap(history: &[String], last_rc: i32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_file_is_sourced() {
+        let path = format!("/tmp/rbox_env_test_{}", std::process::id());
+        std::fs::write(&path, "RBOX_ENV_TEST=loaded\n").unwrap();
+        // SAFETY: 单测串行（cargo test 默认多线程，使用唯一变量名降低干扰）
+        unsafe {
+            std::env::set_var("ENV", &path);
+            std::env::remove_var("RBOX_ENV_TEST");
+        }
+        let mut rc = 0;
+        let mut hist = Vec::new();
+        assert!(load_env_file(&mut rc, &mut hist));
+        assert_eq!(
+            std::env::var("RBOX_ENV_TEST").ok().as_deref(),
+            Some("loaded")
+        );
+        unsafe {
+            std::env::remove_var("ENV");
+            std::env::remove_var("RBOX_ENV_TEST");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
     use super::*;
 
     #[test]

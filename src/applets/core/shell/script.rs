@@ -213,6 +213,7 @@ pub(crate) fn run_source(
 ) -> i32 {
     // 脚本模式也需捕获 INT/TERM 以执行 trap（幂等）
     trap::install_handlers();
+    crate::applets::core::shell::builtin::init_pwd();
     let lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
     let mut i = 0;
     let mut last_rc = 0;
@@ -275,6 +276,21 @@ pub(crate) fn run_source(
             functions::define(&name, &body);
             i += consumed;
             continue;
+        }
+        // `cmd && ( ... )` / `cmd || { ...; }`：条件执行组
+        if let Some((op_pos, group_pos, is_and)) = find_operator_group(&line) {
+            let head = line[..op_pos].to_string();
+            let rc = if head.trim().is_empty() {
+                last_rc
+            } else {
+                execute_line(&head, &mut last_rc, history, exit_fn)
+            };
+            let run_group = if is_and { rc == 0 } else { rc != 0 };
+            line = if run_group {
+                line[group_pos..].to_string()
+            } else {
+                String::new()
+            };
         }
         // 顶层分号 + 复合关键字/子 shell：先执行前段，余下部分按复合命令处理
         {
@@ -531,6 +547,69 @@ fn split_top_level_semicolons(line: &str) -> Vec<String> {
     parts
 }
 
+/// 查找顶层 `&&`/`||` 后紧跟 `(`/`{` 的位置：返回 (op_pos, group_pos, is_and)。
+fn find_operator_group(line: &str) -> Option<(usize, usize, bool)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    let mut in_backtick = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_squote {
+            if c == b'\'' {
+                in_squote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_dquote {
+            if c == b'\\' {
+                i += 1;
+            } else if c == b'"' {
+                in_dquote = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_backtick {
+            if c == b'`' {
+                in_backtick = false;
+            } else if c == b'\\' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' => in_squote = true,
+            b'"' => in_dquote = true,
+            b'`' => in_backtick = true,
+            b'(' | b'{' => depth += 1,
+            b')' | b'}' => depth -= 1,
+            b'&' | b'|' if depth == 0 => {
+                let is_and = c == b'&';
+                let op_len = if bytes.get(i + 1) == Some(&c) { 2 } else { 0 };
+                if op_len == 2 {
+                    let mut j = i + 2;
+                    while bytes.get(j).is_some_and(|b| *b == b' ' || *b == b'\t') {
+                        j += 1;
+                    }
+                    if matches!(bytes.get(j), Some(b'(') | Some(b'{')) {
+                        return Some((i, j, is_and));
+                    }
+                }
+                i += op_len.max(1);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// 是否为复合命令起始关键字。
 fn starts_compound_keyword(t: &str) -> bool {
     let w = t.split_whitespace().next().unwrap_or("");
@@ -592,6 +671,20 @@ pub(crate) fn run_interactive_line(
 ) -> i32 {
     let mut line = line.to_string();
     let mut rc = last_rc;
+    if let Some((op_pos, group_pos, is_and)) = find_operator_group(&line) {
+        let head = line[..op_pos].to_string();
+        let r = if head.trim().is_empty() {
+            rc
+        } else {
+            execute_line(&head, &mut rc, history, exit_fn)
+        };
+        let run_group = if is_and { r == 0 } else { r != 0 };
+        line = if run_group {
+            line[group_pos..].to_string()
+        } else {
+            String::new()
+        };
+    }
     {
         let segments = split_top_level_semicolons(&line);
         if segments.len() > 1 {
@@ -1188,6 +1281,20 @@ mod tests {
         let rc = run_source(&src, &[], &|_| {}, false);
         assert_eq!(rc, 0);
         assert_eq!(read_filtered(&p), "IF\nW0\nW1");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn run_source_operator_group() {
+        let _g = test_guard();
+        let p = format!("/tmp/rbox_opgrp_{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let src = format!(
+            "true && ( echo AND >> {p} )\nfalse && ( echo BAD_AND >> {p} )\nfalse || ( echo OR >> {p} )\ntrue || ( echo BAD_OR >> {p} )\n"
+        );
+        let rc = run_source(&src, &[], &|_| {}, false);
+        assert_eq!(rc, 0);
+        assert_eq!(read_filtered(&p), "AND\nOR");
         let _ = std::fs::remove_file(&p);
     }
 }

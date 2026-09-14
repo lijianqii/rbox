@@ -227,6 +227,65 @@ fn mark_readonly(name: &str) {
     }
 }
 
+/// 文本规范化路径（逻辑路径：解析 `.` 与 `..`，不解析符号链接）。
+pub(crate) fn logical_normalize(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                if parts.last().is_some_and(|p| *p != "..") {
+                    parts.pop();
+                } else if !path.starts_with('/') {
+                    parts.push("..");
+                }
+            }
+            c => parts.push(c),
+        }
+    }
+    if path.starts_with('/') {
+        format!("/{}", parts.join("/"))
+    } else if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// 逻辑 PWD：$PWD 有效（与当前目录同一 inode）时返回，否则返回物理路径。
+pub(crate) fn logical_pwd() -> String {
+    if let Ok(p) = std::env::var("PWD")
+        && !p.is_empty()
+        && std::fs::metadata(&p).is_ok()
+        && same_file_as_cwd(&p)
+    {
+        return p;
+    }
+    std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "/".to_string())
+}
+
+/// $PWD 是否指向当前工作目录（同 dev+ino）。
+fn same_file_as_cwd(path: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(path), std::fs::metadata(".")) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// 启动时初始化 PWD（未设置或失效时写入物理路径）。
+pub(crate) fn init_pwd() {
+    let valid = std::env::var("PWD")
+        .ok()
+        .filter(|p| !p.is_empty() && std::fs::metadata(p).is_ok() && same_file_as_cwd(p))
+        .is_some();
+    if !valid && let Ok(cwd) = std::env::current_dir() {
+        setenv("PWD", cwd.to_string_lossy().as_ref());
+    }
+}
+
 /// 设置环境变量（shell 单线程）。
 fn setenv(k: &str, v: impl AsRef<std::ffi::OsStr>) {
     // SAFETY: shell 单线程
@@ -267,33 +326,15 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Exit
         }
         "cd" => {
-            let positional: Vec<&str> = cmd.argv[1..]
-                .iter()
-                .map(String::as_str)
-                .filter(|a| *a != "-P" && *a != "-L" && *a != "-e")
-                .collect();
-            // CDPATH：相对路径且非 . / .. 时搜索
-            if let Some(rel) = positional.first()
-                && !rel.starts_with('/')
-                && !rel.starts_with('.')
-                && !rel.starts_with('~')
-                && let Ok(cdpath) = std::env::var("CDPATH")
-            {
-                for dir in cdpath.split(':') {
-                    if dir.is_empty() {
-                        continue;
-                    }
-                    let cand = format!("{}/{}", dir, rel);
-                    if std::path::Path::new(&cand).is_dir()
-                        && std::env::set_current_dir(&cand).is_ok()
-                    {
-                        println!("{}", cand);
-                        if let Ok(new) = std::env::current_dir() {
-                            setenv("PWD", new.to_string_lossy().as_ref());
-                        }
-                        *last_rc = 0;
-                        return BuiltinResult::Done;
-                    }
+            // -P 物理路径（解析符号链接）；-L 逻辑路径（默认，保留 .. 文本语义）
+            let mut physical = false;
+            let mut positional: Vec<&str> = Vec::new();
+            for a in cmd.argv[1..].iter().map(String::as_str) {
+                match a {
+                    "-P" => physical = true,
+                    "-L" => physical = false,
+                    "-e" => {}
+                    _ => positional.push(a),
                 }
             }
             let target = match positional.first().copied() {
@@ -311,39 +352,59 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 Some(p) => p.to_string(),
                 None => std::env::var("HOME").unwrap_or_else(|_| "/".to_string()),
             };
-            let old = std::env::current_dir()
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned());
-            match std::env::set_current_dir(&target) {
-                Ok(()) => {
-                    if let Ok(new) = std::env::current_dir() {
-                        // SAFETY: shell 单线程
-                        unsafe {
-                            std::env::set_var("PWD", new.to_string_lossy().as_ref());
-                        }
+            // CDPATH：相对路径且非 . / .. 时依次尝试
+            let mut candidates: Vec<String> = Vec::new();
+            let relative =
+                !target.starts_with('/') && !target.starts_with('.') && !target.starts_with('~');
+            if relative && let Ok(cdpath) = std::env::var("CDPATH") {
+                for dir in cdpath.split(':') {
+                    if !dir.is_empty() {
+                        candidates.push(format!("{}/{}", dir, target));
                     }
-                    if let Some(o) = old {
-                        unsafe {
-                            std::env::set_var("OLDPWD", o);
-                        }
-                    }
-                    *last_rc = 0;
-                }
-                Err(e) => {
-                    eprintln!("cd: {}: {}", target, e);
-                    *last_rc = 1;
                 }
             }
+            candidates.push(target.clone());
+            let old_pwd = logical_pwd();
+            for cand in &candidates {
+                if std::env::set_current_dir(cand).is_ok() {
+                    if *cand != target {
+                        println!("{}", cand);
+                    }
+                    let new_pwd = if physical {
+                        std::env::current_dir()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| cand.clone())
+                    } else {
+                        let joined = if cand.starts_with('/') {
+                            cand.clone()
+                        } else {
+                            format!("{}/{}", old_pwd.trim_end_matches('/'), cand)
+                        };
+                        logical_normalize(&joined)
+                    };
+                    setenv("PWD", &new_pwd);
+                    setenv("OLDPWD", &old_pwd);
+                    *last_rc = 0;
+                    return BuiltinResult::Done;
+                }
+            }
+            eprintln!("cd: {}: No such file or directory", target);
+            *last_rc = 1;
             BuiltinResult::Done
         }
         "pwd" => {
-            // 接受并忽略 -P/-L（getcwd 已解析符号链接）
-            match std::env::current_dir() {
-                Ok(p) => println!("{}", p.display()),
-                Err(e) => {
-                    eprintln!("pwd: {}", e);
-                    *last_rc = 1;
+            // -P 物理路径；默认 -L 逻辑路径（$PWD 有效时优先）
+            let physical = cmd.argv[1..].iter().any(|a| a == "-P");
+            if physical {
+                match std::env::current_dir() {
+                    Ok(p) => println!("{}", p.display()),
+                    Err(e) => {
+                        eprintln!("pwd: {}", e);
+                        *last_rc = 1;
+                    }
                 }
+            } else {
+                println!("{}", logical_pwd());
             }
             BuiltinResult::Done
         }
@@ -1216,7 +1277,7 @@ fn run_kill_builtin(cmd: &SimpleCmd) -> i32 {
                     return 0;
                 }
             }
-            println!("{}", crate::applets::sys::kill::signal_names().join(" "));
+            crate::applets::sys::kill::print_signal_table();
             return 0;
         }
         if a == "-s" || a == "--signal" {
@@ -1585,5 +1646,39 @@ mod tests {
         let mut rc2 = 0;
         try_builtin(&make_cmd(&["kill", "%99"]), &mut rc2, &[]);
         assert_ne!(rc2, 0);
+    }
+
+    #[test]
+    fn logical_normalize_cases() {
+        assert_eq!(logical_normalize("/a/b/../c"), "/a/c");
+        assert_eq!(logical_normalize("/a/./b//c/"), "/a/b/c");
+        assert_eq!(logical_normalize("/.."), "/");
+        assert_eq!(logical_normalize("a/../b"), "b");
+        assert_eq!(logical_normalize("/"), "/");
+    }
+
+    #[test]
+    fn cd_logical_and_physical_paths() {
+        let _g = crate::applets::core::shell::compound::tests::test_guard();
+        let base = format!("/tmp/rbox_cd_test_{}", std::process::id());
+        let real = format!("{}/real", base);
+        let sym = format!("{}/sym", base);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &sym).unwrap();
+        let start = std::env::current_dir().unwrap();
+
+        let mut rc = 0;
+        // 默认 -L：保留符号链接路径；.. 按文本语义
+        try_builtin(&make_cmd(&["cd", &sym]), &mut rc, &[]);
+        assert_eq!(std::env::var("PWD").unwrap(), sym);
+        try_builtin(&make_cmd(&["cd", ".."]), &mut rc, &[]);
+        assert_eq!(std::env::var("PWD").unwrap(), base);
+        // -P：物理路径
+        try_builtin(&make_cmd(&["cd", "-P", &sym]), &mut rc, &[]);
+        assert_eq!(std::env::var("PWD").unwrap(), real);
+        // 回到起点，避免影响其他测试
+        let _ = std::env::set_current_dir(&start);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

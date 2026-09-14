@@ -861,19 +861,19 @@ impl ArithParser<'_> {
         Some(v)
     }
 
-    /// term := factor (('*'|'/'|'%') factor)*
+    /// term := power (('*'|'/'|'%') power)*
     fn term(&mut self) -> Option<i64> {
-        let mut v = self.factor()?;
+        let mut v = self.power()?;
         loop {
             self.ws();
             match self.peek() {
-                Some(b'*') => {
+                Some(b'*') if self.s.get(self.pos + 1) != Some(&b'*') => {
                     self.pos += 1;
-                    v = v.checked_mul(self.factor()?)?;
+                    v = v.checked_mul(self.power()?)?;
                 }
                 Some(b'/') => {
                     self.pos += 1;
-                    let d = self.factor()?;
+                    let d = self.power()?;
                     if d == 0 {
                         return None;
                     }
@@ -881,7 +881,7 @@ impl ArithParser<'_> {
                 }
                 Some(b'%') => {
                     self.pos += 1;
-                    let d = self.factor()?;
+                    let d = self.power()?;
                     if d == 0 {
                         return None;
                     }
@@ -893,25 +893,40 @@ impl ArithParser<'_> {
         Some(v)
     }
 
-    /// factor := ('+'|'-'|'!')? primary
+    /// power := factor ('**' power)?（右结合；一元运算符作用于整个幂）
+    fn power(&mut self) -> Option<i64> {
+        let base = self.factor()?;
+        self.ws();
+        if self.s.get(self.pos..self.pos + 2) == Some(b"**") {
+            self.pos += 2;
+            let exp = self.power()?;
+            if !(0..=u32::MAX as i64).contains(&exp) {
+                return None;
+            }
+            return base.checked_pow(exp as u32);
+        }
+        Some(base)
+    }
+
+    /// factor := ('+'|'-'|'!')? power | primary
     fn factor(&mut self) -> Option<i64> {
         self.ws();
         match self.peek() {
             Some(b'-') if self.s.get(self.pos + 1) != Some(&b'-') => {
                 self.pos += 1;
-                Some(-self.factor()?)
+                Some(-self.power()?)
             }
             Some(b'+') if self.s.get(self.pos + 1) != Some(&b'+') => {
                 self.pos += 1;
-                self.factor()
+                self.power()
             }
             Some(b'!') if self.s.get(self.pos + 1) != Some(&b'=') => {
                 self.pos += 1;
-                Some((self.factor()? == 0) as i64)
+                Some((self.power()? == 0) as i64)
             }
             Some(b'~') => {
                 self.pos += 1;
-                Some(!self.factor()?)
+                Some(!self.power()?)
             }
             Some(b'+') if self.s.get(self.pos + 1) == Some(&b'+') => {
                 self.pos += 2;
@@ -1767,6 +1782,18 @@ mod tests {
         assert_eq!(expand_vars("$((1?2:3))", 0), "2");
         assert_eq!(expand_vars("$((0?2:3))", 0), "3");
         assert_eq!(expand_vars("$((1,2,3))", 0), "3");
+    }
+
+    #[test]
+    fn arith_power() {
+        assert_eq!(expand_vars("$((2**10))", 0), "1024");
+        // 右结合：2**(3**2) = 512
+        assert_eq!(expand_vars("$((2**3**2))", 0), "512");
+        // 一元负号作用于整个幂：-(2**2)
+        assert_eq!(expand_vars("$((-2**2))", 0), "-4");
+        assert_eq!(expand_vars("$((2*3**2))", 0), "18");
+        // 负指数非法 → 0
+        assert_eq!(expand_vars("$((2**-1))", 0), "0");
     }
 
     #[test]

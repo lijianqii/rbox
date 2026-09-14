@@ -366,6 +366,24 @@ OUT=$(timeout 400 bash -c '
   printf "false; if true; then echo IF2_OK; fi\n"; sleep 0.6
   printf "sv2=abcdef; echo \"negs:\${sv2: -2}\"\n"; sleep 0.5
   printf "readonly RO2=5; unset RO2; echo \"ro2:\$RO2\"\n"; sleep 0.5
+  # 10.12 未覆盖项补齐：**/cd -L,-P/kill -l 表格/&& 组/$ENV/ignoreeof
+  printf "echo pow=\$((2**10))\n"; sleep 0.5
+  printf "mkdir -p /tmp/lnk/real; ln -s /tmp/lnk/real /tmp/lnk/sym\n"; sleep 0.6
+  printf "cd /tmp/lnk/sym; pwd\n"; sleep 0.5
+  printf "cd ..; pwd\n"; sleep 0.5
+  printf "cd -P /tmp/lnk/sym; pwd\n"; sleep 0.5
+  printf "cd /\n"; sleep 0.4
+  printf "kill -l | head -n 1\n"; sleep 0.5
+  printf "true && ( echo AND_GROUP_OK )\n"; sleep 0.6
+  printf "false || { echo OR_GROUP_OK; }\n"; sleep 0.6
+  printf "echo \x27export RBOX_ENV_OK=1\x27 > /tmp/rbox_envrc.sh; export ENV=/tmp/rbox_envrc.sh\n"; sleep 0.6
+  printf "sh\n"; sleep 1.5
+  printf "echo \"env_loaded:\$RBOX_ENV_OK\"\n"; sleep 0.8
+  printf "exit\n"; sleep 1.2
+  printf "set -o ignoreeof\n"; sleep 0.5
+  printf "\004"; sleep 0.6
+  printf "echo EOF_GUARD_OK\n"; sleep 0.5
+  printf "set +o ignoreeof\n"; sleep 0.4
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -650,6 +668,15 @@ assert_line "分号后 if 复合命令" "IF2_OK"
 assert_line "子串负偏移" "negs:ef"
 assert_contains "readonly 阻止 unset" "read only"
 assert_line "readonly 值保留" "ro2:5"
+assert_line "算术 ** 幂运算" "pow=1024"
+assert_line "cd -L 逻辑路径" "/tmp/lnk/sym"
+assert_line "cd -L .. 逻辑父目录" "/tmp/lnk"
+assert_line "cd -P 物理路径" "/tmp/lnk/real"
+assert_contains "kill -l 表格格式" "1) HUP"
+assert_line "&& 子 shell 组" "AND_GROUP_OK"
+assert_line "|| 花括号组" "OR_GROUP_OK"
+assert_line "$ENV 启动文件生效" "env_loaded:1"
+assert_line "ignoreeof 后 shell 存活" "EOF_GUARD_OK"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

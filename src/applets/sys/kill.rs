@@ -67,6 +67,19 @@ pub(crate) fn signal_names() -> &'static [&'static str] {
     SIGNAL_NAMES
 }
 
+/// 打印信号表（`kill -l` 无参，4 列，BusyBox 风格）。
+pub(crate) fn print_signal_table() {
+    for (i, name) in SIGNAL_NAMES.iter().enumerate() {
+        print!("{:2}) {:<8}", i + 1, name);
+        if (i + 1) % 4 == 0 {
+            println!();
+        }
+    }
+    if !SIGNAL_NAMES.len().is_multiple_of(4) {
+        println!();
+    }
+}
+
 /// 信号号 -> 信号名（不带 SIG 前缀）。
 pub(crate) fn signal_name(n: i32) -> Option<&'static str> {
     SIGNAL_NAMES
@@ -166,7 +179,7 @@ impl Applet for Kill {
         }
 
         if list {
-            println!("{}", SIGNAL_NAMES.join(" "));
+            print_signal_table();
             return ExitCode::SUCCESS;
         }
         if pids.is_empty() {
