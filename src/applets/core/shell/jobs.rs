@@ -1,4 +1,4 @@
-//! 作业控制：后台/挂起任务表（`jobs`/`fg`/`bg`/`wait`/`disown`）。
+//! 作业控制：后台/挂起任务表（`jobs`/`fg`/`bg`/`wait`）。
 //!
 //! 表为进程内全局状态（shell 单线程执行，Mutex 仅满足 Sync）。
 //! SIGCHLD 处理器只置位标志（async-signal-safe），由 [`reap_children`] 在
@@ -138,6 +138,11 @@ pub(crate) fn add_job(pgid: i32, command: &str, state: JobState) -> u32 {
 }
 
 /// 列出当前作业（自动清理已退出）。
+/// 当前作业的进程组 ID 列表（`jobs -p`）。
+pub(crate) fn pids() -> Vec<i32> {
+    list().iter().map(|j| j.pgid).collect()
+}
+
 pub(crate) fn list() -> Vec<Job> {
     let Ok(mut t) = table().lock() else {
         return Vec::new();
@@ -214,18 +219,6 @@ pub(crate) fn mark_running(spec: Option<&str>) -> Option<Job> {
     let idx = resolve_spec(&t, spec)?;
     t[idx].state = JobState::Running;
     Some(t[idx].clone())
-}
-
-/// 从作业表移除（disown）。
-pub(crate) fn disown(spec: Option<&str>) -> bool {
-    let Ok(mut t) = table().lock() else {
-        return false;
-    };
-    let Some(idx) = resolve_spec(&t, spec) else {
-        return false;
-    };
-    t.remove(idx);
-    true
 }
 
 /// 向进程组发送 SIGCONT 继续执行。
@@ -359,14 +352,6 @@ mod tests {
         assert_eq!(find(Some("%?beta")).unwrap().id, id2);
         assert_eq!(find(Some("%alpha")).unwrap().id, id1);
         assert!(find(Some("%nope")).is_none());
-    }
-
-    #[test]
-    fn disown_removes_job() {
-        reset_for_test();
-        let id = add("to disown");
-        assert!(disown(Some(&format!("%{}", id))));
-        assert!(find(Some(&format!("%{}", id))).is_none());
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub(crate) fn option_string() -> String {
     if allexport() {
         out.push('a');
     }
+    if notify() {
+        out.push('b');
+    }
     if noclobber() {
         out.push('C');
     }

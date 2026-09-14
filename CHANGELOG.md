@@ -20,6 +20,9 @@
   （默认，保留符号链接与 `..` 文本语义）与 `cd -P`/`pwd -P` 物理路径、`kill -l` 无参
   4 列表格、`cmd && ( ... )`/`cmd || { ...; }` 条件组、`$ENV` 启动文件与 `set -o ignoreeof`
   的端到端验证
+- BusyBox ash 1:1 对齐（以 busybox ash 为基准实测）：`set -o` 输出 `name on|off`、
+  `export -p`/`readonly -p` 引号格式、`jobs -p`、`set -b` 反映到 `$-`、`kill -l`
+  逐行 `N) NAME`；删除 ash 无的 `disown` 与 `trap -l`
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -54,7 +57,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 792 个、QEMU 集成断言 244 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 791 个、QEMU 集成断言 247 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

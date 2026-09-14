@@ -69,14 +69,8 @@ pub(crate) fn signal_names() -> &'static [&'static str] {
 
 /// 打印信号表（`kill -l` 无参，4 列，BusyBox 风格）。
 pub(crate) fn print_signal_table() {
-    for (i, name) in SIGNAL_NAMES.iter().enumerate() {
-        print!("{:2}) {:<8}", i + 1, name);
-        if (i + 1) % 4 == 0 {
-            println!();
-        }
-    }
-    if !SIGNAL_NAMES.len().is_multiple_of(4) {
-        println!();
+    for (i, name) in signal_names().iter().enumerate() {
+        println!("{:2}) {}", i + 1, name);
     }
 }
 

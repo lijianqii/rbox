@@ -377,13 +377,17 @@ OUT=$(timeout 400 bash -c '
   printf "true && ( echo AND_GROUP_OK )\n"; sleep 0.6
   printf "false || { echo OR_GROUP_OK; }\n"; sleep 0.6
   printf "echo \x27export RBOX_ENV_OK=1\x27 > /tmp/rbox_envrc.sh; export ENV=/tmp/rbox_envrc.sh\n"; sleep 0.6
-  printf "sh\n"; sleep 1.5
+  printf "sh\n"; sleep 2.0
   printf "echo \"env_loaded:\$RBOX_ENV_OK\"\n"; sleep 0.8
   printf "exit\n"; sleep 1.2
   printf "set -o ignoreeof\n"; sleep 0.5
   printf "\004"; sleep 0.6
   printf "echo EOF_GUARD_OK\n"; sleep 0.5
   printf "set +o ignoreeof\n"; sleep 0.4
+  # 10.13 ash 对齐：jobs -p / set -b / readonly -p 引号格式
+  printf "sleep 3 & jobs -p; kill %%+\n"; sleep 0.8
+  printf "set -b; echo \"notify:\$-\"; set +b\n"; sleep 0.5
+  printf "readonly RO3=9; readonly -p\n"; sleep 0.5
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
   printf "meminfo\n"; sleep 1.5
   printf "meminfo -m\n"; sleep 1.5
@@ -659,7 +663,7 @@ assert_line "<> 不截断文件" "rwkeep:keep"
 assert_line "任意 fd 3> 与 3>&-" "fd3_ok"
 assert_line "set -f 通配不展开" "/tmp/noglob*"
 assert_line "\$- 含 f 标志" "dash:f"
-assert_line "set -o 名称列表含 noclobber" "noclobber"
+assert_contains "set -o 名称列表含 noclobber" "noclobber"
 assert_line "\$RANDOM 为数字" "rnd_ok"
 assert_line "命令替换拼接多行输出" "m1,m2,"
 assert_contains "CDPATH 搜索相对路径" "/tmp/cdp/sub"
@@ -677,6 +681,9 @@ assert_line "&& 子 shell 组" "AND_GROUP_OK"
 assert_line "|| 花括号组" "OR_GROUP_OK"
 assert_line "$ENV 启动文件生效" "env_loaded:1"
 assert_line "ignoreeof 后 shell 存活" "EOF_GUARD_OK"
+assert_line_regex "jobs -p 输出 PID" "^[0-9]+$"
+assert_line "set -b 反映到 \$-" "notify:b"
+assert_contains "readonly -p 引号格式" "readonly RO3='9'"
 
 echo ""
 echo "[Shell: 复合命令/别名/命令替换/作业控制]"

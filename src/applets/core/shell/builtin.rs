@@ -34,7 +34,6 @@ pub fn is_builtin(name: &str) -> bool {
             | "shift"
             | "exec"
             | "wait"
-            | "disown"
             | "return"
             | "trap"
             | "type"
@@ -414,7 +413,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                     let mut vars: Vec<(String, String)> = std::env::vars().collect();
                     vars.sort();
                     for (k, v) in vars {
-                        println!("export {}={}", k, v);
+                        println!("export {}='{}'", k, v);
                     }
                     continue;
                 }
@@ -520,9 +519,16 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             BuiltinResult::Done
         }
         "jobs" => {
-            let show_pid = cmd.argv.iter().skip(1).any(|a| a == "-l");
-            for line in jobs::format_lines(show_pid) {
-                println!("{}", line);
+            let args: Vec<&str> = cmd.argv[1..].iter().map(String::as_str).collect();
+            if args.contains(&"-p") {
+                for pid in jobs::pids() {
+                    println!("{}", pid);
+                }
+            } else {
+                let show_pid = args.contains(&"-l");
+                for line in jobs::format_lines(show_pid) {
+                    println!("{}", line);
+                }
             }
             *last_rc = 0;
             BuiltinResult::Done
@@ -664,7 +670,11 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                                     // 列出选项（+o 为可重置形式）
                                     for (name, value) in options::named_options() {
                                         if on {
-                                            println!("{}", name);
+                                            println!(
+                                                "{:<15} {}",
+                                                name,
+                                                if value { "on" } else { "off" }
+                                            );
                                         } else if value {
                                             println!("set -o {}", name);
                                         } else {
@@ -779,26 +789,6 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             }
             BuiltinResult::Done
         }
-        "disown" => {
-            let args = &cmd.argv[1..];
-            let mut rc = 0;
-            if args.is_empty() {
-                if !jobs::disown(None) {
-                    rc = 1;
-                }
-            } else {
-                for s in args {
-                    if s == "-a" || s == "--all" {
-                        while jobs::disown(None) {}
-                    } else if !jobs::disown(Some(s)) {
-                        eprintln!("disown: {}: no such job", s);
-                        rc = 1;
-                    }
-                }
-            }
-            *last_rc = rc;
-            BuiltinResult::Done
-        }
         "return" => {
             let code = cmd
                 .argv
@@ -816,13 +806,6 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 for (sig, c) in trap::list() {
                     println!("trap -- '{}' {}", c, trap::signal_name(sig));
                 }
-                *last_rc = 0;
-            } else if args[0] == "-l" {
-                let names: Vec<String> = crate::applets::sys::kill::signal_names()
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                println!("{}", names.join(" "));
                 *last_rc = 0;
             } else {
                 let cmdline = args[0].clone();
@@ -981,7 +964,7 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 names.sort();
                 for name in names {
                     let val = std::env::var(name).unwrap_or_default();
-                    println!("readonly {}={}", name, val);
+                    println!("readonly {}='{}'", name, val);
                 }
             }
             *last_rc = rc;

@@ -120,6 +120,7 @@ mod tests {
 
     #[test]
     fn define_get_list_unset() {
+        let _g = local_guard();
         reset_for_test();
         define("greet", "echo hi");
         assert!(is_function("greet"));
