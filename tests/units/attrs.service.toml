@@ -1,0 +1,14 @@
+[Unit]
+Description = "Process attributes (test)"
+Name = "attrs"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'echo ATTR_UMASK=$(umask); echo ATTR_NOFILE=$(ulimit -n)'"
+UMask = 0o027
+Nice = 5
+LimitNOFILE = 64
+NoNewPrivileges = true
+
+[Install]
+WantedBy = ["default.target"]

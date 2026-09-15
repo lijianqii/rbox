@@ -393,6 +393,13 @@ send_boot() {
   # socket 激活：客户端连接 Unix 套接字，服务读取一行并回显
   printf "ls /tmp/echo.sock\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rbox --sockclient /tmp/echo.sock hello-socket\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # 命令替换内的内置命令（$(umask)/$(ulimit -n)）
+  printf "echo sub_umask=\$(umask) sub_nofile=\$(ulimit -n)\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # cgroup v2 资源限制
+  printf "cat /sys/fs/cgroup/test.slice/limited/memory.max\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /sys/fs/cgroup/test.slice/limited/cpu.max\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /sys/fs/cgroup/test.slice/limited/pids.max\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /sys/fs/cgroup/test.slice/limited/cpu.weight\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # init 增强：reload、sysctl、User= 降权
   printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
@@ -791,6 +798,17 @@ assert_contains "path 单元已装载" "path watch.path watching"
 assert_contains "socket 单元监听" "socket echo.socket listening"
 assert_contains "socket 文件已创建" "echo.sock"
 assert_contains "socket 激活连接往返" "SOCKET_GOT:hello-socket"
+assert_line_regex "命令替换内内置命令" "^sub_umask=[0-7]{4} sub_nofile=[0-9]+$"
+assert_line "cgroup MemoryMax 生效" "33554432"
+assert_line "cgroup CPUQuota 生效" "50000 100000"
+assert_line "cgroup TasksMax 生效" "10"
+assert_line "cgroup CPUWeight 生效" "200"
+assert_contains "服务加入 cgroup" "placed in cgroup"
+assert_contains "UMask 生效" "ATTR_UMASK=0027"
+assert_contains "LimitNOFILE 生效" "ATTR_NOFILE=64"
+assert_line_regex "PrivateTmp 生效" "^SB_TMP= *0$"
+assert_contains "ProtectSystem 只读" "SB_RO_OK"
+assert_line_regex "ProtectHome 掩蔽" "^SB_HOME= *0$"
 
 
 echo ""

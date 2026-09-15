@@ -10,6 +10,7 @@
 //! - 通过 unix socket 响应控制请求（server 模块：status/start/stop/restart/reload）。
 
 pub(crate) mod boot;
+pub(crate) mod cgroup;
 pub(crate) mod mount;
 pub(crate) mod server;
 pub(crate) mod services;
@@ -73,6 +74,7 @@ impl Applet for Init {
         // 1. 基本环境与文件系统初始化（默认 PATH + /etc/fstab 挂载 + 主机名 + sysctl）
         setup_environment();
         mount_all_fs();
+        crate::applets::core::init::cgroup::ensure_mounted();
         setup_hostname();
         apply_sysctl(&crate::config::load().paths.sysctl_conf);
         log("rbox init: basic filesystems mounted");

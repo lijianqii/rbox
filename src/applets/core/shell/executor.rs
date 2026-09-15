@@ -758,7 +758,18 @@ fn capture_pipeline(pipeline: &Pipeline) -> Option<(i32, String)> {
         if cmd.argv.is_empty() {
             continue;
         }
-        let (program, extra_args) = resolve_command(&cmd.argv[0]);
+        // 命令替换内的内置命令（$(umask)/$(ulimit -n) 等）经 `rbox --builtin` 子进程执行
+        let (program, extra_args) = if is_builtin(&cmd.argv[0]) {
+            let rbox_path = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "/bin/rbox".to_string());
+            (
+                rbox_path,
+                vec!["--builtin".to_string(), cmd.argv[0].clone()],
+            )
+        } else {
+            resolve_command(&cmd.argv[0])
+        };
         let mut command = Command::new(program);
         command.args(&extra_args);
         command.args(&cmd.argv[1..]);

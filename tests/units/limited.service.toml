@@ -1,0 +1,15 @@
+[Unit]
+Description = "cgroup v2 resource limits (test)"
+Name = "limited"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sleep 60"
+MemoryMax = "32M"
+CPUQuota = "50%"
+CPUWeight = 200
+TasksMax = 10
+Slice = "test.slice"
+
+[Install]
+WantedBy = ["default.target"]

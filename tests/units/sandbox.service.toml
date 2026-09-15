@@ -1,0 +1,13 @@
+[Unit]
+Description = "Sandbox options (test)"
+Name = "sandbox"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'echo SB_TMP=$(ls -A /tmp | wc -l); touch /usr/sandbox_test 2>/dev/null || echo SB_RO_OK; echo SB_HOME=$(ls -A /root | wc -l)'"
+PrivateTmp = true
+ProtectSystem = "yes"
+ProtectHome = "yes"
+
+[Install]
+WantedBy = ["default.target"]

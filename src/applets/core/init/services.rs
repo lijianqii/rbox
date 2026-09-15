@@ -62,6 +62,8 @@ pub(crate) struct ServiceInstance {
     pub(crate) active: bool,
     /// Restart=on-success：成功退出时重启
     pub(crate) restart_on_success: bool,
+    /// cgroup v2 路径（有资源限制时创建）
+    pub(crate) cgroup_path: Option<String>,
 }
 
 impl ServiceInstance {
@@ -108,6 +110,181 @@ pub(crate) struct SpawnConfig<'a> {
     pub(crate) group: Option<&'a str>,
     /// 工作目录
     pub(crate) working_directory: Option<&'a str>,
+    /// 进程属性与沙箱（pre_exec 应用）
+    pub(crate) attrs: ExecAttrs,
+}
+
+/// 进程属性与沙箱选项（spawn 前在子进程中应用）。
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ExecAttrs {
+    pub(crate) umask: Option<u32>,
+    pub(crate) nice: Option<i32>,
+    pub(crate) oom_score_adjust: Option<i32>,
+    pub(crate) limit_nofile: Option<u64>,
+    pub(crate) limit_nproc: Option<u64>,
+    pub(crate) limit_core: Option<u64>,
+    pub(crate) limit_as: Option<u64>,
+    pub(crate) no_new_privileges: bool,
+    pub(crate) private_tmp: bool,
+    pub(crate) protect_home: u8,   // 0=off 1=yes 2=read-only 3=tmpfs
+    pub(crate) protect_system: u8, // 0=off 1=yes 2=full 3=strict
+}
+
+impl ExecAttrs {
+    pub(crate) fn from_unit(unit: &Unit) -> Self {
+        let ph = match unit.service.protect_home.as_deref() {
+            Some("yes") => 1,
+            Some("read-only") => 2,
+            Some("tmpfs") => 3,
+            _ => 0,
+        };
+        let ps = match unit.service.protect_system.as_deref() {
+            Some("yes") => 1,
+            Some("full") => 2,
+            Some("strict") => 3,
+            _ => 0,
+        };
+        ExecAttrs {
+            umask: unit.service.umask,
+            nice: unit.service.nice,
+            oom_score_adjust: unit.service.oom_score_adjust,
+            limit_nofile: unit.service.limit_nofile,
+            limit_nproc: unit.service.limit_nproc,
+            limit_core: unit.service.limit_core,
+            limit_as: unit.service.limit_as,
+            no_new_privileges: unit.service.no_new_privileges,
+            private_tmp: unit.service.private_tmp,
+            protect_home: ph,
+            protect_system: ps,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.umask.is_some()
+            || self.nice.is_some()
+            || self.oom_score_adjust.is_some()
+            || self.limit_nofile.is_some()
+            || self.limit_nproc.is_some()
+            || self.limit_core.is_some()
+            || self.limit_as.is_some()
+            || self.no_new_privileges
+            || self.private_tmp
+            || self.protect_home > 0
+            || self.protect_system > 0
+    }
+
+    /// 在子进程中应用（pre_exec，仅 async-signal-safe 调用）。
+    #[cfg(unix)]
+    unsafe fn apply(&self) {
+        unsafe {
+            if let Some(m) = self.umask {
+                libc::umask(m as libc::mode_t);
+            }
+            if let Some(n) = self.nice {
+                let _ = libc::setpriority(libc::PRIO_PROCESS, 0, n);
+            }
+            if let Some(v) = self.oom_score_adjust {
+                let path = std::ffi::CString::new("/proc/self/oom_score_adj").unwrap();
+                let fd = libc::open(path.as_ptr(), libc::O_WRONLY);
+                if fd >= 0 {
+                    let s = std::ffi::CString::new(v.to_string()).unwrap();
+                    let _ = libc::write(fd, s.as_ptr() as *const _, v.to_string().len());
+                    libc::close(fd);
+                }
+            }
+            let mut rl = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            for (res, val) in [
+                (libc::RLIMIT_NOFILE, self.limit_nofile),
+                (libc::RLIMIT_NPROC, self.limit_nproc),
+                (libc::RLIMIT_CORE, self.limit_core),
+                (libc::RLIMIT_AS, self.limit_as),
+            ] {
+                if let Some(v) = val {
+                    rl.rlim_cur = v;
+                    rl.rlim_max = v;
+                    let _ = libc::setrlimit(res as libc::__rlimit_resource_t, &rl);
+                }
+            }
+            if self.no_new_privileges {
+                let _ = libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            }
+            // 沙箱挂载：先建立私有 mount namespace，再覆盖/只读挂载目标路径
+            if self.private_tmp || self.protect_home > 0 || self.protect_system > 0 {
+                if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                    return;
+                }
+                // 递归私有传播，避免影响宿主命名空间
+                let root = std::ffi::CString::new("/").unwrap();
+                let _ = libc::mount(
+                    std::ptr::null(),
+                    root.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                );
+                let tmpfs = std::ffi::CString::new("tmpfs").unwrap();
+                let opts_empty = std::ffi::CString::new("size=0").unwrap();
+                let opts_tmp = std::ffi::CString::new("mode=1777,size=64m").unwrap();
+                if self.private_tmp {
+                    for p in ["/tmp", "/var/tmp"] {
+                        let c = std::ffi::CString::new(p).unwrap();
+                        let _ = libc::mount(
+                            tmpfs.as_ptr(),
+                            c.as_ptr(),
+                            tmpfs.as_ptr(),
+                            libc::MS_NOSUID | libc::MS_NODEV,
+                            opts_tmp.as_ptr() as *const _,
+                        );
+                    }
+                }
+                if self.protect_home > 0 {
+                    let opts = if self.protect_home == 3 {
+                        opts_tmp.as_ptr() as *const _
+                    } else {
+                        opts_empty.as_ptr() as *const _
+                    };
+                    let flags = if self.protect_home == 2 {
+                        libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV
+                    } else {
+                        libc::MS_NOSUID | libc::MS_NODEV
+                    };
+                    for p in ["/home", "/root", "/run/user"] {
+                        let c = std::ffi::CString::new(p).unwrap();
+                        if libc::access(c.as_ptr(), libc::F_OK) == 0 {
+                            let _ = libc::mount(
+                                tmpfs.as_ptr(),
+                                c.as_ptr(),
+                                tmpfs.as_ptr(),
+                                flags,
+                                opts,
+                            );
+                        }
+                    }
+                }
+                if self.protect_system > 0 {
+                    // yes: /usr /boot 只读；full: 加 /etc；strict: 整个根只读（/dev /proc /sys 例外由内核处理）
+                    let paths: &[&str] = match self.protect_system {
+                        1 => &["/usr", "/boot"],
+                        2 => &["/usr", "/boot", "/etc"],
+                        _ => &["/"],
+                    };
+                    for p in paths {
+                        let c = std::ffi::CString::new(*p).unwrap();
+                        let _ = libc::mount(
+                            std::ptr::null(),
+                            c.as_ptr(),
+                            std::ptr::null(),
+                            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+                            std::ptr::null(),
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SpawnConfig<'_> {
@@ -117,6 +294,7 @@ impl SpawnConfig<'_> {
             user: unit.service.user.as_deref(),
             group: unit.service.group.as_deref(),
             working_directory: unit.service.working_directory.as_deref(),
+            attrs: ExecAttrs::from_unit(unit),
         }
     }
 }
@@ -210,6 +388,17 @@ pub(crate) fn spawn_unit_command(
                 ));
                 return None;
             }
+        }
+    }
+    // 进程属性与沙箱（UMask/Nice/OOMScoreAdjust/rlimits/NoNewPrivileges/PrivateTmp/Protect*）
+    if cfg.attrs.any() {
+        #[cfg(unix)]
+        unsafe {
+            let attrs = cfg.attrs;
+            command.pre_exec(move || {
+                attrs.apply();
+                Ok(())
+            });
         }
     }
     match command.spawn() {
@@ -485,6 +674,12 @@ fn new_service_instance(
     child: Option<Child>,
     tracked_pid: Option<u32>,
 ) -> ServiceInstance {
+    let cgroup_path = child
+        .as_ref()
+        .and_then(|c| crate::applets::core::init::cgroup::setup(unit, c.id()));
+    if let Some(p) = cgroup_path.as_deref() {
+        log(&format!("rbox init: {} placed in cgroup {}", unit.name, p));
+    }
     ServiceInstance {
         name: unit.name.clone(),
         child,
@@ -520,6 +715,7 @@ fn new_service_instance(
         stopped: false,
         unit: unit.clone(),
         active: false,
+        cgroup_path,
     }
 }
 
@@ -632,9 +828,13 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
         user: svc.user.as_deref(),
         group: svc.group.as_deref(),
         working_directory: svc.working_directory.as_deref(),
+        attrs: ExecAttrs::from_unit(&svc.unit),
     };
     svc.tracked_pid = None;
     svc.child = spawn_unit_command(&svc.name, &svc.exec_start, &svc.env, &cfg);
+    if let Some(child) = svc.child.as_ref() {
+        svc.cgroup_path = crate::applets::core::init::cgroup::setup(&svc.unit, child.id());
+    }
     if !svc.is_forking {
         return;
     }
@@ -699,6 +899,13 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
     let mode = svc.kill_mode.as_str();
     let sig = kill_signal_of(&svc.unit);
     let send_sigkill = svc.unit.service.send_sigkill;
+    // 有 cgroup 时优先整组终止（cgroup.kill）
+    if mode != "none"
+        && let Some(cg) = svc.cgroup_path.as_deref()
+        && crate::applets::core::init::cgroup::kill(cg)
+    {
+        log(&format!("rbox init: {} killed via cgroup", svc.name));
+    }
     if let Some(mut child) = svc.child.take() {
         if mode != "none" {
             let _ = match mode {
@@ -770,6 +977,7 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
             user: svc.user.as_deref(),
             group: svc.group.as_deref(),
             working_directory: svc.working_directory.as_deref(),
+            attrs: ExecAttrs::from_unit(&svc.unit),
         };
         for cmd in svc.unit.service.exec_stop_post.clone() {
             log(&format!("rbox init: ExecStopPost {}: {}", svc.name, cmd));
@@ -867,6 +1075,7 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         stopped: false,
         unit: Unit::default(),
         active: false,
+        cgroup_path: None,
     }
 }
 
@@ -1052,5 +1261,31 @@ mod tests {
         u.service.remain_after_exit = true;
         let inst = oneshot_instance(&u, "/bin/true", &[]);
         assert!(inst.active);
+    }
+
+    #[test]
+    fn exec_attrs_from_unit() {
+        let mut u = Unit {
+            name: "a".to_string(),
+            ..Default::default()
+        };
+        u.service.umask = Some(0o027);
+        u.service.nice = Some(5);
+        u.service.limit_nofile = Some(64);
+        u.service.no_new_privileges = true;
+        u.service.private_tmp = true;
+        u.service.protect_home = Some("read-only".to_string());
+        u.service.protect_system = Some("full".to_string());
+        let a = ExecAttrs::from_unit(&u);
+        assert_eq!(a.umask, Some(0o027));
+        assert_eq!(a.nice, Some(5));
+        assert_eq!(a.limit_nofile, Some(64));
+        assert!(a.no_new_privileges);
+        assert!(a.private_tmp);
+        assert_eq!(a.protect_home, 2);
+        assert_eq!(a.protect_system, 2);
+        assert!(a.any());
+        let d = ExecAttrs::default();
+        assert!(!d.any());
     }
 }

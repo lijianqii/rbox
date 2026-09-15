@@ -65,6 +65,11 @@
   `.path`（PathExists/PathChanged/DirectoryNotEmpty）、`.socket`（ListenStream Unix/TCP、
   Accept=yes 连接作 stdin/stdout、Accept=no 监听 fd 作 fd 3 + LISTEN_FDS/LISTEN_PID）；
   主循环 poll 集成与超时计算；隐藏 `--sockclient` 供端到端验证
+- init 进程属性与沙箱：UMask/Nice/OOMScoreAdjust/LimitNOFILE/LimitNPROC/LimitCORE/LimitAS、
+  NoNewPrivileges、PrivateTmp、ProtectHome（yes/read-only/tmpfs）、ProtectSystem（yes/full/strict）
+- init cgroup v2：Slice/MemoryMax/CPUQuota/CPUWeight/TasksMax（自动挂载 cgroup2、启用控制器、
+  服务加入子 cgroup，KillMode 优先 cgroup.kill）；内核启用 CONFIG_CFS_BANDWIDTH
+- 修复：命令替换内的内置命令（$(umask)/$(ulimit -n)）经 `rbox --builtin` 执行
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -99,7 +104,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 806 个、QEMU 集成断言 297 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 809 个、QEMU 集成断言 308 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

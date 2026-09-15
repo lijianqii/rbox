@@ -183,6 +183,12 @@ kernel:
 	else \
 		echo "内核配置已存在，跳过 defconfig"; \
 	fi
+	@# 启用 cgroup v2 CPU 带宽控制（init 的 CPUQuota= 依赖），幂等
+	@if [ -x $(KERNEL)/scripts/config ] && ! grep -q '^CONFIG_CFS_BANDWIDTH=y' $(KERNEL)/.config; then \
+		echo "启用内核 CONFIG_CFS_BANDWIDTH（CPUQuota 支持）..."; \
+		cd $(KERNEL) && ./scripts/config --enable CFS_BANDWIDTH && \
+			$(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig >/dev/null; \
+	fi
 	@if [ ! -f $(KERNEL)/arch/arm64/boot/Image ]; then \
 		echo "编译内核镜像 (Image) ..."; \
 		cd $(KERNEL) && $(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$$(nproc) Image; \

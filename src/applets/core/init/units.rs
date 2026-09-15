@@ -241,6 +241,51 @@ pub(crate) struct ServiceSection {
     #[serde(default = "default_true")]
     #[serde(rename = "SendSIGKILL")]
     pub(crate) send_sigkill: bool,
+    /// 进程属性：umask（八进制，如 0o027）
+    #[serde(default, rename = "UMask")]
+    pub(crate) umask: Option<u32>,
+    /// 进程优先级（-20..19）
+    #[serde(default, rename = "Nice")]
+    pub(crate) nice: Option<i32>,
+    /// OOM 评分调整（-1000..1000）
+    #[serde(default, rename = "OOMScoreAdjust")]
+    pub(crate) oom_score_adjust: Option<i32>,
+    /// 资源限制（软/硬同值）：LimitNOFILE/LimitNPROC/LimitCORE/LimitAS
+    #[serde(default, rename = "LimitNOFILE")]
+    pub(crate) limit_nofile: Option<u64>,
+    #[serde(default, rename = "LimitNPROC")]
+    pub(crate) limit_nproc: Option<u64>,
+    #[serde(default, rename = "LimitCORE")]
+    pub(crate) limit_core: Option<u64>,
+    #[serde(default, rename = "LimitAS")]
+    pub(crate) limit_as: Option<u64>,
+    /// 沙箱：禁止提权（PR_SET_NO_NEW_PRIVS）
+    #[serde(default, rename = "NoNewPrivileges")]
+    pub(crate) no_new_privileges: bool,
+    /// 沙箱：私有 /tmp 与 /var/tmp（mount namespace + tmpfs）
+    #[serde(default, rename = "PrivateTmp")]
+    pub(crate) private_tmp: bool,
+    /// 沙箱：隐藏 /home /root /run/user（yes/read-only/tmpfs）
+    #[serde(default, rename = "ProtectHome")]
+    pub(crate) protect_home: Option<String>,
+    /// 沙箱：只读挂载系统目录（yes/full/strict）
+    #[serde(default, rename = "ProtectSystem")]
+    pub(crate) protect_system: Option<String>,
+    /// cgroup v2：内存上限（64M/1G/纯字节）
+    #[serde(default, rename = "MemoryMax")]
+    pub(crate) memory_max: Option<String>,
+    /// cgroup v2：CPU 配额（如 50%）
+    #[serde(default, rename = "CPUQuota")]
+    pub(crate) cpu_quota: Option<String>,
+    /// cgroup v2：CPU 权重（1..10000，默认 100）
+    #[serde(default, rename = "CPUWeight")]
+    pub(crate) cpu_weight: Option<u64>,
+    /// cgroup v2：进程数上限
+    #[serde(default, rename = "TasksMax")]
+    pub(crate) tasks_max: Option<u64>,
+    /// cgroup v2：所属 slice（默认 system.slice）
+    #[serde(default, rename = "Slice")]
+    pub(crate) slice: Option<String>,
 }
 
 fn default_restart_sec() -> u64 {
