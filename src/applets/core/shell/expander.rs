@@ -37,6 +37,8 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
             }
             state.push('\x1d');
             state.push_str(&super::params::all().join("\x1f"));
+            state.push('\x1c');
+            state.push_str(&super::options::shell_pid().to_string());
             new_argv.push(state);
         } else {
             for arg in &cmd.argv {
@@ -319,6 +321,11 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
             continue;
         }
         if c == '$' {
+            // `$$` 的第二个 `$` 前可能夹带 tokenizer 元数据标记（每个 `$` 都会插入），
+            // 先跳过，否则 `$$`/`$?` 等会被当作字面 `$`
+            while matches!(chars.peek(), Some(&NO_SPLIT_ESCAPE) | Some(&SPLIT_ESCAPE)) {
+                chars.next();
+            }
             let start = result.len();
             match chars.peek() {
                 Some('{') => {
@@ -340,7 +347,7 @@ pub fn expand_vars(s: &str, last_rc: i32) -> String {
                 }
                 Some('$') => {
                     chars.next();
-                    result.push_str(&std::process::id().to_string());
+                    result.push_str(&super::options::shell_pid().to_string());
                 }
                 Some('!') => {
                     chars.next();
@@ -594,7 +601,7 @@ fn remove_suffix(val: &str, pat: &str, longest: bool) -> String {
 fn lookup_var(name: &str, last_rc: i32) -> String {
     match name {
         "?" => return last_rc.to_string(),
-        "$" => return std::process::id().to_string(),
+        "$" => return super::options::shell_pid().to_string(),
         "!" => return super::params::last_bg().to_string(),
         "-" => return super::options::option_string(),
         "RANDOM" => return (random_u32() % 32768).to_string(),
@@ -1952,5 +1959,14 @@ mod tests {
             vec!["pre1 2suf"]
         );
         unsafe { std::env::remove_var("RBOX_T_MIX") };
+    }
+
+    #[test]
+    fn shell_pid_expansion() {
+        crate::applets::core::shell::options::set_shell_pid(4242);
+        assert_eq!(expand_vars("$$", 0), "4242");
+        assert_eq!(expand_vars("pid=$$", 0), "pid=4242");
+        // 恢复为当前进程（避免影响其他测试）
+        crate::applets::core::shell::options::set_shell_pid(std::process::id() as i32);
     }
 }

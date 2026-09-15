@@ -21,12 +21,26 @@ static PHYSICAL: AtomicBool = AtomicBool::new(false);
 static HISTORY: AtomicBool = AtomicBool::new(true);
 /// 交互式 shell 标志（别名展开等仅交互模式生效）。
 static INTERACTIVE: AtomicBool = AtomicBool::new(false);
+/// shell 进程号（`$$`）：子 shell 沿用父 shell 的 pid（POSIX/ash 行为）。
+static SHELL_PID: AtomicI32 = AtomicI32::new(0);
 /// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
 static NOUNSET_VIOLATION: AtomicBool = AtomicBool::new(false);
 /// 退出请求（`exit` 之外的内部退出：set -e 触发等）；-1 表示无。
 static EXIT_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 /// `return` 请求（source/函数帧消费）；-1 表示无。
 static RETURN_REQUESTED: AtomicI32 = AtomicI32::new(-1);
+
+/// `$$` 是否尚未初始化（用于区分顶层 shell 与 fork 子 shell）。
+pub(crate) fn shell_pid_unset() -> bool {
+    SHELL_PID.load(Ordering::SeqCst) == 0
+}
+pub(crate) fn shell_pid() -> i32 {
+    let p = SHELL_PID.load(Ordering::SeqCst);
+    if p > 0 { p } else { std::process::id() as i32 }
+}
+pub(crate) fn set_shell_pid(pid: i32) {
+    SHELL_PID.store(pid, Ordering::SeqCst);
+}
 
 pub(crate) fn interactive() -> bool {
     INTERACTIVE.load(Ordering::SeqCst)

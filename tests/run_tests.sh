@@ -308,6 +308,7 @@ send_boot() {
   send_boot
   # 基本 applet
   printf "uname -m\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo pid=$$\necho __RBOX_DONE__\n" >&7; wait_main
   printf "uname -n\necho __RBOX_DONE__\n" >&7; wait_main
   printf "pwd\necho __RBOX_DONE__\n" >&7; wait_main
   printf "echo hello\necho __RBOX_DONE__\n" >&7; wait_main
@@ -651,6 +652,7 @@ echo ""
 
 echo "[基本 applet]"
 assert_line "uname -m -> aarch64" "aarch64"
+assert_line_regex "$$ 展开为数字" "^pid=[0-9]+$"
 assert_line "uname -n -> 主机名" "rbox"
 assert_line "pwd -> /" "/"
 assert_line "echo hello -> hello" "hello"

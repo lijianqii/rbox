@@ -252,6 +252,9 @@ pub(crate) fn run_source(
     trap::install_handlers();
     crate::applets::core::shell::builtin::init_pwd();
     crate::applets::core::shell::options::set_interactive(interactive);
+    if crate::applets::core::shell::options::shell_pid_unset() {
+        crate::applets::core::shell::options::set_shell_pid(std::process::id() as i32);
+    }
     let lines: Vec<String> = source.lines().map(|s| s.to_string()).collect();
     let mut i = 0;
     let mut last_rc = 0;

@@ -56,6 +56,11 @@ fn restore_subshell_state(state: &str) {
     {
         params::set(ps.split('\x1f').map(str::to_string).collect());
     }
+    if let Some(pid) = parts.next()
+        && let Ok(pid) = pid.parse::<i32>()
+    {
+        crate::applets::core::shell::options::set_shell_pid(pid);
+    }
 }
 
 fn main() -> ExitCode {
