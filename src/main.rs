@@ -51,15 +51,24 @@ fn restore_subshell_state(state: &str) {
             _ => {}
         }
     }
-    if let Some(ps) = parts.next()
-        && !ps.is_empty()
-    {
+    let rest = parts.next().unwrap_or("");
+    let mut r = rest.split('\x1c');
+    let ps = r.next().unwrap_or("");
+    if !ps.is_empty() {
         params::set(ps.split('\x1f').map(str::to_string).collect());
     }
-    if let Some(pid) = parts.next()
+    if let Some(pid) = r.next()
         && let Ok(pid) = pid.parse::<i32>()
     {
         crate::applets::core::shell::options::set_shell_pid(pid);
+    }
+    if let Some(flags) = r.next() {
+        for ch in flags.chars() {
+            crate::applets::core::shell::options::set_by_flag(ch, true);
+        }
+    }
+    if let Some(pf) = r.next() {
+        crate::applets::core::shell::options::set_pipefail(pf == "1");
     }
 }
 

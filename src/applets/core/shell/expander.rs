@@ -39,6 +39,11 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
             state.push_str(&super::params::all().join("\x1f"));
             state.push('\x1c');
             state.push_str(&super::options::shell_pid().to_string());
+            // 选项状态：子 shell 继承父 shell 的 set -e/-u/-x/... 与 pipefail
+            state.push('\x1c');
+            state.push_str(&super::options::option_string());
+            state.push('\x1c');
+            state.push(if super::options::pipefail() { '1' } else { '0' });
             new_argv.push(state);
         } else {
             for arg in &cmd.argv {
@@ -618,7 +623,7 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
             Some(v) => v,
             None => {
                 if super::options::nounset() {
-                    eprintln!("shell: ${}: unbound variable", name);
+                    eprintln!("shell: ${{{}}}: parameter not set", name);
                     super::options::mark_nounset_violation();
                 }
                 String::new()
@@ -629,7 +634,7 @@ fn lookup_var(name: &str, last_rc: i32) -> String {
         Ok(v) => v,
         Err(_) => {
             if super::options::nounset() {
-                eprintln!("shell: {}: unbound variable", name);
+                eprintln!("shell: {}: parameter not set", name);
                 super::options::mark_nounset_violation();
             }
             String::new()

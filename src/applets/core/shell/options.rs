@@ -31,6 +31,24 @@ static EXIT_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 static RETURN_REQUESTED: AtomicI32 = AtomicI32::new(-1);
 
 /// `$$` 是否尚未初始化（用于区分顶层 shell 与 fork 子 shell）。
+/// 单字母选项设置（`set -e` 等；供 subshell 状态恢复复用）。
+pub(crate) fn set_by_flag(ch: char, on: bool) -> bool {
+    match ch {
+        'a' => set_allexport(on),
+        'b' => set_notify(on),
+        'C' => set_noclobber(on),
+        'e' => set_errexit(on),
+        'f' => set_noglob(on),
+        'm' => set_monitor(on),
+        'n' => set_noexec(on),
+        'u' => set_nounset(on),
+        'v' => set_verbose(on),
+        'x' => set_xtrace(on),
+        _ => return false,
+    }
+    true
+}
+
 pub(crate) fn shell_pid_unset() -> bool {
     SHELL_PID.load(Ordering::SeqCst) == 0
 }
