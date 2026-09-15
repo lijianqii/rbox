@@ -311,17 +311,28 @@ pub(crate) fn wait_any() -> i32 {
 }
 
 pub(crate) fn format_lines(show_pid: bool) -> Vec<String> {
-    list()
-        .iter()
-        .map(|j| {
+    let jobs = list();
+    let n = jobs.len();
+    jobs.iter()
+        .enumerate()
+        .map(|(i, j)| {
             let state = match j.state {
                 JobState::Running => "Running",
                 JobState::Stopped => "Stopped",
             };
-            if show_pid {
-                format!("[{}] {} {}  {}", j.id, j.pgid, state, j.command)
+            // ash 风格：最近作业标 `+`，次近标 `-`
+            let mark = if i + 1 == n {
+                '+'
+            } else if i + 2 == n {
+                '-'
             } else {
-                format!("[{}] {}  {}", j.id, state, j.command)
+                ' '
+            };
+            if show_pid {
+                // `jobs -l`：`[n]+  PID State`（不附命令，状态列对齐）
+                format!("[{}]{}  {:>6} {:<19}", j.id, mark, j.pgid, state)
+            } else {
+                format!("[{}]{}  {}  {}", j.id, mark, state, j.command)
             }
         })
         .collect()

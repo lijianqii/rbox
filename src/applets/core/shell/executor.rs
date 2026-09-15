@@ -243,6 +243,25 @@ pub fn execute_line(
                     *last_rc = rc;
                     continue;
                 }
+                if args[0] == "-p" {
+                    // `command -p`：使用 POSIX 默认 PATH 查找并执行
+                    let saved = std::env::var("PATH").ok();
+                    // SAFETY: shell 单线程
+                    unsafe {
+                        std::env::set_var("PATH", "/sbin:/usr/sbin:/bin:/usr/bin");
+                    }
+                    let script = args[1..].join(" ");
+                    *last_rc = execute_line(&script, last_rc, history, exit_fn);
+                    match saved {
+                        Some(p) => unsafe {
+                            std::env::set_var("PATH", p);
+                        },
+                        None => unsafe {
+                            std::env::remove_var("PATH");
+                        },
+                    }
+                    continue;
+                }
                 let script = args.join(" ");
                 *last_rc = execute_line(&script, last_rc, history, exit_fn);
                 if crate::applets::core::shell::options::return_requested() {

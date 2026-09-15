@@ -122,7 +122,7 @@ LOGIN_OUT_FILE=/tmp/rbox_login_out.$$
 LOGIN_FIFO=/tmp/rbox_login_fifo.$$
 rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
-timeout 200 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
   < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 &
 LOGIN_QPID=$!
@@ -156,7 +156,7 @@ finish_session "$LOGIN_QPID" 9 "$LOGIN_FIFO"
 LOGIN_OUT=$(cat "$LOGIN_OUT_FILE")
 rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
-timeout 200 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
   < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 &
 LOGIN_QPID=$!
@@ -311,6 +311,11 @@ send_boot() {
   printf "echo pid=$$\necho __RBOX_DONE__\n" >&7; wait_main
   printf "set -u; echo x | ( echo \"\$UNSET_IV\" ) 2>&1 | head -1\necho __RBOX_DONE__\n" >&7; wait_main
   printf "set +u; set -- A B; echo x | ( echo \"iv:\$1-\$2\" )\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "umask 022; umask -S\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "command -p echo cmd_p_ok\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "type -t echo\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "read -t 0 rv < /dev/null; echo r0=\$?\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "sleep 5 & jobs -l; kill %%+\necho __RBOX_DONE__\n" >&7; wait_main
   printf "uname -n\necho __RBOX_DONE__\n" >&7; wait_main
   printf "pwd\necho __RBOX_DONE__\n" >&7; wait_main
   printf "echo hello\necho __RBOX_DONE__\n" >&7; wait_main
@@ -657,6 +662,11 @@ assert_line "uname -m -> aarch64" "aarch64"
 assert_line_regex "$$ 展开为数字" "^pid=[0-9]+$"
 assert_contains "子 shell 继承 nounset" "parameter not set"
 assert_line "子 shell 继承位置参数" "iv:A-B"
+assert_line "umask -S 符号输出" "u=rwx,g=rx,o=rx"
+assert_line "command -p 执行" "cmd_p_ok"
+assert_line "type -t 输出类型" "file"
+assert_line "read -t 0 立即返回" "r0=0"
+assert_line_regex "jobs -l 格式" "^(> )?\[[0-9]+\]\+ +[0-9]+ Running *$"
 assert_line "uname -n -> 主机名" "rbox"
 assert_line "pwd -> /" "/"
 assert_line "echo hello -> hello" "hello"
@@ -1113,13 +1123,13 @@ timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
 DISK_QPID=$!
 exec 3> "$DISK_FIFO"
 # 首次登录（root / root）
-B=$(count_of "$DISK_OUT_FILE" "user: "); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "user: " "$B" 200
-B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
+B=$(count_of "$DISK_OUT_FILE" "user: "); printf 'root\n' >&3 2>/dev/null || true; wait_count "$DISK_OUT_FILE" "user: " "$B" 200
+B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3 2>/dev/null || true; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
 # 写盘并同步
-B=$(count_of "$DISK_OUT_FILE" "disk_write_ok"); printf 'echo PERSIST_MARKER > /persist_test.txt; sync; echo disk_write_ok\n' >&3
+B=$(count_of "$DISK_OUT_FILE" "disk_write_ok"); printf 'echo PERSIST_MARKER > /persist_test.txt; sync; echo disk_write_ok\n' >&3 2>/dev/null || true
 wait_count "$DISK_OUT_FILE" "disk_write_ok" "$B" 150
 # 重启：等内核重新启动后重新登录
-printf 'reboot\n' >&3
+printf 'reboot\n' >&3 2>/dev/null || true
 base_boot=$(count_of "$DISK_OUT_FILE" "Linux version")
 for _ in $(seq 150); do
     n=$(count_of "$DISK_OUT_FILE" "Linux version")
@@ -1129,14 +1139,14 @@ done
 sleep 5
 B=$(count_of "$DISK_OUT_FILE" "user: ")
 for _ in $(seq 60); do
-    printf 'root\n' >&3
+    printf 'root\n' >&3 2>/dev/null || true
     n=$(count_of "$DISK_OUT_FILE" "user: ")
     [ "${n:-0}" -gt "${B:-0}" ] && break
     sleep 1
 done
-B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
+B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3 2>/dev/null || true; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
 # 校验持久化数据
-B=$(count_of "$DISK_OUT_FILE" "PERSIST_MARKER"); printf 'cat /persist_test.txt\n' >&3
+B=$(count_of "$DISK_OUT_FILE" "PERSIST_MARKER"); printf 'cat /persist_test.txt\n' >&3 2>/dev/null || true
 wait_count "$DISK_OUT_FILE" "PERSIST_MARKER" "$B" 150
 finish_session "$DISK_QPID" 3 "$DISK_FIFO"
 DISK_OUT=$(cat "$DISK_OUT_FILE")

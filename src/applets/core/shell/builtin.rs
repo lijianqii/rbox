@@ -704,7 +704,13 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 i += 1;
             }
             let (line, complete) = read_line_from_stdin(&opts);
-            if !complete && line.is_empty() {
+            if opts.timeout == Some(0) {
+                // `read -t 0`：立即探测（ash 语义：总是成功，有数据则赋值）
+                if !line.is_empty() {
+                    assign_read_vars(&line, &names);
+                }
+                *last_rc = 0;
+            } else if !complete && line.is_empty() {
                 *last_rc = 1; // EOF / 超时
             } else {
                 assign_read_vars(&line, &names);
@@ -913,18 +919,54 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
         }
         "type" => {
             let mut rc = 0;
-            for name in &cmd.argv[1..] {
-                if let Some(v) = alias::get_alias(name) {
-                    println!("{} is aliased to `{}'", name, v);
+            let mut mode = 'd';
+            let mut names: Vec<&str> = Vec::new();
+            for a in &cmd.argv[1..] {
+                match a.as_str() {
+                    "-a" => mode = 'a',
+                    "-p" | "-P" => mode = 'p',
+                    "-t" => mode = 't',
+                    _ => names.push(a),
+                }
+            }
+            for name in names {
+                let kind = if alias::get_alias(name).is_some() {
+                    "alias"
                 } else if is_builtin(name) {
-                    println!("{} is a shell builtin", name);
+                    "builtin"
                 } else if functions::is_function(name) {
-                    println!("{} is a function", name);
-                } else if let Some(p) = super::executor::command_path(name) {
-                    println!("{} is {}", name, p);
+                    "function"
+                } else if super::executor::command_path(name).is_some() {
+                    "file"
                 } else {
-                    println!("{}: not found", name);
-                    rc = 1;
+                    ""
+                };
+                match mode {
+                    't' => {
+                        if kind.is_empty() {
+                            rc = 1;
+                        } else {
+                            println!("{}", kind);
+                        }
+                    }
+                    'p' => match super::executor::command_path(name) {
+                        Some(p) => println!("{}", p),
+                        None => rc = 1,
+                    },
+                    _ => {
+                        if let Some(v) = alias::get_alias(name) {
+                            println!("{} is aliased to `{}'", name, v);
+                        } else if is_builtin(name) {
+                            println!("{} is a shell builtin", name);
+                        } else if functions::is_function(name) {
+                            println!("{} is a function", name);
+                        } else if let Some(p) = super::executor::command_path(name) {
+                            println!("{} is {}", name, p);
+                        } else {
+                            println!("{}: not found", name);
+                            rc = 1;
+                        }
+                    }
                 }
             }
             *last_rc = rc;
@@ -939,14 +981,34 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
             let old = unsafe { libc::umask(0) };
             unsafe { libc::umask(old) };
             if let Some(m) = cmd.argv.get(1) {
-                match u32::from_str_radix(m, 8) {
-                    Ok(v) => {
-                        unsafe { libc::umask(v) };
-                        *last_rc = 0;
-                    }
-                    Err(_) => {
-                        eprintln!("umask: invalid mode: {}", m);
-                        *last_rc = 1;
+                if m == "-S" {
+                    // 符号输出：允许的权限（掩码取反）
+                    let sym = |bits: u32| {
+                        format!(
+                            "{}{}{}",
+                            if bits & 4 != 0 { "r" } else { "" },
+                            if bits & 2 != 0 { "w" } else { "" },
+                            if bits & 1 != 0 { "x" } else { "" }
+                        )
+                    };
+                    let perm = !old & 0o777;
+                    println!(
+                        "u={},g={},o={}",
+                        sym((perm >> 6) & 7),
+                        sym((perm >> 3) & 7),
+                        sym(perm & 7)
+                    );
+                    *last_rc = 0;
+                } else {
+                    match u32::from_str_radix(m, 8) {
+                        Ok(v) => {
+                            unsafe { libc::umask(v) };
+                            *last_rc = 0;
+                        }
+                        Err(_) => {
+                            eprintln!("umask: invalid mode: {}", m);
+                            *last_rc = 1;
+                        }
                     }
                 }
             } else {

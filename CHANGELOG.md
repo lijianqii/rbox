@@ -48,6 +48,8 @@
 - 集成测试驱动重构：所有 QEMU 会话由"固定 sleep"改为 FIFO + 提示符/计数/sentinel 等待，
   消除时序漂移导致的偶发断言失败；顺带修复 `read x < file` 消费 REPL 预读缓冲、
   监控线程抢走嵌套 shell 输入两个真实缺陷
+- 内置命令补齐：`umask -S`（符号输出）、`type -a/-p/-t`、`command -p`、
+  `read -t 0`（立即探测语义）、`jobs -l` 格式对齐 ash（`[n]+  PID State`）
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -82,7 +84,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 794 个、QEMU 集成断言 264 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 794 个、QEMU 集成断言 269 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
