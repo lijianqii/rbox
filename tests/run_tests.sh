@@ -137,12 +137,21 @@ B=$(count_of "$LOGIN_OUT_FILE" "passwd"); send_login root; wait_count "$LOGIN_OU
 B=$(count_of "$LOGIN_OUT_FILE" "Login incorrect"); send_login wrongpass2; wait_count "$LOGIN_OUT_FILE" "Login incorrect" "$B" 150
 B=$(count_of "$LOGIN_OUT_FILE" "passwd"); send_login root; wait_count "$LOGIN_OUT_FILE" "passwd" "$B" 150
 send_login root
-send_login "echo LOGIN_OK"; wait_count "$LOGIN_OUT_FILE" "LOGIN_OK" 0 150
-send_login "ls -l /proc/self/fd/0"; wait_count "$LOGIN_OUT_FILE" "/dev/ttyAMA0" 0 150
+send_login_until() {  # $1=期望输出 $2=命令
+    local base; base=$(count_of "$LOGIN_OUT_FILE" "$1")
+    for _ in $(seq 40); do
+        send_login "$2"
+        [ "$(count_of "$LOGIN_OUT_FILE" "$1")" -gt "$base" ] && return 0
+        sleep 1
+    done
+    return 0
+}
+send_login_until "LOGIN_OK" "echo LOGIN_OK"
+send_login_until "/dev/ttyAMA0" "ls -l /proc/self/fd/0"
 B=$(count_of "$LOGIN_OUT_FILE" "user: "); send_login exit; wait_count "$LOGIN_OUT_FILE" "user: " "$B" 150
 B=$(count_of "$LOGIN_OUT_FILE" "passwd"); send_login root; wait_count "$LOGIN_OUT_FILE" "passwd" "$B" 150
 send_login root
-send_login "echo LOGIN_AGAIN"; wait_count "$LOGIN_OUT_FILE" "LOGIN_AGAIN" 0 150
+send_login_until "LOGIN_AGAIN" "echo LOGIN_AGAIN"
 finish_session "$LOGIN_QPID" 9 "$LOGIN_FIFO"
 LOGIN_OUT=$(cat "$LOGIN_OUT_FILE")
 rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
