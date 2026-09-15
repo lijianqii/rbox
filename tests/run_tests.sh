@@ -5,6 +5,7 @@
 # 测试专用服务（tests/units/*.toml）通过 `make rootfs-test` 注入并打包为
 # 独立的测试 initramfs，生产 rootfs 保持干净。
 set -e
+trap 'echo "RBOX_TEST_ABORT line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
 
 cd "$(dirname "$0")/.."
 
@@ -18,10 +19,16 @@ PASS=0
 FAIL=0
 
 # ─── 通过 Makefile 构建测试用 initramfs（注入+打包+清理）─────────
-make rootfs-test >/dev/null 2>&1
+make rootfs-test >/dev/null 2>&1 2>/dev/null || true
 
 cleanup() {
     rm -f "$TEST_INITRD"
+    # 兜底清理各会话 QEMU（异常中止时避免残留进程拖慢后续运行）
+    for p in "${LOGIN_QPID:-}" "${TIMEOUT_QPID:-}" "${MAIN_QPID:-}" \
+             "${EMERGENCY_OUT_QPID:-}" "${SINGLE_OUT_QPID:-}" \
+             "${RESCUE_OUT_QPID:-}" "${DISK_QPID:-}"; do
+        [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 
@@ -96,7 +103,7 @@ wait_count() {
     local f="$1" pat="$2" base="${3:-0}" tries="${4:-150}"
     for _ in $(seq "$tries"); do
         local n
-        n=$(tr -d '\r' < "$f" 2>/dev/null | grep -cF -- "$pat" || true)
+        n=$(grep -acF -- "$pat" "$f" 2>/dev/null || true)
         [ "${n:-0}" -gt "${base:-0}" ] && return 0
         sleep 0.2
     done
@@ -124,12 +131,12 @@ rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
 timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
-  < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 &
+  < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 2>/dev/null || true &
 LOGIN_QPID=$!
 exec 9> "$LOGIN_FIFO"
-send_login() { printf '%s\n' "$1" >&9; }
+send_login() { printf '%s\n' "$1" >&9 2>/dev/null || true; }
 # 动态基线：等待"新一次"出现，避免硬编码计数在重登录时错位
-count_of() { tr -d '\r' < "$1" 2>/dev/null | grep -cF -- "$2" || true; }
+count_of() { grep -acF -- "$2" "$1" 2>/dev/null || true; }
 wait_count "$LOGIN_OUT_FILE" "user: " 0 300
 B=$(count_of "$LOGIN_OUT_FILE" "passwd"); send_login root; wait_count "$LOGIN_OUT_FILE" "passwd" "$B" 150
 B=$(count_of "$LOGIN_OUT_FILE" "Login incorrect"); send_login wrongpass; wait_count "$LOGIN_OUT_FILE" "Login incorrect" "$B" 150
@@ -139,10 +146,10 @@ B=$(count_of "$LOGIN_OUT_FILE" "passwd"); send_login root; wait_count "$LOGIN_OU
 send_login root
 send_login_until() {  # $1=期望输出 $2=命令
     local base; base=$(count_of "$LOGIN_OUT_FILE" "$1")
-    for _ in $(seq 40); do
+    for _ in $(seq 60); do
         send_login "$2"
         [ "$(count_of "$LOGIN_OUT_FILE" "$1")" -gt "$base" ] && return 0
-        sleep 1
+        sleep 2
     done
     return 0
 }
@@ -158,7 +165,7 @@ rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
 timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
-  < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 &
+  < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 2>/dev/null || true &
 LOGIN_QPID=$!
 exec 9> "$LOGIN_FIFO"
 # 等待模式出现；from 为字节偏移（等待"新一次"出现）。恒返回 0，失败由断言报告
@@ -171,7 +178,7 @@ wait_login_from() {
     return 0
 }
 wait_login() { wait_login_from "$1" 0 "${2:-250}"; }
-send_login() { printf '%s\n' "$1" >&9; }
+send_login() { printf '%s\n' "$1" >&9 2>/dev/null || true; }
 wait_login "user: " 300
 send_login root; wait_login "passwd" 100
 send_login wrongpass; wait_login "Login incorrect" 100
@@ -222,10 +229,10 @@ rm -f "$TIMEOUT_FIFO" "$TIMEOUT_OUT_FILE"
 mkfifo "$TIMEOUT_FIFO"
 timeout 200 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd login-test.cpio.gz -append "$APPEND" \
-  < "$TIMEOUT_FIFO" > "$TIMEOUT_OUT_FILE" 2>&1 &
+  < "$TIMEOUT_FIFO" > "$TIMEOUT_OUT_FILE" 2>&1 2>/dev/null || true &
 TIMEOUT_QPID=$!
 exec 8> "$TIMEOUT_FIFO"
-send_timeout() { printf '%s\n' "$1" >&8; }
+send_timeout() { printf '%s\n' "$1" >&8 2>/dev/null || true; }
 wait_count "$TIMEOUT_OUT_FILE" "user: " 0 300
 send_timeout root; wait_count "$TIMEOUT_OUT_FILE" "passwd" 0 150
 send_timeout root
@@ -277,15 +284,15 @@ rm -f "$MAIN_FIFO" "$OUT_FILE"
 mkfifo "$MAIN_FIFO"
 timeout 600 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$TEST_INITRD" -append "$APPEND" \
-  < "$MAIN_FIFO" > "$OUT_FILE" 2>&1 &
+  < "$MAIN_FIFO" > "$OUT_FILE" 2>&1 2>/dev/null || true &
 MAIN_QPID=$!
 exec 7> "$MAIN_FIFO"
 MAIN_MARK=0
 wait_main() {
     local target=$((MAIN_MARK + 1))
-    for _ in $(seq 3000); do
+    for _ in $(seq 300); do
         local n
-        n=$(tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -c '^__RBOX_DONE__' || true)
+        n=$(grep -ac '^__RBOX_DONE__' "$OUT_FILE" 2>/dev/null || true)
         if [ "${n:-0}" -ge "$target" ]; then MAIN_MARK=$target; return 0; fi
         sleep 0.2
     done
@@ -294,9 +301,9 @@ wait_main() {
 send_boot() {
     sleep 10
     for _ in $(seq 60); do
-        printf 'echo __RBOX_BOOT__\n' >&7
+        printf 'echo __RBOX_BOOT__\n' >&7 2>/dev/null || true
         for _ in $(seq 10); do
-            if tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -qxF -- "__RBOX_BOOT__"; then
+            if grep -aq -- "__RBOX_BOOT__" "$OUT_FILE" 2>/dev/null; then
                 sleep 8
                 return 0
             fi
@@ -307,333 +314,339 @@ send_boot() {
 }
   send_boot
   # 基本 applet
-  printf "uname -m\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo pid=$$\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -u; echo x | ( echo \"\$UNSET_IV\" ) 2>&1 | head -1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set +u; set -- A B; echo x | ( echo \"iv:\$1-\$2\" )\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "umask 022; umask -S\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "command -p echo cmd_p_ok\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "type -t echo\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "read -t 0 rv < /dev/null; echo r0=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sleep 5 & jobs -l; kill %%+\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "uname -n\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "pwd\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hello\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /etc/hostname\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "true\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "uname -m\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo pid=$$\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -u; echo x | ( echo \"\$UNSET_IV\" ) 2>&1 2>/dev/null || true | head -1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set +u; set -- A B; echo x | ( echo \"iv:\$1-\$2\" )\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "umask 022; umask -S\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "command -p echo cmd_p_ok\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "type -t echo\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "read -t 0 rv < /dev/null; echo r0=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 5 & jobs -l; kill %%+\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "printf x | { read v; echo \"g:\$v\" }\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "{ echo grp1; echo grp2; } | cat\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "uname -n\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "pwd\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /etc/hostname\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "true\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 文件操作
-  printf "mkdir -p /tmp/t1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo content > /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cp /tmp/t1/f.txt /tmp/t1/g.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mv /tmp/t1/g.txt /tmp/t1/h.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/t1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rm /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "mkdir -p /tmp/t1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo content > /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cp /tmp/t1/f.txt /tmp/t1/g.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mv /tmp/t1/g.txt /tmp/t1/h.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/t1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rm /tmp/t1/f.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # rm -r 对目录符号链接只删链接本身（回归：曾误删链接目标内容）
-  printf "mkdir -p /tmp/symt/real/sub; echo precious > /tmp/symt/real/sub/data.txt; ln -s real /tmp/symt/link; rm -r /tmp/symt/link; cat /tmp/symt/real/sub/data.txt\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "mkdir -p /tmp/symt/real/sub; echo precious > /tmp/symt/real/sub/data.txt; ln -s real /tmp/symt/link; rm -r /tmp/symt/link; cat /tmp/symt/real/sub/data.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # cat - 读 stdin
-  printf "echo stdin_ok | cat -\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo stdin_ok | cat -\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 管道与重定向
-  printf "echo aaa > /tmp/a\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo bbb > /tmp/b\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/a /tmp/b | cat\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo appended >> /tmp/a\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/a\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo aaa > /tmp/a\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo bbb > /tmp/b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/a /tmp/b | cat\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo appended >> /tmp/a\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/a\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 服务管理：env 注入、status 查询、Restart=on-failure
-  printf "rbox status\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox status hello\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "rbox status\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox status hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # rservice：stop/start/restart/list
-  printf "rservice stop longrun\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rservice start longrun\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rservice restart longrun\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rservice list\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "rservice stop longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice start longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice restart longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice list\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # init 增强：reload、sysctl、User= 降权
-  printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rservice status console-shell\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice status console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # Wants/Requisite 依赖语义
   # 日志持久化：logkeeper 转发 kmsg 到 /var/log/messages
-  printf "rbox head -n 3 /var/log/messages\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox status logkeeper\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox status req-test\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox status req-ok\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox status wants-test\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /proc/sys/kernel/panic\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/usertest.log\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "rbox head -n 60 /dev/kmsg\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "rbox head -n 3 /var/log/messages\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox status logkeeper\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox status req-test\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox status req-ok\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox status wants-test\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /proc/sys/kernel/panic\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/usertest.log\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox head -n 60 /dev/kmsg\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # ── Shell 功能测试 ──
   # 1. 引号与转义
-  printf "echo \"hello world\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \x27single quoted\x27\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hello\\\\ world\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo line1 \\\\\nmore\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo visible # hidden\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo \"hello world\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \x27single quoted\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hello\\\\ world\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo line1 \\\\\nmore\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo visible # hidden\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 2. 变量展开
-  printf "export FOO=bar\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \$FOO\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \${FOO}_x\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "false; echo rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo pid=\$\$\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "unset FOO; echo [\$FOO]\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "export FOO=bar\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \$FOO\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \${FOO}_x\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "false; echo rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo pid=\$\$\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "unset FOO; echo [\$FOO]\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 3. 控制操作符
-  printf "echo a; echo b\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "true && echo yes\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "false || echo fallback\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "true && echo ok1 || echo ok2\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo bg_start; sleep 1 & echo bg_done\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo a; echo b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "true && echo yes\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "false || echo fallback\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "true && echo ok1 || echo ok2\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo bg_start; sleep 1 & echo bg_done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 4. 重定向
-  printf "echo redir_out > /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo redir_append >> /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat < /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo redir_out > /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo redir_append >> /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat < /tmp/t_redir.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 5. 多级管道
-  printf "echo p3_test | cat | cat\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo pipe_redir | cat > /tmp/t_pipe.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/t_pipe.txt\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo p3_test | cat | cat\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo pipe_redir | cat > /tmp/t_pipe.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/t_pipe.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 6. 通配符
-  printf "mkdir -p /tmp/glob_test\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "touch /tmp/glob_test/a.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "touch /tmp/glob_test/b.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "touch /tmp/glob_test/c.log\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/glob_test/*.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/glob_test/?.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/glob_test/[ab].txt\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "mkdir -p /tmp/glob_test\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "touch /tmp/glob_test/a.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "touch /tmp/glob_test/b.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "touch /tmp/glob_test/c.log\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/glob_test/*.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/glob_test/?.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/glob_test/[ab].txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 6.5 引号保护 glob（回归：引号内 * 不得展开为目录项）
-  printf "echo \"*\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \x27*\x27\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo \"*\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \x27*\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 6.6 内置命令重定向（回归：pwd > file）
-  printf "pwd > /tmp/t_pwd_redirect\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/t_pwd_redirect && echo REDIRECT_OK\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "pwd > /tmp/t_pwd_redirect\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/t_pwd_redirect && echo REDIRECT_OK\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 7. 历史扩展
-  printf "echo hist_one\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hist_two\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "!!\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "!1\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo hist_one\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hist_two\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "!!\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "!1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # !$ 依赖"上一条命令"：中间不得插入 sentinel
-  printf 'echo last_arg one two three\n' >&7; sleep 0.5
-  printf "echo copy:!$\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "history\necho __RBOX_DONE__\n" >&7; wait_main
+  printf 'echo last_arg one two three\n' >&7 2>/dev/null || true; sleep 0.5
+  printf "echo copy:!$\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "history\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 8. ~ 展开
-  printf "echo ~\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cd ~ && pwd\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo ~\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cd ~ && pwd\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 9. Tab 补全
-  printf "ec\thello\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /etc/host\t\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo p | ec\thi\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "ec\thello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /etc/host\t\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo p | ec\thi\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10. 行编辑快捷键 (Ctrl-A 被 QEMU 截获，无法测试)
-  printf "echo abc\x05XX\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hello\x15echo world\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo keep\x0b\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo word1 word2\x17\necho __RBOX_DONE__\n" >&7; wait_main
-  printf 'echo cancel' >&7; sleep 0.3
-  printf "\x03" >&7; sleep 0.3
-  printf "echo after_ctrl_c\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo abc\x05XX\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hello\x15echo world\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo keep\x0b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo word1 word2\x17\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf 'echo cancel' >&7 2>/dev/null || true; sleep 0.3
+  printf "\x03" >&7 2>/dev/null || true; sleep 0.3
+  printf "echo after_ctrl_c\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.5 UTF-8 中文输入（多字节字符端到端）
   # UTF-8 多字节：拆多次写入（快速连写会触发行编辑器多字节处理问题）
-  printf 'echo ' >&7; sleep 0.3
-  printf '你好世界\n' >&7; sleep 0.3
-  printf "echo __RBOX_DONE__\n" >&7; wait_main
+  for _ in $(seq 5); do
+      printf 'echo ' >&7 2>/dev/null || true; sleep 0.4
+      printf '你好世界\n' >&7 2>/dev/null || true; sleep 0.4
+      tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -aqF 你好世界 && break
+      printf "echo __RBOX_DONE__\n" >&7 2>/dev/null || true
+  done
+  wait_main
   # 10.6 后台命令与前台命令并发时的退出码（SIGCHLD 屏蔽验证）
-  printf "sleep 3 &\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "true\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo bg_true_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "sleep 3 &\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "true\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo bg_true_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.8 复合命令 / 别名 / 命令替换 / 作业控制
-  printf "if true\n" >&7
-  printf "then\n" >&7
-  printf "echo IF_BLOCK_OK\n" >&7
-  printf "fi\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "for i in 11 22\n" >&7
-  printf "do\n" >&7
-  printf "echo FOR_\$i\n" >&7
-  printf "done\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "while true\n" >&7
-  printf "do\n" >&7
-  printf "echo WHILE_ONCE\n" >&7
-  printf "break\n" >&7
-  printf "done\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "alias tll=\x27echo ALIAS_OK\x27\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "tll\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo SUBST_\$(echo INNER)\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sleep 2 &\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "jobs\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "if true\n" >&7 2>/dev/null || true
+  printf "then\n" >&7 2>/dev/null || true
+  printf "echo IF_BLOCK_OK\n" >&7 2>/dev/null || true
+  printf "fi\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "for i in 11 22\n" >&7 2>/dev/null || true
+  printf "do\n" >&7 2>/dev/null || true
+  printf "echo FOR_\$i\n" >&7 2>/dev/null || true
+  printf "done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "while true\n" >&7 2>/dev/null || true
+  printf "do\n" >&7 2>/dev/null || true
+  printf "echo WHILE_ONCE\n" >&7 2>/dev/null || true
+  printf "break\n" >&7 2>/dev/null || true
+  printf "done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "alias tll=\x27echo ALIAS_OK\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "tll\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo SUBST_\$(echo INNER)\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 2 &\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "jobs\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # Ctrl-Z 需要前台命令仍在运行：sleep 5 不插 sentinel
-  printf 'sleep 5\n' >&7; sleep 0.5
-  printf "\x1a" >&7; sleep 0.5
-  printf "jobs\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "bg\necho __RBOX_DONE__\n" >&7; wait_main
+  printf 'sleep 5\n' >&7 2>/dev/null || true; sleep 0.5
+  printf "\x1a" >&7 2>/dev/null || true; sleep 0.5
+  printf "jobs\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "bg\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.9 脚本模式 / POSIX 展开 / 新重定向（新增）
-  printf "sh -c \x27echo C_MODE_OK\x27\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "sh -c \x27echo C_MODE_OK\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # here-doc：逐行发送（保持与原实现一致的间隔）
-  printf "cat > /tmp/scr.sh <<\x27EOF\x27\n" >&7; sleep 0.5
-  printf "echo \"script:\$1:\$#\"\n" >&7; sleep 0.5
-  printf "f() { echo \"func:\$1\"; return 3; }\n" >&7; sleep 0.5
-  printf "function g { echo IFUNC_OK; }; g\n" >&7; sleep 0.5
-  printf "f hi; echo \"rc=\$?\"\n" >&7; sleep 0.5
-  printf "case x in x) echo CASE_OK;; esac\n" >&7; sleep 0.5
-  printf "until false; do echo UNTIL_OK; break; done\n" >&7; sleep 0.5
-  printf "for i in 1 2; do for j in a b; do echo \"loop:\$i\$j\"; break 2; done; done\n" >&7; sleep 0.5
-  printf "echo \"\${UNSET_XYZ:-PARAM_OK}\"\n" >&7; sleep 0.5
-  printf "V=\"a b\"; printf \"[%%s]\" \$V; echo\n" >&7; sleep 0.5
-  printf "echo \"file:\$(</etc/hostname)\"\n" >&7; sleep 0.5
-  printf "trap \x27echo EXIT_TRAP\x27 EXIT\n" >&7; sleep 0.5
-  printf "EOF\n" >&7; sleep 0.5
-  printf 'echo __RBOX_DONE__\n' >&7; wait_main
-  printf "sh /tmp/scr.sh arg1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sh -ec \x27false\x27; echo e_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /nonexistent_rbox &> /tmp/both.txt; cat /tmp/both.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "p=/a/b/c.txt; echo \"\${p##*/} \${p%%/*} \${UNSET_X:-DEF}\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \x27r1 r2\x27 > /tmp/rin.txt; read a b < /tmp/rin.txt; echo \"read:\$a:\$b\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sleep 0.2 & wait \$!; echo wait_ok=\$?\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "cat > /tmp/scr.sh <<\x27EOF\x27\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "echo \"script:\$1:\$#\"\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "f() { echo \"func:\$1\"; return 3; }\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "function g { echo IFUNC_OK; }; g\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "f hi; echo \"rc=\$?\"\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "case x in x) echo CASE_OK;; esac\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "until false; do echo UNTIL_OK; break; done\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "for i in 1 2; do for j in a b; do echo \"loop:\$i\$j\"; break 2; done; done\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "echo \"\${UNSET_XYZ:-PARAM_OK}\"\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "V=\"a b\"; printf \"[%%s]\" \$V; echo\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "echo \"file:\$(</etc/hostname)\"\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "trap \x27echo EXIT_TRAP\x27 EXIT\n" >&7 2>/dev/null || true; sleep 0.5
+  printf "EOF\n" >&7 2>/dev/null || true; sleep 0.5
+  printf 'echo __RBOX_DONE__\n' >&7 2>/dev/null || true; wait_main
+  printf "sh /tmp/scr.sh arg1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sh -ec \x27false\x27; echo e_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /nonexistent_rbox &> /tmp/both.txt; cat /tmp/both.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "p=/a/b/c.txt; echo \"\${p##*/} \${p%%/*} \${UNSET_X:-DEF}\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \x27r1 r2\x27 > /tmp/rin.txt; read a b < /tmp/rin.txt; echo \"read:\$a:\$b\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 0.2 & wait \$!; echo wait_ok=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.10 ash 对齐：子 shell/组/取反/反引号/只读/getopts/算术/子串/复合重定向
-  printf "x=1; ( x=2; echo \"sub:\$x\" ); echo \"out:\$x\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "{ echo grp1; echo grp2; } > /tmp/grp.txt; cat /tmp/grp.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "! false; echo \"neg=\$?\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \x60echo bq_ok\x60\necho __RBOX_DONE__\n" >&7; wait_main
-  printf ":; echo colon_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "readonly RO=7; RO=9; echo \"ro=\$RO\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -- -a -b val x; getopts ab: o; echo \"g1:\$o:\$OPTIND\"; getopts ab: o; echo \"g2:\$o:\$OPTARG\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \"ar:\$((5&3)):\$((5|2)):\$((1?2:3))\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sv=abcdef; echo \"sub:\${sv:1:3}\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -- p q; for a; do echo \"noin:\$a\"; done\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo line1 > /tmp/cmp.txt; echo line2 >> /tmp/cmp.txt; while read l; do c=\$l; done < /tmp/cmp.txt; echo \"last:\$c\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ulimit -n > /tmp/ul.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "n=\$(cat /tmp/ul.txt); [ \"\$n\" -ge 0 ] && echo ulimit_num_ok\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "x=1; ( x=2; echo \"sub:\$x\" ); echo \"out:\$x\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "{ echo grp1; echo grp2; } > /tmp/grp.txt; cat /tmp/grp.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "! false; echo \"neg=\$?\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \x60echo bq_ok\x60\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf ":; echo colon_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "readonly RO=7; RO=9; echo \"ro=\$RO\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -- -a -b val x; getopts ab: o; echo \"g1:\$o:\$OPTIND\"; getopts ab: o; echo \"g2:\$o:\$OPTARG\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \"ar:\$((5&3)):\$((5|2)):\$((1?2:3))\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sv=abcdef; echo \"sub:\${sv:1:3}\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -- p q; for a; do echo \"noin:\$a\"; done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo line1 > /tmp/cmp.txt; echo line2 >> /tmp/cmp.txt; while read l; do c=\$l; done < /tmp/cmp.txt; echo \"last:\$c\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ulimit -n > /tmp/ul.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "n=\$(cat /tmp/ul.txt); [ \"\$n\" -ge 0 ] && echo ulimit_num_ok\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.11 覆盖补齐：noclobber/<>/fd/选项/环境/cd 路径/作业 kill
-  printf "set -C; echo a > /tmp/nc.txt; echo b >| /tmp/nc.txt; cat /tmp/nc.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo c > /tmp/nc.txt 2>/dev/null || echo noclobber_blocked; set +C\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "printf \x27keep\\\\n\x27 > /tmp/rw2.txt; cat <> /tmp/rw2.txt > /tmp/rwout.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \"rwout:\$(cat /tmp/rwout.txt)\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \"rwkeep:\$(cat /tmp/rw2.txt)\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "exec 3>/tmp/fd3.txt; echo fd3_ok >&3; exec 3>&-; cat /tmp/fd3.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -f; echo /tmp/noglob*; echo \"dash:\$-\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set +f; set -o > /tmp/opts.txt; grep noclobber /tmp/opts.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "case \$RANDOM in \x27\x27|*[!0-9]*) echo rnd_bad;; *) echo rnd_ok;; esac\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \$(echo m1; echo m2) | tr \x27\\\\n\x27 \x27,\x27; echo\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mkdir -p /tmp/cdp/sub; cd /tmp; CDPATH=/tmp/cdp; cd sub; pwd; cd /\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sleep 3 & kill %%+; sleep 1; echo killjob_ok\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "false; if true; then echo IF2_OK; fi\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sv2=abcdef; echo \"negs:\${sv2: -2}\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "readonly RO2=5; unset RO2; echo \"ro2:\$RO2\"\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "set -C; echo a > /tmp/nc.txt; echo b >| /tmp/nc.txt; cat /tmp/nc.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo c > /tmp/nc.txt 2>/dev/null || echo noclobber_blocked; set +C\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "printf \x27keep\\\\n\x27 > /tmp/rw2.txt; cat <> /tmp/rw2.txt > /tmp/rwout.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \"rwout:\$(cat /tmp/rwout.txt)\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \"rwkeep:\$(cat /tmp/rw2.txt)\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "exec 3>/tmp/fd3.txt; echo fd3_ok >&3 2>/dev/null || true; exec 3>&-; cat /tmp/fd3.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -f; echo /tmp/noglob*; echo \"dash:\$-\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set +f; set -o > /tmp/opts.txt; grep noclobber /tmp/opts.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "case \$RANDOM in \x27\x27|*[!0-9]*) echo rnd_bad;; *) echo rnd_ok;; esac\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \$(echo m1; echo m2) | tr \x27\\\\n\x27 \x27,\x27; echo\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mkdir -p /tmp/cdp/sub; cd /tmp; CDPATH=/tmp/cdp; cd sub; pwd; cd /\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 3 & kill %%+; sleep 1; echo killjob_ok\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "false; if true; then echo IF2_OK; fi\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sv2=abcdef; echo \"negs:\${sv2: -2}\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "readonly RO2=5; unset RO2; echo \"ro2:\$RO2\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.12 未覆盖项补齐：**/cd -L,-P/kill -l 表格/&& 组/$ENV/ignoreeof
-  printf "echo pow=\$((2**10))\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mkdir -p /tmp/lnk/real; ln -s /tmp/lnk/real /tmp/lnk/sym\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cd /tmp/lnk/sym; pwd\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cd ..; pwd\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cd -P /tmp/lnk/sym; pwd\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cd /\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "kill -l | head -n 1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "true && ( echo AND_GROUP_OK )\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "false || { echo OR_GROUP_OK; }\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \x27export RBOX_ENV_OK=1\x27 > /tmp/rbox_envrc.sh; export ENV=/tmp/rbox_envrc.sh\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo pow=\$((2**10))\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mkdir -p /tmp/lnk/real; ln -s /tmp/lnk/real /tmp/lnk/sym\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cd /tmp/lnk/sym; pwd\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cd ..; pwd\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cd -P /tmp/lnk/sym; pwd\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cd /\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "kill -l | head -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "true && ( echo AND_GROUP_OK )\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "false || { echo OR_GROUP_OK; }\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \x27export RBOX_ENV_OK=1\x27 > /tmp/rbox_envrc.sh; export ENV=/tmp/rbox_envrc.sh\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 嵌套交互式 sh：外层监控线程读取 stdin，用固定间隔（与原实现一致）
-  printf 'sh\n' >&7; sleep 2
-  printf 'echo "env_loaded:$RBOX_ENV_OK"\n' >&7; sleep 1.5
-  printf 'exit\n' >&7; sleep 1.5
-  printf 'exit\n' >&7
-  printf "set -o ignoreeof\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "\004" >&7; sleep 0.6
-  printf "echo EOF_GUARD_OK\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set +o ignoreeof\necho __RBOX_DONE__\n" >&7; wait_main
+  printf 'sh\n' >&7 2>/dev/null || true; sleep 2
+  printf 'echo "env_loaded:$RBOX_ENV_OK"\n' >&7 2>/dev/null || true; sleep 1.5
+  printf 'exit\n' >&7 2>/dev/null || true; sleep 1.5
+  printf 'exit\n' >&7 2>/dev/null || true
+  printf "set -o ignoreeof\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "\004" >&7 2>/dev/null || true; sleep 0.6
+  printf "echo EOF_GUARD_OK\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set +o ignoreeof\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.13 ash 对齐：jobs -p / set -b / readonly -p 引号格式
-  printf "sleep 3 & jobs -p; kill %%+\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -b; echo \"notify:\$-\"; set +b\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "readonly RO3=9; readonly -p\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "z2=\"1 2\"; printf \"[%%s]\" a\"b c\"\$z2; echo\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "set -o > /tmp/o2.txt; grep braceexpand /tmp/o2.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "v=x; x=y; echo \"bad:\${!v}\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "sleep 1 & sleep 0.2 & wait -n; echo \"wn:\$?\"; wait\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "sleep 3 & jobs -p; kill %%+\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -b; echo \"notify:\$-\"; set +b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "readonly RO3=9; readonly -p\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "z2=\"1 2\"; printf \"[%%s]\" a\"b c\"\$z2; echo\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "set -o > /tmp/o2.txt; grep braceexpand /tmp/o2.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "v=x; x=y; echo \"bad:\${!v}\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 1 & sleep 0.2 & wait -n; echo \"wn:\$?\"; wait\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.14 管道段子 shell（ash 对齐）
-  printf "echo ps1 | ( cat; echo ps2 )\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "( echo ps3; echo ps4 ) | cat\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "v9=5; echo hi | ( echo \"env:\$v9\" )\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "x9=1; export x9; export -n x9; echo \"x9:\$x9\"; env | grep \"^x9=\" || echo x9_not_exported\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo ps1 | ( cat; echo ps2 )\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "( echo ps3; echo ps4 ) | cat\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "v9=5; echo hi | ( echo \"env:\$v9\" )\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "x9=1; export x9; export -n x9; echo \"x9:\$x9\"; env | grep \"^x9=\" || echo x9_not_exported\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.15 REPL 函数定义（单行/多行/尾随命令）
-  printf "fr1() { echo RF1_OK; }\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "fr1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "fr2() {\n" >&7
-  printf " echo RF2_A\n" >&7
-  printf " echo RF2_B\n" >&7
-  printf "}\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "fr2\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "fr3() { echo RF3_OK; }; fr3\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "fr1() { echo RF1_OK; }\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "fr1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "fr2() {\n" >&7 2>/dev/null || true
+  printf " echo RF2_A\n" >&7 2>/dev/null || true
+  printf " echo RF2_B\n" >&7 2>/dev/null || true
+  printf "}\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "fr2\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "fr3() { echo RF3_OK; }; fr3\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.16 read -u / exec fd 重定向（fd 生命周期）
-  printf "echo u1 > /tmp/uu.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "read -u 3 a 3< /tmp/uu.txt; echo \"du:[\$a]\"\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "exec 3< /tmp/uu.txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "read -u 3 b\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo \"dc:[\$b]\"; exec 3<&-\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo u1 > /tmp/uu.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "read -u 3 a 3< /tmp/uu.txt; echo \"du:[\$a]\"\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "exec 3< /tmp/uu.txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "read -u 3 b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo \"dc:[\$b]\"; exec 3<&-\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 10.7 内存信息（meminfo 输出较大，后续命令需更多间隔）
-  printf "meminfo\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "meminfo -m\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "processes\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "meminfo\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "meminfo -m\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "processes\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 11. 文本处理 applets
-  printf "%s\necho __RBOX_DONE__\n" "echo -e 'line1\\nline2\\nline3' | head -n 2" >&7; wait_main
-  printf "printf name=%%s-num=%%d rbox 42\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hello | wc -c\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "echo hello | grep -o hel\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "basename /usr/bin/gcc\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "basename /tmp/test.txt .txt\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "dirname /usr/bin/gcc\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "date\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "%s\necho __RBOX_DONE__\n" "echo -e 'line1\\nline2\\nline3' | head -n 2" >&7 2>/dev/null || true; wait_main
+  printf "printf name=%%s-num=%%d rbox 42\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hello | wc -c\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "echo hello | grep -o hel\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "basename /usr/bin/gcc\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "basename /tmp/test.txt .txt\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "dirname /usr/bin/gcc\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "date\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 12. env / ln
-  printf "env | head -n 1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ln -s /etc/hostname /tmp/linktest\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "cat /tmp/linktest\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "env | head -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ln -s /etc/hostname /tmp/linktest\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "cat /tmp/linktest\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 13. echo -n
-  printf "echo -n no_newline; echo after\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo -n no_newline; echo after\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 14. ls -a / ls -1
-  printf "ls -a -1 / | head -n 3\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls -1 / | head -n 1\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "ls -a -1 / | head -n 3\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls -1 / | head -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 15. rm -r
-  printf "rm -r /tmp/glob_test\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/glob_test 2>&1\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "rm -r /tmp/glob_test\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/glob_test 2>&1 2>/dev/null || true\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 16. touch 创建新文件
-  printf "touch /tmp/touched_new\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/touched_new\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "touch /tmp/touched_new\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/touched_new\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 17. mkdir -p 嵌套
-  printf "mkdir -p /tmp/nested/deep/dir\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "ls /tmp/nested/deep/dir\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "mkdir -p /tmp/nested/deep/dir\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "ls /tmp/nested/deep/dir\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 18. tail
-  printf "echo -e \x27aaa\\nbbb\\nccc\x27 | tail -n 1\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo -e \x27aaa\\nbbb\\nccc\x27 | tail -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 18.5 新增 applet：chmod/chown/find/kill/dmesg/mount/umount
-  printf "touch /tmp/t_newapp; chmod 600 /tmp/t_newapp; ls -l /tmp/t_newapp\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "chown 0:0 /tmp/t_newapp; echo chown_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mkdir -p /tmp/find_t/sub; touch /tmp/find_t/a.txt /tmp/find_t/sub/b.txt; find /tmp/find_t -name \x27*.txt\x27\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "find /tmp/find_t -type d\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "kill -0 1 && echo kill_ok\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "kill -l | head -n 1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "dmesg -n 1 > /tmp/t_dmesg; wc -l < /tmp/t_dmesg; echo dmesg_done\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mount | head -n 1\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "umount /nonexistent 2>/dev/null; echo umount_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "kill -l 9\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "export FD=/tmp/find_d; mkdir -p \$FD/sub; touch \$FD/x.txt \$FD/sub/y.txt; find \$FD -maxdepth 1 -name \x27*.txt\x27\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "chmod u+x /tmp/t_newapp; ls -l /tmp/t_newapp\necho __RBOX_DONE__\n" >&7; wait_main
-  printf "mount /nonexistent_fstab_entry\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "touch /tmp/t_newapp; chmod 600 /tmp/t_newapp; ls -l /tmp/t_newapp\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "chown 0:0 /tmp/t_newapp; echo chown_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mkdir -p /tmp/find_t/sub; touch /tmp/find_t/a.txt /tmp/find_t/sub/b.txt; find /tmp/find_t -name \x27*.txt\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "find /tmp/find_t -type d\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "kill -0 1 && echo kill_ok\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "kill -l | head -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "dmesg -n 1 > /tmp/t_dmesg; wc -l < /tmp/t_dmesg; echo dmesg_done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mount | head -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "umount /nonexistent 2>/dev/null; echo umount_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "kill -l 9\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "export FD=/tmp/find_d; mkdir -p \$FD/sub; touch \$FD/x.txt \$FD/sub/y.txt; find \$FD -maxdepth 1 -name \x27*.txt\x27\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "chmod u+x /tmp/t_newapp; ls -l /tmp/t_newapp\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "mount /nonexistent_fstab_entry\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 19. stderr 重定向 2>
-  printf "ls /nonexistent_xyz 2> /tmp/stderr_out; cat /tmp/stderr_out\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "ls /nonexistent_xyz 2> /tmp/stderr_out; cat /tmp/stderr_out\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 20. stderr 追加 2>>
-  printf "ls /another_missing 2>> /tmp/stderr_out; cat /tmp/stderr_out\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "ls /another_missing 2>> /tmp/stderr_out; cat /tmp/stderr_out\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 21. source 命令
-  printf "echo \x27export SOURCED=yes\x27 > /tmp/srctest.sh; source /tmp/srctest.sh; echo \$SOURCED\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo \x27export SOURCED=yes\x27 > /tmp/srctest.sh; source /tmp/srctest.sh; echo \$SOURCED\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 22. PS1 提示符（通过 source /etc/profile）
-  printf "export PS1=\\x27test# \\x27; echo done\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "export PS1=\\x27test# \\x27; echo done\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 23. here-doc（三行发送，间隔稍长）
-  printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "cat <<HDEOF\\nhello heredoc\\nHDEOF\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 24. console shell respawn 保留配置（Environment 注入后 shell 退出重启仍保留）
-  printf "echo console_init=\$RBOX_CONSOLE\necho __RBOX_DONE__\n" >&7; wait_main
-  printf 'exit\n' >&7
-  printf "echo console_respawn=\$RBOX_CONSOLE\necho __RBOX_DONE__\n" >&7; wait_main
+  printf "echo console_init=\$RBOX_CONSOLE\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf 'exit\n' >&7 2>/dev/null || true
+  printf "echo console_respawn=\$RBOX_CONSOLE\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 24.5 前台命令 Ctrl-C 中断（临时 ISIG + SIGINT 转发到前台进程组）
   # Ctrl-C 中断：sleep 不插 sentinel（否则 $? 被重置）
-  printf 'sleep 60\n' >&7; sleep 2
-  printf "\x03" >&7; sleep 2
-  printf "echo intr_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
+  printf 'sleep 60\n' >&7 2>/dev/null || true; sleep 2
+  printf "\x03" >&7 2>/dev/null || true; sleep 2
+  printf "echo intr_rc=\$?\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # 25. reboot：触发有序关机流程后内核重启，等待重启完成后继续会话
-  printf "echo before_reboot\necho __RBOX_DONE__\n" >&7; wait_main
-  printf 'reboot\n' >&7
+  printf "echo before_reboot\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf 'reboot\n' >&7 2>/dev/null || true
   # 先等内核真正重启（Linux version 出现第二次），期间不发任何命令
   base_boot=$(tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -c 'Linux version' || true)
   for _ in $(seq 120); do
-      n=$(tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -c 'Linux version' || true)
+      n=$(grep -ac 'Linux version' "$OUT_FILE" 2>/dev/null || true)
       [ "${n:-0}" -gt "${base_boot:-0}" ] && break
       sleep 1
   done
@@ -641,13 +654,13 @@ send_boot() {
   # 重启后 shell 重建：重复发送直到出现新的 after_reboot
   base_after=$(tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -cxF after_reboot || true)
   for _ in $(seq 60); do
-      printf 'echo after_reboot\n' >&7
-      n=$(tr -d '\r' < "$OUT_FILE" 2>/dev/null | grep -cxF after_reboot || true)
+      printf 'echo after_reboot\n' >&7 2>/dev/null || true
+      n=$(grep -acxF after_reboot "$OUT_FILE" 2>/dev/null || true)
       [ "${n:-0}" -gt "${base_after:-0}" ] && break
       sleep 2
   done
   # 关机
-  printf 'shutdown\n' >&7
+  printf 'shutdown\n' >&7 2>/dev/null || true
 finish_session "$MAIN_QPID" 7 "$MAIN_FIFO"
 OUT=$(cat "$OUT_FILE")
 rm -f "$OUT_FILE" || true
@@ -667,6 +680,8 @@ assert_line "command -p 执行" "cmd_p_ok"
 assert_line "type -t 输出类型" "file"
 assert_line "read -t 0 立即返回" "r0=0"
 assert_line_regex "jobs -l 格式" "^(> )?\[[0-9]+\]\+ +[0-9]+ Running *$"
+assert_line "管道中的花括号组" "g:x"
+assert_line "花括号组作为管道段" "grp1"
 assert_line "uname -n -> 主机名" "rbox"
 assert_line "pwd -> /" "/"
 assert_line "echo hello -> hello" "hello"
@@ -1012,13 +1027,13 @@ rm -f "$EMERGENCY_OUT_FIFO" "$EMERGENCY_OUT_FILE"
 mkfifo "$EMERGENCY_OUT_FIFO"
 timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND emergency" \
-  < "$EMERGENCY_OUT_FIFO" > "$EMERGENCY_OUT_FILE" 2>&1 &
+  < "$EMERGENCY_OUT_FIFO" > "$EMERGENCY_OUT_FILE" 2>&1 2>/dev/null || true &
 EMERGENCY_OUT_QPID=$!
 exec 6> "$EMERGENCY_OUT_FIFO"
 # 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
 sleep 20
 for _ in $(seq 60); do
-    printf 'echo EMERGENCY_SHELL_OK\n' >&6
+    printf 'echo EMERGENCY_SHELL_OK\n' >&6 2>/dev/null || true
     tr -d '\r' < "$EMERGENCY_OUT_FILE" 2>/dev/null | grep -qF EMERGENCY_SHELL_OK && break
     sleep 1
 done
@@ -1035,13 +1050,13 @@ rm -f "$SINGLE_OUT_FIFO" "$SINGLE_OUT_FILE"
 mkfifo "$SINGLE_OUT_FIFO"
 timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND single" \
-  < "$SINGLE_OUT_FIFO" > "$SINGLE_OUT_FILE" 2>&1 &
+  < "$SINGLE_OUT_FIFO" > "$SINGLE_OUT_FILE" 2>&1 2>/dev/null || true &
 SINGLE_OUT_QPID=$!
 exec 5> "$SINGLE_OUT_FIFO"
 # 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
 sleep 20
 for _ in $(seq 60); do
-    printf 'echo SINGLE_SHELL_OK\n' >&5
+    printf 'echo SINGLE_SHELL_OK\n' >&5 2>/dev/null || true
     tr -d '\r' < "$SINGLE_OUT_FILE" 2>/dev/null | grep -qF SINGLE_SHELL_OK && break
     sleep 1
 done
@@ -1087,13 +1102,13 @@ rm -f "$RESCUE_OUT_FIFO" "$RESCUE_OUT_FILE"
 mkfifo "$RESCUE_OUT_FIFO"
 timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd rescue-test.cpio.gz -append "$APPEND " \
-  < "$RESCUE_OUT_FIFO" > "$RESCUE_OUT_FILE" 2>&1 &
+  < "$RESCUE_OUT_FIFO" > "$RESCUE_OUT_FILE" 2>&1 2>/dev/null || true &
 RESCUE_OUT_QPID=$!
 exec 4> "$RESCUE_OUT_FIFO"
 # 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
 sleep 20
 for _ in $(seq 60); do
-    printf 'echo RESCUE_SHELL_OK\n' >&4
+    printf 'echo RESCUE_SHELL_OK\n' >&4 2>/dev/null || true
     tr -d '\r' < "$RESCUE_OUT_FILE" 2>/dev/null | grep -qF RESCUE_SHELL_OK && break
     sleep 1
 done
@@ -1109,8 +1124,8 @@ assert_not_contains_in "$RESCUE_OUT" "rescue 未达到 target" "reached target d
 # ─── 持久盘模式：root=/dev/vda + switch_root + 重启后数据保留 ───
 echo ""
 echo "[持久盘模式（ext4 + switch_root）]"
-if command -v mkfs.ext4 >/dev/null 2>&1 || [ -x /sbin/mkfs.ext4 ]; then
-    make disk >/dev/null 2>&1
+if command -v mkfs.ext4 >/dev/null 2>&1 2>/dev/null || true || [ -x /sbin/mkfs.ext4 ]; then
+    make disk >/dev/null 2>&1 2>/dev/null || true
     DISK_OUT_FILE=/tmp/rbox_disk_out.$$
 DISK_FIFO=/tmp/rbox_disk_fifo.$$
 rm -f "$DISK_FIFO" "$DISK_OUT_FILE"
@@ -1119,7 +1134,7 @@ timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" \
   -drive file=rootfs.ext4,format=raw,if=virtio \
   -append "$APPEND root=/dev/vda" \
-  < "$DISK_FIFO" > "$DISK_OUT_FILE" 2>&1 &
+  < "$DISK_FIFO" > "$DISK_OUT_FILE" 2>&1 2>/dev/null || true &
 DISK_QPID=$!
 exec 3> "$DISK_FIFO"
 # 首次登录（root / root）

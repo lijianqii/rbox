@@ -38,6 +38,7 @@ pub(crate) fn parse_shell_args(args: &[String]) -> Result<ShellArgs, String> {
             while j < chars.len() {
                 match chars[j] {
                     'c' => {
+                        options::set_c_flag(true);
                         i += 1;
                         let Some(cmd) = args.get(i) else {
                             return Err("-c requires an argument".to_string());
@@ -406,7 +407,17 @@ pub(crate) fn run_source(
                 last_rc = execute_line(&rest, &mut last_rc, history, exit_fn);
                 rc = last_rc;
             }
-        } else if line.trim_start().starts_with('{') {
+        } else if line.trim_start().starts_with('{')
+            && extract_group(line.trim_start())
+                .map(|(_, tail)| {
+                    let t = tail.trim_start();
+                    !(t.starts_with('|')
+                        || t.starts_with("&&")
+                        || t.starts_with("||")
+                        || t.starts_with('&'))
+                })
+                .unwrap_or(true)
+        {
             // 花括号组：当前 shell 执行（变量保留）
             let mut text = line.clone();
             let mut depth = brace_delta(&text);
@@ -786,8 +797,18 @@ pub(crate) fn run_interactive_line(
                     || tt.starts_with('&'))
             })
             .unwrap_or(true)
+    } else if t.starts_with('{') {
+        extract_group(t)
+            .map(|(_, tail)| {
+                let tt = tail.trim_start();
+                !(tt.starts_with('|')
+                    || tt.starts_with("&&")
+                    || tt.starts_with("||")
+                    || tt.starts_with('&'))
+            })
+            .unwrap_or(true)
     } else {
-        t.starts_with('{')
+        false
     };
     if pure_group || t.starts_with("! ") {
         return run_segment(&line, history, exit_fn, rc);

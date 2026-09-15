@@ -50,6 +50,10 @@
   监控线程抢走嵌套 shell 输入两个真实缺陷
 - 内置命令补齐：`umask -S`（符号输出）、`type -a/-p/-t`、`command -p`、
   `read -t 0`（立即探测语义）、`jobs -l` 格式对齐 ash（`[n]+  PID State`）
+- 花括号组可作为管道段（`cmd | { ...; }`）：tokenizer 整体捕获 + `--subshell` 执行；
+  行首组后接管道交由管道路径
+- `$-` 在 `-c` 下含 `c`；`shift` 越界静默返回 1（ash 一致）
+- 测试健壮性：会话写入容错、EXIT 兜底清理 QEMU、等待超时缩短、UTF-8/登录重试
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -84,7 +88,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 794 个、QEMU 集成断言 269 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 794 个、QEMU 集成断言 271 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

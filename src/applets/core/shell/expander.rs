@@ -11,11 +11,11 @@ pub fn expand_pipeline(pipeline: &Pipeline, last_rc: i32) -> Result<Pipeline, St
     let mut new_cmds = Vec::with_capacity(pipeline.cmds.len());
     for cmd in &pipeline.cmds {
         let mut new_argv = Vec::with_capacity(cmd.argv.len());
-        if cmd.argv.len() == 1
-            && cmd.argv[0].starts_with('(')
-            && cmd.argv[0].ends_with(')')
+        let is_group = cmd.argv.len() == 1
             && cmd.argv[0].len() > 2
-        {
+            && ((cmd.argv[0].starts_with('(') && cmd.argv[0].ends_with(')'))
+                || (cmd.argv[0].starts_with('{') && cmd.argv[0].ends_with('}')));
+        if is_group {
             // 管道/后台中的子 shell 段：交给 `rbox --subshell` 子进程执行
             // （环境变量/cwd/umask 由 fork+exec 继承；函数/别名不继承）
             let inner = cmd.argv[0][1..cmd.argv[0].len() - 1].to_string();

@@ -21,6 +21,8 @@ static PHYSICAL: AtomicBool = AtomicBool::new(false);
 static HISTORY: AtomicBool = AtomicBool::new(true);
 /// 交互式 shell 标志（别名展开等仅交互模式生效）。
 static INTERACTIVE: AtomicBool = AtomicBool::new(false);
+/// `sh -c` 调用标志（`$-` 含 `c`，ash 行为）。
+static C_FLAG: AtomicBool = AtomicBool::new(false);
 /// shell 进程号（`$$`）：子 shell 沿用父 shell 的 pid（POSIX/ash 行为）。
 static SHELL_PID: AtomicI32 = AtomicI32::new(0);
 /// nounset 违规标记：expand_vars 发现未定义变量时置位，脚本驱动据此退出。
@@ -153,8 +155,15 @@ pub(crate) fn set_ignoreeof(v: bool) {
 }
 
 /// `$-`：当前选项字母（ash 风格：a b C e f m n u v x）。
+pub(crate) fn set_c_flag(v: bool) {
+    C_FLAG.store(v, Ordering::SeqCst);
+}
+
 pub(crate) fn option_string() -> String {
     let mut out = String::new();
+    if C_FLAG.load(Ordering::SeqCst) {
+        out.push('c');
+    }
     if allexport() {
         out.push('a');
     }

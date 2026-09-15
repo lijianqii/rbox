@@ -809,12 +809,8 @@ pub fn try_builtin(cmd: &SimpleCmd, last_rc: &mut i32, history: &[String]) -> Bu
                 },
                 None => 1,
             };
-            if params::shift(n) {
-                *last_rc = 0;
-            } else {
-                eprintln!("shift: can't shift that many");
-                *last_rc = 1;
-            }
+            // ash：移位越界时静默返回 1
+            *last_rc = if params::shift(n) { 0 } else { 1 };
             BuiltinResult::Done
         }
         "exec" => {
