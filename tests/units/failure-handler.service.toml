@@ -1,0 +1,7 @@
+[Unit]
+Description = "OnFailure handler (test)"
+Name = "failure-handler"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo FAILURE_HANDLER_RAN"

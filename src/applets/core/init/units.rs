@@ -50,6 +50,30 @@ pub(crate) struct UnitSection {
     #[serde(default)]
     #[serde(rename = "Before")]
     pub(crate) before: Vec<String>,
+    /// 互斥单元：启动本单元前停止它们（systemd Conflicts=）
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "Conflicts")]
+    pub(crate) conflicts: Vec<String>,
+    /// 联动单元：这些单元停止/重启时本单元随之停止/重启（PartOf=）
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "PartOf")]
+    pub(crate) part_of: Vec<String>,
+    /// 本单元失败时启动的单元（best-effort）
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "OnFailure")]
+    pub(crate) on_failure: Vec<String>,
+    /// 本单元成功退出时启动的单元
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "OnSuccess")]
+    pub(crate) on_success: Vec<String>,
+    /// 条件：路径存在才启动（不满足则跳过，不算失败）
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "ConditionPathExists")]
+    pub(crate) condition_path_exists: Vec<String>,
+    /// 条件：目录非空才启动
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "ConditionDirectoryNotEmpty")]
+    pub(crate) condition_dir_not_empty: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -123,6 +147,34 @@ pub(crate) struct ServiceSection {
     #[serde(default)]
     #[serde(rename = "Group")]
     pub(crate) group: Option<String>,
+    /// 启动前依次同步执行的命令；任一失败则启动失败
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "ExecStartPre")]
+    pub(crate) exec_start_pre: Vec<String>,
+    /// 启动成功后依次同步执行的命令
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "ExecStartPost")]
+    pub(crate) exec_start_post: Vec<String>,
+    /// 停止后执行的命令（无论停止是否成功）
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "ExecStopPost")]
+    pub(crate) exec_stop_post: Vec<String>,
+    /// Type=oneshot 且进程退出后仍视为 active
+    #[serde(default)]
+    #[serde(rename = "RemainAfterExit")]
+    pub(crate) remain_after_exit: bool,
+    /// 视为成功的额外退出码（默认仅 0）
+    #[serde(default, deserialize_with = "one_or_many_i32")]
+    #[serde(rename = "SuccessExitStatus")]
+    pub(crate) success_exit_status: Vec<i32>,
+    /// 停止时发送的信号名（默认 TERM）
+    #[serde(default)]
+    #[serde(rename = "KillSignal")]
+    pub(crate) kill_signal: Option<String>,
+    /// 停止超时后是否补发 SIGKILL（默认 true）
+    #[serde(default = "default_true")]
+    #[serde(rename = "SendSIGKILL")]
+    pub(crate) send_sigkill: bool,
 }
 
 fn default_restart_sec() -> u64 {
@@ -143,6 +195,9 @@ fn default_timeout_stop() -> u64 {
 fn default_kill_mode() -> String {
     "control-group".to_string()
 }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct InstallSection {
@@ -151,7 +206,71 @@ pub(crate) struct InstallSection {
     pub(crate) wanted_by: Vec<String>,
 }
 
-/// 单元名解析：优先 [Unit] Name 字段，缺省回退文件名（去掉 .toml）。
+/// 扫描单元目录，返回 (unit_name, 路径, 是否启用) 列表（含 `*.toml.disabled`）。
+pub(crate) fn scan_unit_files() -> Vec<(String, std::path::PathBuf, bool)> {
+    let mut out = Vec::new();
+    let dir = Path::new(&crate::config::load().paths.system_dir);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (enabled, stem) = if let Some(stem) = fname.strip_suffix(".toml.disabled") {
+            (false, stem.to_string())
+        } else if let Some(stem) = fname.strip_suffix(".toml") {
+            (true, stem.to_string())
+        } else {
+            continue;
+        };
+        let name = fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| toml::from_str::<Unit>(&c).ok())
+            .map(|u| resolve_unit_name(&stem, &u.unit.name))
+            .unwrap_or(stem);
+        out.push((name, path, enabled));
+    }
+    out
+}
+
+/// 接受单个字符串或字符串数组（TOML 中 `X = "a"` 与 `X = ["a"]` 均可）。
+fn one_or_many<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(de)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// 接受单个整数或整数数组（SuccessExitStatus）。
+fn one_or_many_i32<'de, D>(de: D) -> Result<Vec<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(i32),
+        Many(Vec<i32>),
+    }
+    Ok(match OneOrMany::deserialize(de)? {
+        OneOrMany::One(n) => vec![n],
+        OneOrMany::Many(v) => v,
+    })
+}
+
+/// 条件检查
 pub(crate) fn resolve_unit_name(file_stem: &str, declared: &str) -> String {
     if declared.is_empty() {
         file_stem.to_string()
@@ -356,33 +475,20 @@ mod tests {
             name: name.to_string(),
             is_target,
             unit: UnitSection {
-                description: String::new(),
-                name: String::new(),
                 after: after.iter().map(|s| s.to_string()).collect(),
                 requires: requires.iter().map(|s| s.to_string()).collect(),
-                wants: Vec::new(),
-                requisite: Vec::new(),
-                before: Vec::new(),
+                ..Default::default()
             },
             service: ServiceSection {
                 typ: "simple".to_string(),
-                exec_start: None,
-                exec_stop: None,
-                exec_reload: None,
-                restart: String::new(),
                 restart_sec: 1,
                 start_limit_burst: 5,
                 start_limit_interval_sec: 10,
                 timeout_start_sec: 10,
-                pidfile: None,
-                environment: Vec::new(),
-                environment_file: None,
-                working_directory: None,
                 timeout_stop_sec: 5,
                 kill_mode: "control-group".to_string(),
-                logfile: None,
-                user: None,
-                group: None,
+                send_sigkill: true,
+                ..Default::default()
             },
             install: InstallSection {
                 wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),
@@ -565,5 +671,46 @@ mod tests {
             u.service.exec_start.as_deref(),
             Some("/bin/rgetty -L -t 60 ttyAMA0")
         );
+    }
+
+    #[test]
+    fn parse_new_service_and_unit_fields() {
+        let toml_src = r#"
+[Unit]
+Name = "demo"
+Conflicts = ["old"]
+PartOf = ["grp"]
+OnFailure = ["rescue"]
+OnSuccess = ["notify"]
+ConditionPathExists = ["/etc/passwd", "!/nonexistent"]
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/true"
+ExecStartPre = ["/bin/echo pre"]
+ExecStartPost = ["/bin/echo post"]
+ExecStopPost = ["/bin/echo stop-post"]
+RemainAfterExit = true
+SuccessExitStatus = [2, 3]
+KillSignal = "INT"
+SendSIGKILL = false
+
+[Install]
+WantedBy = ["multi-user.target"]
+"#;
+        let u: Unit = toml::from_str(toml_src).unwrap();
+        assert_eq!(u.unit.conflicts, vec!["old"]);
+        assert_eq!(u.unit.part_of, vec!["grp"]);
+        assert_eq!(u.unit.on_failure, vec!["rescue"]);
+        assert_eq!(u.unit.on_success, vec!["notify"]);
+        assert_eq!(u.unit.condition_path_exists.len(), 2);
+        assert_eq!(u.service.typ, "oneshot");
+        assert_eq!(u.service.exec_start_pre, vec!["/bin/echo pre"]);
+        assert_eq!(u.service.exec_start_post, vec!["/bin/echo post"]);
+        assert_eq!(u.service.exec_stop_post, vec!["/bin/echo stop-post"]);
+        assert!(u.service.remain_after_exit);
+        assert_eq!(u.service.success_exit_status, vec![2, 3]);
+        assert_eq!(u.service.kill_signal.as_deref(), Some("INT"));
+        assert!(!u.service.send_sigkill);
     }
 }

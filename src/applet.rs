@@ -63,6 +63,8 @@ declare_applets! {
     crate::applets::file::dd::DD,
     crate::applets::file::tar::TAR,
     crate::applets::core::shutdown::SHUTDOWN,
+    crate::applets::core::shutdown::POWEROFF,
+    crate::applets::core::shutdown::HALT,
     crate::applets::core::reboot::REBOOT,
     crate::applets::text::head::HEAD,
     crate::applets::text::tail::TAIL,

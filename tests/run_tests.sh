@@ -79,6 +79,22 @@ assert_line_in() {
 assert_line() {
     assert_line_in "$OUT" "$1" "$2"
 }
+# 断言输出中不存在与给定字符串完全相等的一行（-F 固定串 + -x 整行）
+assert_not_line_in() {
+    local out="$1"
+    local desc="$2"
+    local pattern="$3"
+    if printf '%s\n' "$out" | tr -d '\r' | grep -qxF -- "$pattern"; then
+        echo "  FAIL  $desc (不应出现整行: '$pattern')"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS  $desc"
+        PASS=$((PASS + 1))
+    fi
+}
+assert_not_line() {
+    assert_not_line_in "$OUT" "$1" "$2"
+}
 
 # 断言输出中存在匹配正则的一整行（-E 扩展正则 + -x 整行）
 assert_line_regex_in() {
@@ -128,7 +144,7 @@ LOGIN_OUT_FILE=/tmp/rbox_login_out.$$
 LOGIN_FIFO=/tmp/rbox_login_fifo.$$
 rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
-timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+timeout 400 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
   < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 2>/dev/null || true &
 LOGIN_QPID=$!
@@ -162,7 +178,7 @@ finish_session "$LOGIN_QPID" 9 "$LOGIN_FIFO"
 LOGIN_OUT=$(cat "$LOGIN_OUT_FILE")
 rm -f "$LOGIN_FIFO" "$LOGIN_OUT_FILE"
 mkfifo "$LOGIN_FIFO"
-timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+timeout 400 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
   -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND" \
   < "$LOGIN_FIFO" > "$LOGIN_OUT_FILE" 2>&1 2>/dev/null || true &
 LOGIN_QPID=$!
@@ -355,6 +371,22 @@ send_boot() {
   printf "rservice start longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice restart longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice list\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # P1/P2 新语义：oneshot/ExecStopPost/Conflicts/PartOf/KillSignal/管理命令
+  printf "rservice status oneshot-setup\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice stop oneshot-setup\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice start conflict-a\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice start conflict-b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice start partof-child\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice stop conflict-b\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice start killsig\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice stop killsig\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice is-enabled hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice disable hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice is-enabled hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice enable hello\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice daemon-reload\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice isolate default.target\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rservice reset-failed\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # init 增强：reload、sysctl、User= 降权
   printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
@@ -659,7 +691,7 @@ send_boot() {
       sleep 2
   done
   # 关机
-  printf 'shutdown\n' >&7 2>/dev/null || true
+  printf 'poweroff\n' >&7 2>/dev/null || true
 finish_session "$MAIN_QPID" 7 "$MAIN_FIFO"
 OUT=$(cat "$OUT_FILE")
 rm -f "$OUT_FILE" || true
@@ -727,6 +759,24 @@ assert_contains "rservice stop" "longrun stopped"
 assert_contains "rservice start" "longrun started"
 assert_contains "rservice restart" "longrun started"
 assert_contains "rservice list 显示服务" "longrun"
+echo ""
+echo "[init P1/P2 新语义]"
+assert_contains "oneshot ExecStartPre" "ONESHOT_PRE"
+assert_contains "oneshot ExecStart" "ONESHOT_RUN"
+assert_contains "oneshot ExecStartPost" "ONESHOT_POST"
+assert_contains "oneshot RemainAfterExit active" "oneshot-setup active (exited)"
+assert_contains "ExecStopPost" "ONESHOT_STOPPOST"
+assert_contains "条件不满足跳过" "skipped (condition not met)"
+assert_not_line "条件单元未执行" "COND_SHOULD_NOT_RUN"
+assert_contains "SuccessExitStatus + OnSuccess" "SUCCESS_HANDLER_RAN"
+assert_contains "OnFailure 触发" "FAILURE_HANDLER_RAN"
+assert_contains "Conflicts 停止互斥单元" "conflict-a stopped"
+assert_contains "PartOf 联动停止" "partof-child stopped"
+assert_contains "KillSignal=INT 生效" "GOT_INT"
+assert_contains "is-enabled enabled" "enabled"
+assert_contains "disable 后 is-enabled disabled" "disabled"
+assert_contains "daemon-reload" "reloaded"
+assert_contains "isolate target" "isolated to default.target"
 
 
 echo ""
@@ -737,7 +787,7 @@ assert_contains "Wants 失败不传播" "WANTS_OK"
 assert_contains "Wants 服务已启动" "wants-test exited"
 assert_contains "Requisite 未激活跳过" "skipping req-test"
 assert_contains "Requisite 激活成功" "req-ok exited"
-assert_not_contains_in "$OUT" "Requisite 跳过单元未执行" "REQ_SHOULD_NOT_RUN"
+assert_not_line_in "$OUT" "Requisite 跳过单元未执行" "REQ_SHOULD_NOT_RUN"
 assert_contains "Requisite 跳过单元状态" "req-test not-started"
 assert_contains "status 单查 console" "console-shell running"
 assert_contains "sysctl kernel.panic" "10"

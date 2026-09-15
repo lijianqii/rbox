@@ -1,0 +1,8 @@
+[Unit]
+Description = "PartOf conflict-b (test)"
+Name = "partof-child"
+PartOf = ["conflict-b"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sleep 60"

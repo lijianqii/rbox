@@ -40,7 +40,7 @@ pub(crate) fn create_status_listener() -> Option<UnixListener> {
 pub(crate) fn handle_control_connection(
     mut stream: UnixStream,
     services: std::sync::Arc<std::sync::Mutex<Vec<ServiceInstance>>>,
-    units: std::sync::Arc<HashMap<String, Unit>>,
+    units: std::sync::Arc<std::sync::Mutex<HashMap<String, Unit>>>,
 ) {
     let _ = stream.set_nonblocking(true);
     let mut req = String::new();
@@ -65,6 +65,23 @@ pub(crate) fn handle_control_connection(
             Err(_) => break,
         }
     }
+    // daemon-reload：可变锁重载单元目录（新增/修改/删除的单元立即生效）
+    if req.trim() == "daemon-reload" {
+        let resp = match units.lock() {
+            Ok(mut um) => match crate::applets::core::init::units::load_all_units() {
+                Ok(new_units) => {
+                    let n = new_units.len();
+                    *um = new_units;
+                    format!("reloaded {} units\n", n)
+                }
+                Err(e) => format!("reload failed: {}\n", e),
+            },
+            Err(_) => "error: unit state poisoned\n".to_string(),
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
     let resp = match parse_control_request(&req) {
         Ok(r @ ControlRequest::Status(_)) => {
             // status 需要 CPU 占用率：双采样 /proc（间隔 300ms）。
@@ -73,16 +90,16 @@ pub(crate) fn handle_control_connection(
             std::thread::sleep(std::time::Duration::from_millis(PROC_SAMPLE_MS));
             let now = collect_processes();
             let interval = PROC_SAMPLE_MS as f64 / 1000.0;
-            match services.lock() {
-                Ok(mut guard) => {
-                    execute_control_request(r, &mut guard, &units, Some((&prev, &now, interval)))
+            match (services.lock(), units.lock()) {
+                (Ok(mut guard), Ok(um)) => {
+                    execute_control_request(r, &mut guard, &um, Some((&prev, &now, interval)))
                 }
-                Err(_) => "error: service state poisoned\n".to_string(),
+                _ => "error: service state poisoned\n".to_string(),
             }
         }
-        Ok(r) => match services.lock() {
-            Ok(mut guard) => execute_control_request(r, &mut guard, &units, None),
-            Err(_) => "error: service state poisoned\n".to_string(),
+        Ok(r) => match (services.lock(), units.lock()) {
+            (Ok(mut guard), Ok(um)) => execute_control_request(r, &mut guard, &um, None),
+            _ => "error: service state poisoned\n".to_string(),
         },
         Err(e) => format!("error: {}\n", e),
     };
@@ -103,6 +120,11 @@ pub(crate) enum ControlRequest<'a> {
     Stop(&'a str),
     Restart(&'a str),
     Reload(&'a str),
+    ResetFailed(Option<&'a str>),
+    Enable(&'a str),
+    Disable(&'a str),
+    IsEnabled(&'a str),
+    Isolate(&'a str),
 }
 
 /// 解析控制请求行；空行等价于 status（列出全部）。
@@ -119,6 +141,16 @@ fn parse_control_request(req: &str) -> Result<ControlRequest<'_>, String> {
                 "stop" => ControlRequest::Stop(unit),
                 "reload" => ControlRequest::Reload(unit),
                 _ => ControlRequest::Restart(unit),
+            }),
+            None => Err(format!("usage: {} <unit>", cmd)),
+        },
+        "reset-failed" => Ok(ControlRequest::ResetFailed(arg)),
+        "enable" | "disable" | "is-enabled" | "isolate" => match arg {
+            Some(unit) => Ok(match cmd {
+                "enable" => ControlRequest::Enable(unit),
+                "disable" => ControlRequest::Disable(unit),
+                "isolate" => ControlRequest::Isolate(unit),
+                _ => ControlRequest::IsEnabled(unit),
             }),
             None => Err(format!("usage: {} <unit>", cmd)),
         },
@@ -140,6 +172,25 @@ fn execute_control_request(
         ControlRequest::Start(name) => do_start(name, services, units),
         ControlRequest::Stop(name) => do_stop(name, services),
         ControlRequest::Reload(name) => do_reload(name, services),
+        ControlRequest::Enable(name) => do_set_enabled(name, true),
+        ControlRequest::Disable(name) => do_set_enabled(name, false),
+        ControlRequest::IsEnabled(name) => do_is_enabled(name),
+        ControlRequest::Isolate(name) => do_isolate(name, services, units),
+        ControlRequest::ResetFailed(name) => {
+            let mut out = String::new();
+            for svc in services.iter_mut() {
+                if name.is_none_or(|n| n == svc.name) {
+                    svc.fail_count = 0;
+                    svc.first_failure_at = None;
+                    svc.next_restart_at = None;
+                    out.push_str(&format!("{} reset-failed\n", svc.name));
+                }
+            }
+            if out.is_empty() {
+                out = "no matching units\n".to_string();
+            }
+            out
+        }
         ControlRequest::Restart(name) => {
             let stop_out = do_stop(name, services);
             if stop_out.starts_with("unknown") {
@@ -206,10 +257,39 @@ fn do_start(
     if unit.is_target {
         return format!("{} is a target, not a service\n", name);
     }
+    // 条件不满足：拒绝启动（与启动流程一致，isolate 等批量启动不会绕过条件）
+    if !crate::applets::core::init::conditions_met(unit) {
+        return format!("{} skipped (condition not met)\n", name);
+    }
+    // Requisite= 未激活：拒绝启动
+    for r in &unit.unit.requisite {
+        let active = services
+            .iter()
+            .any(|s| &s.name == r && (s.child.is_some() || s.tracked_pid.is_some() || s.active));
+        if !active {
+            return format!("{} skipped (requisite {} not active)\n", name, r);
+        }
+    }
     let cmd = match &unit.service.exec_start {
         Some(c) => c.clone(),
         None => return format!("{} has no ExecStart\n", name),
     };
+    // Conflicts=：启动前停止互斥的已运行单元（含反向：其他单元声明与本单元冲突）
+    let mut conflict_out = String::new();
+    let mut conflicting: Vec<String> = unit.unit.conflicts.clone();
+    for (other_name, other) in units.iter() {
+        if other_name != name && other.unit.conflicts.iter().any(|c| c == name) {
+            conflicting.push(other_name.clone());
+        }
+    }
+    for cname in conflicting {
+        if services
+            .iter()
+            .any(|s| s.name == cname && (s.child.is_some() || s.tracked_pid.is_some()))
+        {
+            conflict_out.push_str(&do_stop(&cname, services));
+        }
+    }
     let env = unit_environment(unit);
     let inst = if unit.service.typ == "forking" {
         start_forking_service(unit, &cmd, &env)
@@ -219,20 +299,145 @@ fn do_start(
     match inst {
         Some(inst) => {
             services.push(inst);
-            format!("{} started\n", name)
+            format!("{}{} started\n", conflict_out, name)
         }
-        None => format!("failed to start {}\n", name),
+        None => format!("{}failed to start {}\n", conflict_out, name),
     }
 }
 
+/// enable/disable：重命名单元文件为 `*.toml.disabled`（或恢复）。
+fn do_set_enabled(name: &str, enable: bool) -> String {
+    use crate::applets::core::init::units::scan_unit_files;
+    for (uname, path, enabled) in scan_unit_files() {
+        if uname != name {
+            continue;
+        }
+        if enabled == enable {
+            return format!(
+                "{} is already {}\n",
+                name,
+                if enable { "enabled" } else { "disabled" }
+            );
+        }
+        let new_path = if enable {
+            // x.toml.disabled -> x.toml
+            let fname = path.file_name().unwrap_or_default().to_string_lossy();
+            path.with_file_name(fname.trim_end_matches(".disabled"))
+        } else {
+            path.with_file_name(format!(
+                "{}.disabled",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ))
+        };
+        return match std::fs::rename(&path, &new_path) {
+            Ok(()) => format!("{} {}\n", name, if enable { "enabled" } else { "disabled" }),
+            Err(e) => format!("failed to update {}: {}\n", name, e),
+        };
+    }
+    format!("unknown unit: {}\n", name)
+}
+
+/// is-enabled：查询单元文件是否启用。
+fn do_is_enabled(name: &str) -> String {
+    use crate::applets::core::init::units::scan_unit_files;
+    for (uname, _, enabled) in scan_unit_files() {
+        if uname == name {
+            return format!("{}\n", if enabled { "enabled" } else { "disabled" });
+        }
+    }
+    "not-found\n".to_string()
+}
+
+/// isolate：切换到指定 target——停止不在其依赖闭包内的运行服务，启动闭包内未启动的单元。
+fn do_isolate(
+    target: &str,
+    services: &mut Vec<ServiceInstance>,
+    units: &HashMap<String, Unit>,
+) -> String {
+    let Some(t) = units.get(target) else {
+        return format!("unknown unit: {}\n", target);
+    };
+    if !t.is_target {
+        return format!("{} is not a target\n", target);
+    }
+    // 依赖闭包（Requires/Wants 传递）
+    let mut closure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stack = vec![target.to_string()];
+    while let Some(n) = stack.pop() {
+        if !closure.insert(n.clone()) {
+            continue;
+        }
+        if let Some(u) = units.get(&n) {
+            for d in u.unit.requires.iter().chain(u.unit.wants.iter()) {
+                stack.push(d.clone());
+            }
+        }
+        // 反向 WantedBy：WantedBy 含 n 的单元也属于该 target（与启动逻辑一致），
+        // 否则 isolate 会误停 console-shell 等由 target 拉起的单元
+        for (oname, ou) in units.iter() {
+            if ou.install.wanted_by.iter().any(|w| w == &n) {
+                stack.push(oname.clone());
+            }
+        }
+    }
+    let mut out = String::new();
+    // 停止闭包外的运行服务
+    let running: Vec<String> = services
+        .iter()
+        .filter(|s| {
+            (s.child.is_some() || s.tracked_pid.is_some() || s.active) && !closure.contains(&s.name)
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    for n in running {
+        out.push_str(&do_stop_one(&n, services));
+    }
+    // 启动闭包内未运行的单元（target 本身无进程）
+    let to_start: Vec<String> = closure
+        .iter()
+        .filter(|n| {
+            units
+                .get(*n)
+                .is_some_and(|u| !u.is_target && u.service.exec_start.is_some())
+                && !services.iter().any(|s| {
+                    &s.name == *n && (s.child.is_some() || s.tracked_pid.is_some() || s.active)
+                })
+        })
+        .cloned()
+        .collect();
+    for n in to_start {
+        out.push_str(&do_start(&n, services, units));
+    }
+    out.push_str(&format!("isolated to {}\n", target));
+    out
+}
+
 /// 停止服务：执行 ExecStop 并终止进程组，标记 stopped（禁止自动重启）。
+/// PartOf= 联动的单元（其 part_of 含 name）一并停止。
 fn do_stop(name: &str, services: &mut [ServiceInstance]) -> String {
+    let mut out = do_stop_one(name, services);
+    let linked: Vec<String> = services
+        .iter()
+        .filter(|s| {
+            s.name != name
+                && s.unit.unit.part_of.iter().any(|p| p == name)
+                && (s.child.is_some() || s.tracked_pid.is_some() || s.active)
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    for l in linked {
+        out.push_str(&do_stop_one(&l, services));
+    }
+    out
+}
+
+fn do_stop_one(name: &str, services: &mut [ServiceInstance]) -> String {
     let svc = match services.iter_mut().find(|s| s.name == name) {
         Some(s) => s,
         None => return format!("unknown unit: {}\n", name),
     };
     svc.stopped = true;
-    if svc.child.is_none() && svc.tracked_pid.is_none() {
+    if svc.child.is_none() && svc.tracked_pid.is_none() && !svc.active {
         return format!("{} already stopped\n", name);
     }
     stop_service_instance(svc);
@@ -738,5 +943,34 @@ mod tests {
                 .unwrap_err()
                 .contains("usage")
         );
+    }
+
+    #[test]
+    fn parse_control_request_new_commands() {
+        assert_eq!(
+            parse_control_request("enable foo"),
+            Ok(ControlRequest::Enable("foo"))
+        );
+        assert_eq!(
+            parse_control_request("disable foo"),
+            Ok(ControlRequest::Disable("foo"))
+        );
+        assert_eq!(
+            parse_control_request("is-enabled foo"),
+            Ok(ControlRequest::IsEnabled("foo"))
+        );
+        assert_eq!(
+            parse_control_request("isolate multi-user.target"),
+            Ok(ControlRequest::Isolate("multi-user.target"))
+        );
+        assert_eq!(
+            parse_control_request("reset-failed"),
+            Ok(ControlRequest::ResetFailed(None))
+        );
+        assert_eq!(
+            parse_control_request("reset-failed foo"),
+            Ok(ControlRequest::ResetFailed(Some("foo")))
+        );
+        assert!(parse_control_request("enable").is_err());
     }
 }

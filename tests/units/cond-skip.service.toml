@@ -1,0 +1,11 @@
+[Unit]
+Description = "Condition-skipped service (test)"
+Name = "cond-skip"
+ConditionPathExists = ["/nonexistent/cond-marker"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox echo COND_SHOULD_NOT_RUN"
+
+[Install]
+WantedBy = ["default.target"]

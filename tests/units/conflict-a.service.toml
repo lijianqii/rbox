@@ -1,0 +1,7 @@
+[Unit]
+Description = "Conflicts target A (test)"
+Name = "conflict-a"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sleep 60"

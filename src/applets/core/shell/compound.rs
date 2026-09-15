@@ -519,6 +519,20 @@ fn exec_for(slice: &[String], last_rc: &mut i32, history: &[String], exit_fn: &d
 }
 
 /// 执行 while 块（slice 以 while 行开始、done 行结束）。
+/// 循环迭代边界的信号 trap 检查（与 run_source 顶层一致）：
+/// 有 trap 则执行之，无 trap 则按信号终止（128+sig）。
+fn check_pending_trap(last_rc: &mut i32, history: &[String], exit_fn: &dyn Fn(i32)) -> Option<i32> {
+    let sig = crate::applets::core::shell::trap::take_pending()?;
+    match crate::applets::core::shell::trap::get(sig) {
+        Some(cmdline) => {
+            let mut rc = *last_rc;
+            execute_line(&cmdline, &mut rc, history, exit_fn);
+            None
+        }
+        None => Some(128 + sig),
+    }
+}
+
 fn exec_while(
     slice: &[String],
     last_rc: &mut i32,
@@ -546,6 +560,9 @@ fn exec_while(
     let body: Vec<String> = slice[i..slice.len().saturating_sub(1)].to_vec();
 
     loop {
+        if let Some(code) = check_pending_trap(last_rc, history, exit_fn) {
+            return code;
+        }
         *last_rc = execute_line(&cond, last_rc, history, exit_fn);
         if *last_rc != 0 {
             *last_rc = 0;
@@ -596,6 +613,9 @@ fn exec_until(
     let body: Vec<String> = slice[i..slice.len().saturating_sub(1)].to_vec();
 
     loop {
+        if let Some(code) = check_pending_trap(last_rc, history, exit_fn) {
+            return code;
+        }
         *last_rc = execute_line(&cond, last_rc, history, exit_fn);
         if *last_rc == 0 {
             *last_rc = 0;

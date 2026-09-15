@@ -1,0 +1,8 @@
+[Unit]
+Description = "KillSignal=INT (test)"
+Name = "killsig"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'trap \"echo GOT_INT; exit 0\" INT; while true; do sleep 0.2; done'"
+KillSignal = "INT"

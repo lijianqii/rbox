@@ -1,0 +1,14 @@
+[Unit]
+Description = "Oneshot setup with pre/post hooks (test)"
+Name = "oneshot-setup"
+
+[Service]
+Type = "oneshot"
+ExecStartPre = "/bin/rbox echo ONESHOT_PRE"
+ExecStart = "/bin/rbox echo ONESHOT_RUN"
+ExecStartPost = "/bin/rbox echo ONESHOT_POST"
+ExecStopPost = "/bin/rbox echo ONESHOT_STOPPOST"
+RemainAfterExit = true
+
+[Install]
+WantedBy = ["default.target"]

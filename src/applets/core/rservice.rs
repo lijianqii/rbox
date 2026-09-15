@@ -26,21 +26,41 @@ impl Applet for Rservice {
             || (args.len() == 1 && (args[0] == "list" || args[0] == "status"))
         {
             "status".to_string()
+        } else if args.len() == 1 && args[0] == "daemon-reload" {
+            "daemon-reload".to_string()
         } else if args.len() == 2
             && matches!(
                 args[0].as_str(),
-                "start" | "stop" | "restart" | "reload" | "status"
+                "start"
+                    | "stop"
+                    | "restart"
+                    | "reload"
+                    | "status"
+                    | "enable"
+                    | "disable"
+                    | "is-enabled"
+                    | "isolate"
             )
         {
             format!("{} {}", args[0], args[1])
         } else if args.len() == 1
-            && matches!(args[0].as_str(), "start" | "stop" | "restart" | "reload")
+            && matches!(
+                args[0].as_str(),
+                "start"
+                    | "stop"
+                    | "restart"
+                    | "reload"
+                    | "enable"
+                    | "disable"
+                    | "is-enabled"
+                    | "isolate"
+            )
         {
             eprintln!("rservice: {} requires a unit name", args[0]);
             return ExitCode::from(2);
         } else {
             eprintln!(
-                "rservice: usage: rservice [list|status [unit]|start|stop|restart|reload <unit>]"
+                "rservice: usage: rservice [list|status [unit]|start|stop|restart|reload|enable|disable|is-enabled|isolate <unit>|reset-failed [unit]|daemon-reload]"
             );
             return ExitCode::from(2);
         };

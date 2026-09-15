@@ -1,0 +1,7 @@
+[Unit]
+Description = "OnSuccess handler (test)"
+Name = "success-handler"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo SUCCESS_HANDLER_RAN"

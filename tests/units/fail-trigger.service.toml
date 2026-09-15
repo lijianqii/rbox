@@ -1,0 +1,11 @@
+[Unit]
+Description = "Failing service with OnFailure (test)"
+Name = "fail-trigger"
+OnFailure = ["failure-handler"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'exit 7'"
+
+[Install]
+WantedBy = ["default.target"]

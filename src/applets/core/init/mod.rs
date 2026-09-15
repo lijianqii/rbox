@@ -25,8 +25,9 @@ use crate::applets::core::init::mount::{
 };
 use crate::applets::core::init::server::{create_status_listener, handle_control_connection};
 use crate::applets::core::init::services::{
-    ServiceInstance, finish_daemonize, respawn_service, schedule_restart, start_forking_service,
-    start_service, stop_service_instance, unit_environment,
+    ServiceInstance, SpawnConfig, exit_is_success, finish_daemonize, oneshot_instance,
+    respawn_service, run_command_sync, schedule_restart, start_forking_service, start_service,
+    stop_service_instance, unit_environment,
 };
 use crate::applets::core::init::units::{Unit, compute_start_order, load_all_units, sort_deps};
 use crate::applets::core::{LogLevel, log, log_at};
@@ -228,7 +229,7 @@ impl Applet for Init {
         //    服务状态用 Mutex 共享给控制连接线程（见 reap_with_shutdown）。
         let status_listener = create_status_listener();
         let services_shared = Arc::new(Mutex::new(services));
-        let units_shared = Arc::new(units);
+        let units_shared = Arc::new(Mutex::new(units));
         reap_with_shutdown(&services_shared, &units_shared, status_listener)
     }
 }
@@ -433,27 +434,81 @@ fn compute_depths(order: &[String], units: &HashMap<String, Unit>) -> HashMap<St
     depths
 }
 
+/// 条件检查（ConditionPathExists/ConditionDirectoryNotEmpty，`!` 前缀取反）。
+pub(crate) fn conditions_met(unit: &Unit) -> bool {
+    let check = |spec: &str, value: bool| {
+        let neg = spec.starts_with('!');
+        value != neg
+    };
+    for p in &unit.unit.condition_path_exists {
+        if !check(
+            p,
+            std::path::Path::new(p.trim_start_matches('!').trim_start()).exists(),
+        ) {
+            return false;
+        }
+    }
+    for d in &unit.unit.condition_dir_not_empty {
+        let path = d.trim_start_matches('!').trim_start();
+        let nonempty = std::fs::read_dir(path)
+            .map(|mut it| it.next().is_some())
+            .unwrap_or(false);
+        if !check(d, nonempty) {
+            return false;
+        }
+    }
+    true
+}
+
+/// 运行 ExecStartPost（失败返回 false，调用方需停止已启动的服务）。
+fn run_start_post(unit: &Unit, env: &[(String, String)], cfg: &SpawnConfig<'_>) -> bool {
+    for post in &unit.service.exec_start_post {
+        log(&format!("rbox init: ExecStartPost {}: {}", unit.name, post));
+        match run_command_sync(post, env, cfg, unit.service.timeout_start_sec) {
+            Some(code) if exit_is_success(unit, Some(code)) => {}
+            _ => {
+                log_at(
+                    LogLevel::Error,
+                    &format!("rbox init: {} ExecStartPost failed: {}", unit.name, post),
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// 启动一个服务单元（依赖检查由调用方完成）；返回 (是否成功, 运行实例)。
 /// spawn 成功与否决定 Requires 失败传播；forking 服务以父进程 spawn 成功为
-/// "成功"（daemon 化结果异步，见主循环）；无 ExecStart 的单元视为成功。
+/// "成功"（daemon 化结果异步，见主循环）；Type=oneshot 同步执行并按退出码判定；
+/// 条件不满足则跳过（不算失败）；无 ExecStart 的单元视为成功。
 fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
+    // 条件不满足：跳过（systemd 语义：不算失败）
+    if !conditions_met(unit) {
+        log(&format!(
+            "rbox init: {} skipped (condition not met)",
+            unit.name
+        ));
+        return (true, None);
+    }
     let Some(cmd) = &unit.service.exec_start else {
         return (true, None); // 无 ExecStart 的单元（如占位服务）视为启动成功
     };
-    if !unit.service.typ.is_empty() && unit.service.typ != "simple" && unit.service.typ != "forking"
-    {
+    let typ = unit.service.typ.as_str();
+    if !typ.is_empty() && !matches!(typ, "simple" | "forking" | "oneshot") {
         log_at(
             LogLevel::Warn,
             &format!(
                 "rbox init: {} Type={:?} unsupported, treating as simple",
-                unit.name, unit.service.typ
+                unit.name, typ
             ),
         );
     }
     if !unit.service.restart.is_empty()
-        && unit.service.restart != "on-failure"
-        && unit.service.restart != "always"
-        && unit.service.restart != "no"
+        && !matches!(
+            unit.service.restart.as_str(),
+            "no" | "on-failure" | "always" | "on-success" | "on-abnormal" | "on-abort"
+        )
     {
         log_at(
             LogLevel::Warn,
@@ -472,16 +527,50 @@ fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
         ));
     }
     let env = unit_environment(unit);
-    if unit.service.typ == "forking" {
-        match start_forking_service(unit, cmd, &env) {
-            Some(inst) => (true, Some(inst)),
-            None => (false, None),
+    let cfg = SpawnConfig::from_unit(unit);
+    // ExecStartPre：任一失败则启动失败
+    for pre in &unit.service.exec_start_pre {
+        log(&format!("rbox init: ExecStartPre {}: {}", unit.name, pre));
+        match run_command_sync(pre, &env, &cfg, unit.service.timeout_start_sec) {
+            Some(code) if exit_is_success(unit, Some(code)) => {}
+            _ => {
+                log_at(
+                    LogLevel::Error,
+                    &format!("rbox init: {} ExecStartPre failed: {}", unit.name, pre),
+                );
+                return (false, None);
+            }
         }
+    }
+    // Type=oneshot：同步执行，按退出码判定成功
+    if typ == "oneshot" {
+        let code = run_command_sync(cmd, &env, &cfg, unit.service.timeout_start_sec);
+        if !exit_is_success(unit, code) {
+            log_at(
+                LogLevel::Error,
+                &format!("rbox init: {} oneshot failed (code {:?})", unit.name, code),
+            );
+            return (false, None);
+        }
+        if !run_start_post(unit, &env, &cfg) {
+            return (false, None);
+        }
+        return (true, Some(oneshot_instance(unit, cmd, &env)));
+    }
+    let started = if typ == "forking" {
+        start_forking_service(unit, cmd, &env)
     } else {
-        match start_service(unit, cmd, &env) {
-            Some(inst) => (true, Some(inst)),
-            None => (false, None),
+        start_service(unit, cmd, &env)
+    };
+    match started {
+        Some(mut inst) => {
+            if !run_start_post(unit, &env, &cfg) {
+                stop_service_instance(&mut inst);
+                return (false, None);
+            }
+            (true, Some(inst))
         }
+        None => (false, None),
     }
 }
 
@@ -587,7 +676,7 @@ fn compute_next_timeout(services: &[ServiceInstance]) -> i32 {
 /// ExecStop（最坏数秒）等长操作阻塞。
 fn reap_with_shutdown(
     services_shared: &Arc<Mutex<Vec<ServiceInstance>>>,
-    units: &Arc<HashMap<String, Unit>>,
+    units: &Arc<Mutex<HashMap<String, Unit>>>,
     status_listener: Option<UnixListener>,
 ) -> ExitCode {
     // 创建 self-pipe：信号处理器写 1 字节唤醒主循环 poll
@@ -618,6 +707,8 @@ fn reap_with_shutdown(
             }
         };
         let services = &mut *services_guard;
+        // OnFailure=/OnSuccess= 触发的单元（循环结束后统一启动，避免边遍历边 push）
+        let mut pending_triggers: Vec<String> = Vec::new();
         for svc in services.iter_mut() {
             // 1a. forking 服务等待父进程 daemon 化（异步状态机，不阻塞主循环）
             if svc.waiting_daemonize {
@@ -666,7 +757,7 @@ fn reap_with_shutdown(
                                 status.code()
                             ),
                         );
-                        (true, !status.success())
+                        (true, !exit_is_success(&svc.unit, status.code()))
                     }
                     // 竞态：状态已被孤儿收割取走，视为退出但不触发重启
                     Err(_) => (true, false),
@@ -674,7 +765,18 @@ fn reap_with_shutdown(
                 };
                 if exited {
                     svc.child = None;
-                    schedule_restart(svc, failed);
+                    if !failed {
+                        // 成功退出：RemainAfterExit=yes 保持 active；触发 OnSuccess
+                        if svc.unit.service.remain_after_exit {
+                            svc.active = true;
+                        }
+                        pending_triggers.extend(svc.unit.unit.on_success.iter().cloned());
+                    } else {
+                        pending_triggers.extend(svc.unit.unit.on_failure.iter().cloned());
+                    }
+                    if !svc.active {
+                        schedule_restart(svc, failed);
+                    }
                 }
             }
             // 1b. 到达 RestartSec 退避时间点则重新拉起
@@ -693,6 +795,36 @@ fn reap_with_shutdown(
                     ),
                 );
                 respawn_service(svc);
+            }
+        }
+
+        // 1c. OnFailure/OnSuccess：best-effort 启动触发单元（已活动则跳过）
+        for name in pending_triggers {
+            if services
+                .iter()
+                .any(|s| s.name == name && (s.child.is_some() || s.active))
+            {
+                continue;
+            }
+            let u_opt = units.lock().ok().and_then(|m| m.get(&name).cloned());
+            if let Some(u) = u_opt {
+                let (ok, inst) = start_unit(&u);
+                log_at(
+                    if ok { LogLevel::Info } else { LogLevel::Warn },
+                    &format!(
+                        "rbox init: triggered {} -> {}",
+                        name,
+                        if ok { "ok" } else { "failed" }
+                    ),
+                );
+                if let Some(inst) = inst {
+                    services.push(inst);
+                }
+            } else {
+                log_at(
+                    LogLevel::Warn,
+                    &format!("rbox init: triggered unit {} not found", name),
+                );
             }
         }
 

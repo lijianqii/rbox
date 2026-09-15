@@ -56,6 +56,12 @@ pub(crate) struct ServiceInstance {
     pub(crate) next_restart_at: Option<std::time::Instant>,
     /// stop 请求后标记：禁止自动重启（Restart=on-failure 也不重启）
     pub(crate) stopped: bool,
+    /// 单元定义（新语义字段：oneshot/RemainAfterExit/hooks/信号/OnFailure 等）
+    pub(crate) unit: Unit,
+    /// RemainAfterExit=yes 且已成功启动（进程可已退出，仍视为 active）
+    pub(crate) active: bool,
+    /// Restart=on-success：成功退出时重启
+    pub(crate) restart_on_success: bool,
 }
 
 impl ServiceInstance {
@@ -68,6 +74,9 @@ impl ServiceInstance {
         } else {
             ""
         };
+        if self.active && self.child.is_none() && self.tracked_pid.is_none() {
+            return format!("{} active (exited){}\n", self.name, restart);
+        }
         if let Some(pid) = self.tracked_pid {
             return format!("{} running pid={}{}\n", self.name, pid, restart);
         }
@@ -393,8 +402,13 @@ fn new_service_instance(
         exec_reload: unit.service.exec_reload.clone(),
         exec_start: cmd.to_string(),
         env: env.to_vec(),
-        restart_on_failure: unit.service.restart == "on-failure",
+        // on-abnormal/on-abort 在当前实现中按失败处理（无 cgroup 精确状态）
+        restart_on_failure: matches!(
+            unit.service.restart.as_str(),
+            "on-failure" | "on-abnormal" | "on-abort"
+        ),
         restart_always: unit.service.restart == "always",
+        restart_on_success: unit.service.restart == "on-success",
         restart_sec: unit.service.restart_sec,
         start_limit_burst: unit.service.start_limit_burst,
         start_limit_interval_sec: unit.service.start_limit_interval_sec,
@@ -413,6 +427,63 @@ fn new_service_instance(
         waiting_daemonize: false,
         daemonize_deadline: None,
         stopped: false,
+        unit: unit.clone(),
+        active: false,
+    }
+}
+
+/// 构造 Type=oneshot 的已完成实例（无子进程；RemainAfterExit 时 active）。
+pub(crate) fn oneshot_instance(
+    unit: &Unit,
+    cmd: &str,
+    env: &[(String, String)],
+) -> ServiceInstance {
+    let mut inst = new_service_instance(unit, cmd, env, None, None);
+    inst.active = unit.service.remain_after_exit;
+    inst
+}
+
+/// 退出码是否视为成功（0 或 SuccessExitStatus= 列表）。
+pub(crate) fn exit_is_success(unit: &Unit, code: Option<i32>) -> bool {
+    match code {
+        Some(0) => true,
+        Some(c) => unit.service.success_exit_status.contains(&c),
+        None => false, // 信号终止：失败（除非 SuccessExitStatus 覆盖，暂不处理）
+    }
+}
+
+/// 停止信号（KillSignal=，默认 SIGTERM）。
+pub(crate) fn kill_signal_of(unit: &Unit) -> i32 {
+    unit.service
+        .kill_signal
+        .as_deref()
+        .and_then(crate::applets::sys::kill::signal_number)
+        .unwrap_or(libc::SIGTERM)
+}
+
+/// 同步执行一条命令（ExecStartPre/Post、ExecStopPost、oneshot ExecStart 用）。
+/// 返回退出码；超时（SIGKILL 整组）返回 None。
+pub(crate) fn run_command_sync(
+    cmd: &str,
+    env: &[(String, String)],
+    cfg: &SpawnConfig<'_>,
+    timeout_secs: u64,
+) -> Option<i32> {
+    let mut child = spawn_unit_command("hook", cmd, env, cfg)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.code().unwrap_or(-1)),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = kill_process_group(child.id(), libc::SIGKILL);
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
     }
 }
 
@@ -442,6 +513,8 @@ pub(crate) fn schedule_restart(svc: &mut ServiceInstance, failed: bool) {
         true
     } else if svc.restart_on_failure {
         failed
+    } else if svc.restart_on_success {
+        !failed
     } else {
         false
     };
@@ -533,11 +606,13 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
         }
     }
     let mode = svc.kill_mode.as_str();
+    let sig = kill_signal_of(&svc.unit);
+    let send_sigkill = svc.unit.service.send_sigkill;
     if let Some(mut child) = svc.child.take() {
         if mode != "none" {
             let _ = match mode {
-                "process" => kill_process(child.id(), libc::SIGTERM),
-                _ => kill_process_group(child.id(), libc::SIGTERM),
+                "process" => kill_process(child.id(), sig),
+                _ => kill_process_group(child.id(), sig),
             };
         }
         let deadline =
@@ -547,7 +622,7 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
                 Ok(Some(_)) => break,
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
-                        if mode != "none" {
+                        if mode != "none" && send_sigkill {
                             let _ = match mode {
                                 "process" => kill_process(child.id(), libc::SIGKILL),
                                 _ => kill_process_group(child.id(), libc::SIGKILL),
@@ -570,10 +645,9 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
             return;
         }
         if mode == "process" {
-            let _ = kill_process(pid, libc::SIGTERM);
+            let _ = kill_process(pid, sig);
         } else {
-            let _ = kill_process_group(pid, libc::SIGTERM)
-                .or_else(|_| kill_process(pid, libc::SIGTERM));
+            let _ = kill_process_group(pid, sig).or_else(|_| kill_process(pid, sig));
         }
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(svc.timeout_stop_sec.max(1));
@@ -584,11 +658,13 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
-                if mode == "process" {
-                    let _ = kill_process(pid, libc::SIGKILL);
-                } else {
-                    let _ = kill_process_group(pid, libc::SIGKILL)
-                        .or_else(|_| kill_process(pid, libc::SIGKILL));
+                if send_sigkill {
+                    if mode == "process" {
+                        let _ = kill_process(pid, libc::SIGKILL);
+                    } else {
+                        let _ = kill_process_group(pid, libc::SIGKILL)
+                            .or_else(|_| kill_process(pid, libc::SIGKILL));
+                    }
                 }
                 unsafe { libc::waitpid(pid as i32, &mut status, 0) };
                 break;
@@ -596,6 +672,20 @@ pub(crate) fn stop_service_instance(svc: &mut ServiceInstance) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
+    // ExecStopPost：停止后清理（无论停止是否成功）
+    if !svc.unit.service.exec_stop_post.is_empty() {
+        let cfg = SpawnConfig {
+            logfile: svc.logfile.as_deref(),
+            user: svc.user.as_deref(),
+            group: svc.group.as_deref(),
+            working_directory: svc.working_directory.as_deref(),
+        };
+        for cmd in svc.unit.service.exec_stop_post.clone() {
+            log(&format!("rbox init: ExecStopPost {}: {}", svc.name, cmd));
+            let _ = run_command_sync(&cmd, &svc.env, &cfg, EXEC_COMMAND_TIMEOUT);
+        }
+    }
+    svc.active = false;
 }
 
 /// 拉起降级/应急 shell（路径用配置的缺省 shell，默认 /bin/sh）。
@@ -676,6 +766,7 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         daemonize_deadline: None,
         restart_on_failure,
         restart_always: false,
+        restart_on_success: false,
         restart_sec: 1,
         start_limit_burst: 5,
         start_limit_interval_sec: 10,
@@ -683,6 +774,8 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         fail_count: 0,
         next_restart_at: None,
         stopped: false,
+        unit: Unit::default(),
+        active: false,
     }
 }
 
@@ -833,5 +926,40 @@ mod tests {
         finish_daemonize(&mut svc);
         assert_eq!(svc.tracked_pid, None);
         assert!(!svc.waiting_daemonize);
+    }
+
+    #[test]
+    fn success_exit_status_and_kill_signal() {
+        let mut u = Unit::default();
+        assert!(exit_is_success(&u, Some(0)));
+        assert!(!exit_is_success(&u, Some(2)));
+        assert!(!exit_is_success(&u, None));
+        u.service.success_exit_status = vec![2, 3];
+        assert!(exit_is_success(&u, Some(2)));
+        assert!(exit_is_success(&u, Some(3)));
+        assert!(!exit_is_success(&u, Some(4)));
+        assert_eq!(kill_signal_of(&u), libc::SIGTERM);
+        u.service.kill_signal = Some("INT".to_string());
+        assert_eq!(kill_signal_of(&u), libc::SIGINT);
+        u.service.kill_signal = Some("SIGKILL".to_string());
+        assert_eq!(kill_signal_of(&u), libc::SIGKILL);
+        // 未知信号回退 SIGTERM
+        u.service.kill_signal = Some("NOPE".to_string());
+        assert_eq!(kill_signal_of(&u), libc::SIGTERM);
+    }
+
+    #[test]
+    fn oneshot_instance_active_with_remain() {
+        let mut u = Unit {
+            name: "setup".to_string(),
+            ..Default::default()
+        };
+        u.service.typ = "oneshot".to_string();
+        let inst = oneshot_instance(&u, "/bin/true", &[]);
+        assert!(!inst.active); // 未设置 RemainAfterExit
+        assert!(inst.child.is_none());
+        u.service.remain_after_exit = true;
+        let inst = oneshot_instance(&u, "/bin/true", &[]);
+        assert!(inst.active);
     }
 }

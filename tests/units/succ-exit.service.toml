@@ -1,0 +1,12 @@
+[Unit]
+Description = "SuccessExitStatus + OnSuccess (test)"
+Name = "succ-exit"
+OnSuccess = ["success-handler"]
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'exit 3'"
+SuccessExitStatus = [3]
+
+[Install]
+WantedBy = ["default.target"]

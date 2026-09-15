@@ -54,6 +54,13 @@
   行首组后接管道交由管道路径
 - `$-` 在 `-c` 下含 `c`；`shift` 越界静默返回 1（ash 一致）
 - 测试健壮性：会话写入容错、EXIT 兜底清理 QEMU、等待超时缩短、UTF-8/登录重试
+- init（PID 1）生产化补齐：`Type=oneshot` + `RemainAfterExit`、`ExecStartPre/Post`、
+  `ExecStopPost`、`SuccessExitStatus`、`KillSignal`/`SendSIGKILL`、
+  `Restart=on-success/on-abnormal/on-abort`、`ConditionPathExists`/`ConditionDirectoryNotEmpty`、
+  `Conflicts`/`PartOf`/`OnFailure`/`OnSuccess`；控制接口新增 `daemon-reload`/`enable`/
+  `disable`/`is-enabled`/`isolate`/`reset-failed`；新增 `poweroff`/`halt` applet 与
+  `shutdown -h/-r/-t`；单元字段支持单值或数组写法
+- 修复：循环体内信号 trap 不触发（while/until 迭代边界检查 pending trap）
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -75,7 +82,7 @@
   Tab 补全、行编辑、作业控制（`jobs`/`fg`/`bg` + Ctrl-Z）、here-doc、`source`、PS1 展开
 - 登录：rgetty（常驻 fork/wait、`-L`/`-t` 超时）+ rlogin（shadow + crypt、降权、MOTD）、
   `su`/`passwd`
-- 65 个 applet：文件/文本/进程/系统工具（含 tar/dd/sort/cut/tr/test/find/mount 等）
+- 67 个 applet：文件/文本/进程/系统工具（含 tar/dd/sort/cut/tr/test/find/mount 等）
 
 ### Shell 脚本化（v0.1.0 内后续迭代）
 - 脚本模式：`sh script.sh args`、`sh -c`、shebang、stdin 脚本；`-e/-x/-u/-o pipefail`
@@ -88,7 +95,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 794 个、QEMU 集成断言 271 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 798 个、QEMU 集成断言 289 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
