@@ -455,19 +455,19 @@ send_boot() {
   # 10.9 脚本模式 / POSIX 展开 / 新重定向（新增）
   printf "sh -c \x27echo C_MODE_OK\x27\necho __RBOX_DONE__\n" >&7; wait_main
   # here-doc：逐行发送（保持与原实现一致的间隔）
-  printf "cat > /tmp/scr.sh <<\x27EOF\x27\n" >&7; sleep 0.3
-  printf "echo \"script:\$1:\$#\"\n" >&7; sleep 0.3
-  printf "f() { echo \"func:\$1\"; return 3; }\n" >&7; sleep 0.3
-  printf "function g { echo IFUNC_OK; }; g\n" >&7; sleep 0.3
-  printf "f hi; echo \"rc=\$?\"\n" >&7; sleep 0.3
-  printf "case x in x) echo CASE_OK;; esac\n" >&7; sleep 0.3
-  printf "until false; do echo UNTIL_OK; break; done\n" >&7; sleep 0.3
-  printf "for i in 1 2; do for j in a b; do echo \"loop:\$i\$j\"; break 2; done; done\n" >&7; sleep 0.3
-  printf "echo \"\${UNSET_XYZ:-PARAM_OK}\"\n" >&7; sleep 0.3
-  printf "V=\"a b\"; printf \"[%%s]\" \$V; echo\n" >&7; sleep 0.3
-  printf "echo \"file:\$(</etc/hostname)\"\n" >&7; sleep 0.3
-  printf "trap \x27echo EXIT_TRAP\x27 EXIT\n" >&7; sleep 0.3
-  printf "EOF\n" >&7; sleep 0.3
+  printf "cat > /tmp/scr.sh <<\x27EOF\x27\n" >&7; sleep 0.5
+  printf "echo \"script:\$1:\$#\"\n" >&7; sleep 0.5
+  printf "f() { echo \"func:\$1\"; return 3; }\n" >&7; sleep 0.5
+  printf "function g { echo IFUNC_OK; }; g\n" >&7; sleep 0.5
+  printf "f hi; echo \"rc=\$?\"\n" >&7; sleep 0.5
+  printf "case x in x) echo CASE_OK;; esac\n" >&7; sleep 0.5
+  printf "until false; do echo UNTIL_OK; break; done\n" >&7; sleep 0.5
+  printf "for i in 1 2; do for j in a b; do echo \"loop:\$i\$j\"; break 2; done; done\n" >&7; sleep 0.5
+  printf "echo \"\${UNSET_XYZ:-PARAM_OK}\"\n" >&7; sleep 0.5
+  printf "V=\"a b\"; printf \"[%%s]\" \$V; echo\n" >&7; sleep 0.5
+  printf "echo \"file:\$(</etc/hostname)\"\n" >&7; sleep 0.5
+  printf "trap \x27echo EXIT_TRAP\x27 EXIT\n" >&7; sleep 0.5
+  printf "EOF\n" >&7; sleep 0.5
   printf 'echo __RBOX_DONE__\n' >&7; wait_main
   printf "sh /tmp/scr.sh arg1\necho __RBOX_DONE__\n" >&7; wait_main
   printf "sh -ec \x27false\x27; echo e_rc=\$?\necho __RBOX_DONE__\n" >&7; wait_main
@@ -990,24 +990,48 @@ assert_contains "power off" "power off"
 # ─── 内核 cmdline 启动模式：emergency / single（独立 QEMU 会话）───
 echo ""
 echo "[emergency/single 启动模式]"
-EMERGENCY_OUT=$(timeout 130 bash -c '
-{
-  sleep 25
-  printf "echo EMERGENCY_SHELL_OK\n"; sleep 1
-  printf "shutdown\n"; sleep 8
-} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' emergency"
-' 2>&1) || true
+EMERGENCY_OUT_FILE=/tmp/rbox_emergency_out.$$
+EMERGENCY_OUT_FIFO=/tmp/rbox_emergency_fifo.$$
+rm -f "$EMERGENCY_OUT_FIFO" "$EMERGENCY_OUT_FILE"
+mkfifo "$EMERGENCY_OUT_FIFO"
+timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND emergency" \
+  < "$EMERGENCY_OUT_FIFO" > "$EMERGENCY_OUT_FILE" 2>&1 &
+EMERGENCY_OUT_QPID=$!
+exec 6> "$EMERGENCY_OUT_FIFO"
+# 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
+sleep 20
+for _ in $(seq 60); do
+    printf 'echo EMERGENCY_SHELL_OK\n' >&6
+    tr -d '\r' < "$EMERGENCY_OUT_FILE" 2>/dev/null | grep -qF EMERGENCY_SHELL_OK && break
+    sleep 1
+done
+finish_session "$EMERGENCY_OUT_QPID" 6 "$EMERGENCY_OUT_FIFO"
+EMERGENCY_OUT=$(cat "$EMERGENCY_OUT_FILE")
+rm -f "$EMERGENCY_OUT_FILE"
 assert_contains_in "$EMERGENCY_OUT" "emergency 模式进入应急 shell" "emergency mode, emergency shell"
 assert_not_contains_in "$EMERGENCY_OUT" "emergency 跳过服务启动" "starting console-shell"
 assert_contains_in "$EMERGENCY_OUT" "应急 shell 可用" "EMERGENCY_SHELL_OK"
 
-SINGLE_OUT=$(timeout 130 bash -c '
-{
-  sleep 25
-  printf "echo SINGLE_SHELL_OK\n"; sleep 1
-  printf "shutdown\n"; sleep 8
-} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd '"$INITRD"' -append "'"$APPEND"' single"
-' 2>&1) || true
+SINGLE_OUT_FILE=/tmp/rbox_single_out.$$
+SINGLE_OUT_FIFO=/tmp/rbox_single_fifo.$$
+rm -f "$SINGLE_OUT_FIFO" "$SINGLE_OUT_FILE"
+mkfifo "$SINGLE_OUT_FIFO"
+timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel "$KERNEL" -initrd "$INITRD" -append "$APPEND single" \
+  < "$SINGLE_OUT_FIFO" > "$SINGLE_OUT_FILE" 2>&1 &
+SINGLE_OUT_QPID=$!
+exec 5> "$SINGLE_OUT_FIFO"
+# 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
+sleep 20
+for _ in $(seq 60); do
+    printf 'echo SINGLE_SHELL_OK\n' >&5
+    tr -d '\r' < "$SINGLE_OUT_FILE" 2>/dev/null | grep -qF SINGLE_SHELL_OK && break
+    sleep 1
+done
+finish_session "$SINGLE_OUT_QPID" 5 "$SINGLE_OUT_FIFO"
+SINGLE_OUT=$(cat "$SINGLE_OUT_FILE")
+rm -f "$SINGLE_OUT_FILE"
 assert_contains_in "$SINGLE_OUT" "single 模式进入单用户 shell" "single mode, emergency shell"
 assert_not_contains_in "$SINGLE_OUT" "single 跳过服务启动" "starting console-shell"
 assert_contains_in "$SINGLE_OUT" "单用户 shell 可用" "SINGLE_SHELL_OK"
@@ -1041,12 +1065,25 @@ TOML
 (cd rootfs && find . | cpio -o -H newc 2>/dev/null | gzip > ../rescue-test.cpio.gz)
 mv /tmp/rbox_rescue_target_bak.toml "$RESCUE_TARGET"
 rm -f "$RESCUE_UNIT"
-RESCUE_OUT=$(timeout 130 bash -c '
-{
-  sleep 25
-  printf "echo RESCUE_SHELL_OK\n"; sleep 1
-  printf "shutdown\n"; sleep 8
-} | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic   -kernel '"$KERNEL"' -initrd rescue-test.cpio.gz -append '"'$APPEND'"'' 2>&1) || true
+RESCUE_OUT_FILE=/tmp/rbox_rescue_out.$$
+RESCUE_OUT_FIFO=/tmp/rbox_rescue_fifo.$$
+rm -f "$RESCUE_OUT_FIFO" "$RESCUE_OUT_FILE"
+mkfifo "$RESCUE_OUT_FIFO"
+timeout 150 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel "$KERNEL" -initrd rescue-test.cpio.gz -append "$APPEND " \
+  < "$RESCUE_OUT_FIFO" > "$RESCUE_OUT_FILE" 2>&1 &
+RESCUE_OUT_QPID=$!
+exec 4> "$RESCUE_OUT_FIFO"
+# 等待内核启动后再探测（过早输入会被 tty 刷新丢弃）
+sleep 20
+for _ in $(seq 60); do
+    printf 'echo RESCUE_SHELL_OK\n' >&4
+    tr -d '\r' < "$RESCUE_OUT_FILE" 2>/dev/null | grep -qF RESCUE_SHELL_OK && break
+    sleep 1
+done
+finish_session "$RESCUE_OUT_QPID" 4 "$RESCUE_OUT_FIFO"
+RESCUE_OUT=$(cat "$RESCUE_OUT_FILE")
+rm -f "$RESCUE_OUT_FILE"
 rm -f rescue-test.cpio.gz
 assert_contains_in "$RESCUE_OUT" "target 未达成日志" "target default.target not reached"
 assert_contains_in "$RESCUE_OUT" "进入 rescue 模式" "rescue mode, emergency shell"
@@ -1058,22 +1095,46 @@ echo ""
 echo "[持久盘模式（ext4 + switch_root）]"
 if command -v mkfs.ext4 >/dev/null 2>&1 || [ -x /sbin/mkfs.ext4 ]; then
     make disk >/dev/null 2>&1
-    DISK_OUT=$(timeout 180 bash -c '
-    {
-      sleep 30
-      printf "root\n"; sleep 2
-      printf "root\n"; sleep 2
-      printf "echo PERSIST_MARKER > /persist_test.txt; sync; echo disk_write_ok\n"; sleep 1
-      printf "reboot\n"; sleep 35
-      printf "root\n"; sleep 2
-      printf "root\n"; sleep 2
-      printf "cat /persist_test.txt\n"; sleep 1
-      printf "shutdown\n"; sleep 10
-    } | qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
-      -kernel '"$KERNEL"' -initrd '"$INITRD"' \
-      -drive file=rootfs.ext4,format=raw,if=virtio \
-      -append "'"$APPEND"' root=/dev/vda"
-    ' 2>&1) || true
+    DISK_OUT_FILE=/tmp/rbox_disk_out.$$
+DISK_FIFO=/tmp/rbox_disk_fifo.$$
+rm -f "$DISK_FIFO" "$DISK_OUT_FILE"
+mkfifo "$DISK_FIFO"
+timeout 300 qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic \
+  -kernel "$KERNEL" -initrd "$INITRD" \
+  -drive file=rootfs.ext4,format=raw,if=virtio \
+  -append "$APPEND root=/dev/vda" \
+  < "$DISK_FIFO" > "$DISK_OUT_FILE" 2>&1 &
+DISK_QPID=$!
+exec 3> "$DISK_FIFO"
+# 首次登录（root / root）
+B=$(count_of "$DISK_OUT_FILE" "user: "); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "user: " "$B" 200
+B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
+# 写盘并同步
+B=$(count_of "$DISK_OUT_FILE" "disk_write_ok"); printf 'echo PERSIST_MARKER > /persist_test.txt; sync; echo disk_write_ok\n' >&3
+wait_count "$DISK_OUT_FILE" "disk_write_ok" "$B" 150
+# 重启：等内核重新启动后重新登录
+printf 'reboot\n' >&3
+base_boot=$(count_of "$DISK_OUT_FILE" "Linux version")
+for _ in $(seq 150); do
+    n=$(count_of "$DISK_OUT_FILE" "Linux version")
+    [ "${n:-0}" -gt "${base_boot:-0}" ] && break
+    sleep 1
+done
+sleep 5
+B=$(count_of "$DISK_OUT_FILE" "user: ")
+for _ in $(seq 60); do
+    printf 'root\n' >&3
+    n=$(count_of "$DISK_OUT_FILE" "user: ")
+    [ "${n:-0}" -gt "${B:-0}" ] && break
+    sleep 1
+done
+B=$(count_of "$DISK_OUT_FILE" "passwd"); printf 'root\n' >&3; wait_count "$DISK_OUT_FILE" "passwd" "$B" 150
+# 校验持久化数据
+B=$(count_of "$DISK_OUT_FILE" "PERSIST_MARKER"); printf 'cat /persist_test.txt\n' >&3
+wait_count "$DISK_OUT_FILE" "PERSIST_MARKER" "$B" 150
+finish_session "$DISK_QPID" 3 "$DISK_FIFO"
+DISK_OUT=$(cat "$DISK_OUT_FILE")
+rm -f "$DISK_OUT_FILE"
     assert_contains_in "$DISK_OUT" "切换到持久根" "switching to persistent root /dev/vda"
     assert_contains_in "$DISK_OUT" "磁盘写入成功" "disk_write_ok"
     assert_contains_in "$DISK_OUT" "重启后数据保留" "PERSIST_MARKER"
