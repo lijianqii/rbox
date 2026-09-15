@@ -851,6 +851,13 @@ rbox 二进制本身支持的元命令（非 applet）：
 
 集成测试通过单次 QEMU 启动运行所有测试命令，捕获输出并用 grep 断言。
 
+**会话驱动**：各 QEMU 会话统一使用 `mkfifo` 输入 + 输出落盘 + 等待驱动，不再依赖固定
+`sleep`：登录/超时会话用 `wait_count`（按模式出现次数等待，动态基线）；主会话用 sentinel
+（命令后追加 `echo __RBOX_DONE__`，按行首精确计数等待，开机用 `__RBOX_BOOT__` 解耦启动耗时）。
+here-doc 逐行发送、多行复合命令/函数在块结束处等待；历史（`!$`）、Ctrl-C/Ctrl-Z 时序、
+嵌套 `sh`、reboot、UTF-8 多字节等特殊命令单独处理；收尾统一 `finish_session`（按 PID
+兜底 kill，避免 `pkill -f` 匹配脚本自身）。
+
 测试专用服务单元（`tests/units/`）在脚本运行时注入 `rootfs/etc/rbox/system/`，打包独立的 `initramfs.test.cpio.gz` 供 QEMU 使用；测试结束（含中断）通过 trap 自动清理注入文件与测试镜像，生产 rootfs 与 `make run` 用的 `initramfs.cpio.gz` 保持干净。
 
 ### 测试覆盖
