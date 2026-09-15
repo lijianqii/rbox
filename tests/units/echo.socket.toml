@@ -1,0 +1,12 @@
+[Unit]
+Description = "Unix socket activation (test)"
+Name = "echo.socket"
+
+[Socket]
+ListenStream = "/tmp/echo.sock"
+Accept = true
+SocketMode = 0o666
+Unit = "echo-handler"
+
+[Install]
+WantedBy = ["default.target"]

@@ -1,0 +1,10 @@
+[Unit]
+Description = "PathExists watcher (test)"
+Name = "watch.path"
+
+[Path]
+PathExists = "/tmp/watch-marker"
+Unit = "watch"
+
+[Install]
+WantedBy = ["default.target"]

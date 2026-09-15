@@ -110,6 +110,26 @@ fn main() -> ExitCode {
             "--version" | "-V" | "version" => return print_version(),
             // 隐藏模式：管道/子 shell 中执行 shell 内置命令
             "--builtin" => return run_builtin_subprocess(&raw_args[2..]),
+            // 隐藏模式：连接 Unix 套接字并发送一行（socket 激活测试用）
+            "--sockclient" => {
+                let path = raw_args.get(2).map(String::as_str).unwrap_or("");
+                let text = raw_args.get(3).map(String::as_str).unwrap_or("");
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(mut stream) => {
+                        use std::io::{Read, Write};
+                        let _ = stream.write_all(format!("{}\n", text).as_bytes());
+                        let _ = stream.shutdown(std::net::Shutdown::Write);
+                        let mut buf = String::new();
+                        let _ = stream.read_to_string(&mut buf);
+                        print!("{}", buf);
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("sockclient: {}: {}", path, e);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             // 隐藏模式：管道段中的子 shell（`cmd | ( ... )`）
             "--subshell" => {
                 let src = raw_args.get(2).cloned().unwrap_or_default();

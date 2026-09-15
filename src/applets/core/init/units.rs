@@ -21,6 +21,72 @@ pub(crate) struct Unit {
     pub(crate) service: ServiceSection,
     #[serde(default, rename = "Install")]
     pub(crate) install: InstallSection,
+    #[serde(default, rename = "Timer")]
+    pub(crate) timer: TimerSection,
+    #[serde(default, rename = "Path")]
+    pub(crate) path: PathSection,
+    #[serde(default, rename = "Socket")]
+    pub(crate) socket: SocketSection,
+    #[serde(skip)]
+    pub(crate) is_timer: bool,
+    #[serde(skip)]
+    pub(crate) is_path: bool,
+    #[serde(skip)]
+    pub(crate) is_socket: bool,
+}
+
+/// `[Socket]`：socket 激活单元（`*.socket.toml`）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct SocketSection {
+    /// Unix 套接字路径（以 `/` 开头）或 TCP 端口（纯数字，绑定 127.0.0.1）
+    #[serde(default, rename = "ListenStream")]
+    pub(crate) listen_stream: Option<String>,
+    /// 每个连接启动一次服务（连接作为 stdin/stdout）；缺省 false（监听 fd 作为 fd 3）
+    #[serde(default, rename = "Accept")]
+    pub(crate) accept: bool,
+    /// 触发的服务单元（缺省为同名去掉 .socket）
+    #[serde(default, rename = "Unit")]
+    pub(crate) unit: Option<String>,
+    /// Unix 套接字权限（八进制，如 0666）
+    #[serde(default, rename = "SocketMode")]
+    pub(crate) socket_mode: Option<u32>,
+}
+
+/// `[Timer]`：定时器单元（`*.timer.toml`）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct TimerSection {
+    /// 开机后 N 秒触发一次（支持 5s/2min/1h/1d 或纯秒数）
+    #[serde(default, rename = "OnBootSec")]
+    pub(crate) on_boot_sec: Option<String>,
+    /// 定时器激活后 N 秒触发一次
+    #[serde(default, rename = "OnActiveSec")]
+    pub(crate) on_active_sec: Option<String>,
+    /// 距上次触发 N 秒后重复触发
+    #[serde(default, rename = "OnUnitActiveSec")]
+    pub(crate) on_unit_active_sec: Option<String>,
+    /// 简化日历：`HH:MM[:SS]`（每天）或 `*:0/N`（每 N 分钟）
+    #[serde(default, rename = "OnCalendar")]
+    pub(crate) on_calendar: Option<String>,
+    /// 触发的服务单元（缺省为同名去掉 .timer）
+    #[serde(default, rename = "Unit")]
+    pub(crate) unit: Option<String>,
+}
+
+/// `[Path]`：路径监视单元（`*.path.toml`）。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct PathSection {
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "PathExists")]
+    pub(crate) path_exists: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "PathChanged")]
+    pub(crate) path_changed: Vec<String>,
+    #[serde(default, deserialize_with = "one_or_many")]
+    #[serde(rename = "DirectoryNotEmpty")]
+    pub(crate) directory_not_empty: Vec<String>,
+    /// 触发的服务单元（缺省为同名去掉 .path）
+    #[serde(default, rename = "Unit")]
+    pub(crate) unit: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -284,6 +350,60 @@ pub(crate) fn is_target_file(file_stem: &str) -> bool {
     file_stem.ends_with(".target")
 }
 
+/// 是否为 timer 单元（`*.timer`）。
+pub(crate) fn is_timer_file(file_stem: &str) -> bool {
+    file_stem.ends_with(".timer")
+}
+
+/// 是否为 path 单元（`*.path`）。
+pub(crate) fn is_path_file(file_stem: &str) -> bool {
+    file_stem.ends_with(".path")
+}
+
+/// 是否为 socket 单元（`*.socket`）。
+pub(crate) fn is_socket_file(file_stem: &str) -> bool {
+    file_stem.ends_with(".socket")
+}
+
+/// 解析 systemd 风格时长（`5s`/`2min`/`1h`/`1d`/纯秒数）。
+pub(crate) fn parse_duration(spec: &str) -> Option<u64> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    if let Ok(n) = spec.parse::<u64>() {
+        return Some(n);
+    }
+    for (suffix, mul) in [
+        ("seconds", 1u64),
+        ("second", 1),
+        ("secs", 1),
+        ("sec", 1),
+        ("minutes", 60),
+        ("minute", 60),
+        ("mins", 60),
+        ("min", 60),
+        ("hours", 3600),
+        ("hour", 3600),
+        ("hrs", 3600),
+        ("hr", 3600),
+        ("days", 86400),
+        ("day", 86400),
+        ("d", 86400),
+        ("h", 3600),
+        ("m", 60),
+        ("s", 1),
+        ("ms", 0),
+    ] {
+        if let Some(num) = spec.strip_suffix(suffix)
+            && let Ok(n) = num.trim().parse::<u64>()
+        {
+            return Some(n.saturating_mul(mul) / if suffix == "ms" { 1000 } else { 1 });
+        }
+    }
+    None
+}
+
 /// 加载单元目录（路径可配置，见 /etc/rbox.conf [paths] system_dir）下所有 .toml 单元文件。
 pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     let mut units: HashMap<String, Unit> = HashMap::new();
@@ -318,6 +438,9 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     unit.is_target = is_target_file(&file_stem);
+                    unit.is_timer = is_timer_file(&file_stem);
+                    unit.is_path = is_path_file(&file_stem);
+                    unit.is_socket = is_socket_file(&file_stem);
                     unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
                     if units.contains_key(&unit.name) {
                         log_at(
@@ -493,6 +616,7 @@ mod tests {
             install: InstallSection {
                 wanted_by: wanted_by.iter().map(|s| s.to_string()).collect(),
             },
+            ..Default::default()
         }
     }
 

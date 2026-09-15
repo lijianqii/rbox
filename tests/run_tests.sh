@@ -387,6 +387,12 @@ send_boot() {
   printf "rservice daemon-reload\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice isolate default.target\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice reset-failed\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # 定时器/路径监视：创建 marker 触发 PathExists 单元
+  printf "touch /tmp/watch-marker\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "sleep 3\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # socket 激活：客户端连接 Unix 套接字，服务读取一行并回显
+  printf "ls /tmp/echo.sock\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  printf "rbox --sockclient /tmp/echo.sock hello-socket\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # init 增强：reload、sysctl、User= 降权
   printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
@@ -777,6 +783,14 @@ assert_contains "is-enabled enabled" "enabled"
 assert_contains "disable 后 is-enabled disabled" "disabled"
 assert_contains "daemon-reload" "reloaded"
 assert_contains "isolate target" "isolated to default.target"
+assert_contains "OnBootSec 定时器触发" "TIMER_FIRED"
+assert_contains "OnUnitActiveSec 重复触发" "REPEAT_FIRED"
+assert_contains "PathExists 监视触发" "PATH_FIRED"
+assert_contains "timer 单元已装载" "timer bootjob.timer armed"
+assert_contains "path 单元已装载" "path watch.path watching"
+assert_contains "socket 单元监听" "socket echo.socket listening"
+assert_contains "socket 文件已创建" "echo.sock"
+assert_contains "socket 激活连接往返" "SOCKET_GOT:hello-socket"
 
 
 echo ""

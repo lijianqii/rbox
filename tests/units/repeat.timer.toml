@@ -1,0 +1,11 @@
+[Unit]
+Description = "OnUnitActiveSec repeating timer (test)"
+Name = "repeat.timer"
+
+[Timer]
+OnBootSec = "2s"
+OnUnitActiveSec = "2s"
+Unit = "repeat"
+
+[Install]
+WantedBy = ["default.target"]

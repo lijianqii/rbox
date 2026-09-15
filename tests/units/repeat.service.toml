@@ -1,0 +1,7 @@
+[Unit]
+Description = "Repeated timer target (test)"
+Name = "repeat"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo REPEAT_FIRED"

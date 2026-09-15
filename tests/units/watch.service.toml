@@ -1,0 +1,7 @@
+[Unit]
+Description = "Path watch target (test)"
+Name = "watch"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo PATH_FIRED"

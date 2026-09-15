@@ -224,6 +224,97 @@ pub(crate) fn spawn_unit_command(
     }
 }
 
+/// socket 激活启动：`conn` 为已接受连接（Accept=yes，连接作为 stdin/stdout）；
+/// `listen_fd` 为监听套接字（Accept=no，复制为 fd 3 并设置 LISTEN_FDS/LISTEN_PID）。
+pub(crate) fn spawn_socket_command(
+    unit: &Unit,
+    env: &[(String, String)],
+    conn: Option<crate::applets::core::init::triggers::SocketConn>,
+    listen_fd: Option<i32>,
+) -> Option<Child> {
+    let cmd = unit.service.exec_start.as_deref()?;
+    let argv = parse_cmdline(cmd);
+    if argv.is_empty() {
+        return None;
+    }
+    let cfg = SpawnConfig::from_unit(unit);
+    let self_path = rbox_self_path();
+    let (program, args) = if (argv[0] == "rbox" || argv[0] == "/bin/rbox" || argv[0] == self_path)
+        && argv.len() >= 2
+    {
+        (self_path.as_str(), &argv[1..])
+    } else {
+        (argv[0].as_str(), &argv[1..])
+    };
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    command.envs(env.iter().cloned());
+    command.process_group(0);
+    if let Some(dir) = cfg.working_directory
+        && std::path::Path::new(dir).is_dir()
+    {
+        command.current_dir(dir);
+    }
+    if let Some(c) = conn {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+        let raw = match c {
+            crate::applets::core::init::triggers::SocketConn::Unix(s) => s.into_raw_fd(),
+            crate::applets::core::init::triggers::SocketConn::Tcp(s) => s.into_raw_fd(),
+        };
+        let f2 = unsafe { libc::dup(raw) };
+        command.stdin(Stdio::from(unsafe { std::fs::File::from_raw_fd(raw) }));
+        if f2 >= 0 {
+            command.stdout(Stdio::from(unsafe { std::fs::File::from_raw_fd(f2) }));
+        }
+    }
+    if let Some(fd) = listen_fd {
+        command.env("LISTEN_FDS", "1");
+        #[cfg(unix)]
+        unsafe {
+            command.pre_exec(move || {
+                // 子进程中设置 LISTEN_PID 为自身 pid，并把监听 fd 复制为 3
+                let pid = libc::getpid().to_string();
+                let k = std::ffi::CString::new("LISTEN_PID").unwrap();
+                let v = std::ffi::CString::new(pid).unwrap();
+                libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+                libc::fcntl(fd, libc::F_SETFD, 0);
+                libc::dup2(fd, 3);
+                Ok(())
+            });
+        }
+    }
+    if let Some(user) = cfg.user {
+        command.uid(lookup_uid(user)?);
+    }
+    if let Some(group) = cfg.group {
+        command.gid(lookup_gid(group)?);
+    }
+    match command.spawn() {
+        Ok(child) => {
+            log(&format!(
+                "rbox init: started {} (socket activation, pid {})",
+                unit.name,
+                child.id()
+            ));
+            Some(child)
+        }
+        Err(e) => {
+            log(&format!(
+                "rbox init: failed to start {} (socket): {}",
+                unit.name, e
+            ));
+            None
+        }
+    }
+}
+
+/// 构造 socket 激活启动的服务实例。
+pub(crate) fn socket_instance(unit: &Unit, child: Child) -> ServiceInstance {
+    let cmd = unit.service.exec_start.clone().unwrap_or_default();
+    let env = unit_environment(unit);
+    new_service_instance(unit, &cmd, &env, Some(child), None)
+}
+
 /// 通过 /etc/passwd 解析用户名 -> uid。
 fn lookup_uid(name: &str) -> Option<u32> {
     let Ok(c) = std::ffi::CString::new(name) else {

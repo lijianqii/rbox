@@ -1,0 +1,7 @@
+[Unit]
+Description = "Socket-activated echo handler (test)"
+Name = "echo-handler"
+
+[Service]
+Type = "simple"
+ExecStart = "/bin/rbox sh -c 'read line; echo \"SOCKET_GOT:$line\"'"

@@ -1,0 +1,10 @@
+[Unit]
+Description = "OnBootSec timer (test)"
+Name = "bootjob.timer"
+
+[Timer]
+OnBootSec = "3s"
+Unit = "bootjob"
+
+[Install]
+WantedBy = ["default.target"]

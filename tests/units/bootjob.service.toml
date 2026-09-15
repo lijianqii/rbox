@@ -1,0 +1,7 @@
+[Unit]
+Description = "Oneshot triggered by timer (test)"
+Name = "bootjob"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo TIMER_FIRED"

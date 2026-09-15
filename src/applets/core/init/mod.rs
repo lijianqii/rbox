@@ -16,6 +16,7 @@ pub(crate) mod services;
 pub(crate) mod shutdown;
 pub(crate) mod signals;
 pub(crate) mod syscall;
+pub(crate) mod triggers;
 pub(crate) mod units;
 pub(crate) mod watchdog;
 
@@ -26,8 +27,11 @@ use crate::applets::core::init::mount::{
 use crate::applets::core::init::server::{create_status_listener, handle_control_connection};
 use crate::applets::core::init::services::{
     ServiceInstance, SpawnConfig, exit_is_success, finish_daemonize, oneshot_instance,
-    respawn_service, run_command_sync, schedule_restart, start_forking_service, start_service,
-    stop_service_instance, unit_environment,
+    respawn_service, run_command_sync, schedule_restart, spawn_socket_command,
+    start_forking_service, start_service, stop_service_instance, unit_environment,
+};
+use crate::applets::core::init::triggers::{
+    PathInstance, SocketInstance, TimerInstance, path_from_unit, socket_from_unit, timer_from_unit,
 };
 use crate::applets::core::init::units::{Unit, compute_start_order, load_all_units, sort_deps};
 use crate::applets::core::{LogLevel, log, log_at};
@@ -229,8 +233,52 @@ impl Applet for Init {
         //    服务状态用 Mutex 共享给控制连接线程（见 reap_with_shutdown）。
         let status_listener = create_status_listener();
         let services_shared = Arc::new(Mutex::new(services));
+        // 定时器/路径监视实例：仅对可达（started_ok）的单元建立
+        let timers: Vec<TimerInstance> = order
+            .iter()
+            .filter(|n| started_ok.get(*n).copied().unwrap_or(false))
+            .filter_map(|n| units.get(n))
+            .filter_map(timer_from_unit)
+            .collect();
+        let paths: Vec<PathInstance> = order
+            .iter()
+            .filter(|n| started_ok.get(*n).copied().unwrap_or(false))
+            .filter_map(|n| units.get(n))
+            .filter_map(path_from_unit)
+            .collect();
+        for t in &timers {
+            log(&format!(
+                "rbox init: timer {} armed (target {})",
+                t.name, t.target
+            ));
+        }
+        for p in &paths {
+            log(&format!(
+                "rbox init: path {} watching {} (target {})",
+                p.name, p.path, p.target
+            ));
+        }
+        let sockets: Vec<SocketInstance> = order
+            .iter()
+            .filter(|n| started_ok.get(*n).copied().unwrap_or(false))
+            .filter_map(|n| units.get(n))
+            .filter_map(socket_from_unit)
+            .collect();
+        for s in &sockets {
+            log(&format!(
+                "rbox init: socket {} listening (target {})",
+                s.name, s.target
+            ));
+        }
         let units_shared = Arc::new(Mutex::new(units));
-        reap_with_shutdown(&services_shared, &units_shared, status_listener)
+        reap_with_shutdown(
+            &services_shared,
+            &units_shared,
+            status_listener,
+            timers,
+            paths,
+            sockets,
+        )
     }
 }
 
@@ -678,6 +726,9 @@ fn reap_with_shutdown(
     services_shared: &Arc<Mutex<Vec<ServiceInstance>>>,
     units: &Arc<Mutex<HashMap<String, Unit>>>,
     status_listener: Option<UnixListener>,
+    mut timers: Vec<TimerInstance>,
+    mut paths: Vec<PathInstance>,
+    sockets: Vec<SocketInstance>,
 ) -> ExitCode {
     // 创建 self-pipe：信号处理器写 1 字节唤醒主循环 poll
     let (signal_pipe_read, signal_pipe_write) = signals::create_signal_pipe();
@@ -828,6 +879,65 @@ fn reap_with_shutdown(
             }
         }
 
+        // 1d. 定时器与路径监视：到期/命中则启动关联单元
+        let now = std::time::Instant::now();
+        let mut trigger_targets: Vec<String> = Vec::new();
+        for t in timers.iter_mut() {
+            if now >= t.next_due {
+                log(&format!(
+                    "rbox init: timer {} fired -> {}",
+                    t.name, t.target
+                ));
+                trigger_targets.push(t.target.clone());
+                match t.repeat_secs {
+                    Some(secs) if secs > 0 => {
+                        t.next_due = now + std::time::Duration::from_secs(secs);
+                    }
+                    _ => {
+                        // 一次性定时器：标记为不再触发（下次到期设为极远）
+                        t.next_due = now + std::time::Duration::from_secs(86400 * 365);
+                    }
+                }
+            }
+        }
+        for p in paths.iter_mut() {
+            if p.check() {
+                log(&format!(
+                    "rbox init: path {} triggered -> {}",
+                    p.name, p.target
+                ));
+                trigger_targets.push(p.target.clone());
+            }
+        }
+        for name in trigger_targets {
+            let u_opt = units.lock().ok().and_then(|m| m.get(&name).cloned());
+            if let Some(u) = u_opt {
+                if services
+                    .iter()
+                    .any(|s| s.name == name && (s.child.is_some() || s.active))
+                {
+                    continue; // 已在运行
+                }
+                let (ok, inst) = start_unit(&u);
+                log_at(
+                    if ok { LogLevel::Info } else { LogLevel::Warn },
+                    &format!(
+                        "rbox init: timer/path triggered {} -> {}",
+                        name,
+                        if ok { "ok" } else { "failed" }
+                    ),
+                );
+                if let Some(inst) = inst {
+                    services.push(inst);
+                }
+            } else {
+                log_at(
+                    LogLevel::Warn,
+                    &format!("rbox init: triggered unit {} not found", name),
+                );
+            }
+        }
+
         // 2. 收割收养的孤儿进程（waitpid -1），防止僵尸累积
         reap_orphans(services);
 
@@ -854,15 +964,34 @@ fn reap_with_shutdown(
         // 4. 事件等待：poll 监听 self-pipe 与 status socket。
         //    超时为最近的 restart 退避 / daemon 化超时 / 喂狗截止
         //    （无定时则按喂狗间隔唤醒，保证空闲时也能定时喂狗）。
+        let mut next_timeout = compute_next_timeout(services);
+        for t in &timers {
+            let d = t
+                .next_due
+                .saturating_duration_since(std::time::Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            next_timeout = match next_timeout {
+                -1 => d,
+                v => v.min(d),
+            };
+        }
+        if !paths.is_empty() {
+            // 路径监视按 1s 粒度轮询
+            next_timeout = match next_timeout {
+                -1 => 1000,
+                v => v.min(1000),
+            };
+        }
         let timeout = watchdog::watchdog_poll_timeout(
-            compute_next_timeout(services),
+            next_timeout,
             &last_feed,
             &watchdog_interval,
             watchdog_fd.is_some(),
         );
         drop(services_guard); // poll 期间释放锁，控制线程可获锁执行请求
         let status_fd = status_listener.as_ref().map(|l| l.as_raw_fd());
-        let mut fds = [
+        let mut fds = vec![
             libc::pollfd {
                 fd: signal_pipe_read,
                 events: libc::POLLIN,
@@ -874,8 +1003,14 @@ fn reap_with_shutdown(
                 revents: 0,
             },
         ];
-        let nfds = if status_fd.is_some() { 2 } else { 1 };
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout) };
+        for sock in &sockets {
+            fds.push(libc::pollfd {
+                fd: sock.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n > 0 {
             if fds[0].revents & libc::POLLIN != 0 {
                 signals::drain_signal_pipe(signal_pipe_read);
@@ -888,6 +1023,39 @@ fn reap_with_shutdown(
                 let svc = services_shared.clone();
                 let u = units.clone();
                 std::thread::spawn(move || handle_control_connection(stream, svc, u));
+            }
+            // socket 激活：可读即接受连接/启动服务（重新持锁，poll 前已释放）
+            let mut svc_guard = services_shared.lock().unwrap();
+            for (idx, sock) in sockets.iter().enumerate() {
+                let pi = 2 + idx;
+                if fds[pi].revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let u_opt = units.lock().ok().and_then(|m| m.get(&sock.target).cloned());
+                let Some(u) = u_opt else {
+                    log_at(
+                        LogLevel::Warn,
+                        &format!(
+                            "rbox init: socket {} target {} not found",
+                            sock.name, sock.target
+                        ),
+                    );
+                    continue;
+                };
+                let env = unit_environment(&u);
+                if sock.accept {
+                    if let Some(conn) = sock.accept_conn()
+                        && let Some(child) = spawn_socket_command(&u, &env, Some(conn), None)
+                    {
+                        svc_guard.push(crate::applets::core::init::services::socket_instance(
+                            &u, child,
+                        ));
+                    }
+                } else if let Some(child) = spawn_socket_command(&u, &env, None, Some(sock.fd())) {
+                    svc_guard.push(crate::applets::core::init::services::socket_instance(
+                        &u, child,
+                    ));
+                }
             }
         } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
