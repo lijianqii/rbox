@@ -5,7 +5,6 @@
 # 测试专用服务（tests/units/*.toml）通过 `make rootfs-test` 注入并打包为
 # 独立的测试 initramfs，生产 rootfs 保持干净。
 set -e
-trap 'echo "RBOX_TEST_ABORT line=$LINENO cmd=$BASH_COMMAND" >&2' ERR
 
 cd "$(dirname "$0")/.."
 
