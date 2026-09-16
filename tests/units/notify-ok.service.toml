@@ -1,0 +1,11 @@
+[Unit]
+Description = "Type=notify with watchdog pings (test)"
+Name = "notify-ok"
+
+[Service]
+Type = "notify"
+ExecStart = "/bin/rbox sh -c 'rbox --sd-notify READY=1; i=0; while [ $i -lt 6 ]; do rbox --sd-notify WATCHDOG=1; sleep 1; i=$((i+1)); done'"
+WatchdogSec = "3s"
+
+[Install]
+WantedBy = ["default.target"]

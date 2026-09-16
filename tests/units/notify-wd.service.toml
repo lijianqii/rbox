@@ -1,0 +1,11 @@
+[Unit]
+Description = "Type=notify without watchdog pings (test)"
+Name = "notify-wd"
+
+[Service]
+Type = "notify"
+ExecStart = "/bin/rbox sh -c 'rbox --sd-notify READY=1; sleep 30'"
+WatchdogSec = "2s"
+
+[Install]
+WantedBy = ["default.target"]

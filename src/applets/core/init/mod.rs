@@ -12,6 +12,7 @@
 pub(crate) mod boot;
 pub(crate) mod cgroup;
 pub(crate) mod mount;
+pub(crate) mod notify;
 pub(crate) mod server;
 pub(crate) mod services;
 pub(crate) mod shutdown;
@@ -25,6 +26,7 @@ use crate::applet::Applet;
 use crate::applets::core::init::mount::{
     apply_sysctl, mount_all_fs, setup_environment, setup_hostname,
 };
+use crate::applets::core::init::notify::{NotifySocket, parse_message};
 use crate::applets::core::init::server::{create_status_listener, handle_control_connection};
 use crate::applets::core::init::services::{
     ServiceInstance, SpawnConfig, exit_is_success, finish_daemonize, oneshot_instance,
@@ -75,6 +77,8 @@ impl Applet for Init {
         setup_environment();
         mount_all_fs();
         crate::applets::core::init::cgroup::ensure_mounted();
+        // 通知套接字须在服务启动前创建，否则 Type=notify 的 READY 会丢失
+        let notify_sock = crate::applets::core::init::notify::create();
         setup_hostname();
         apply_sysctl(&crate::config::load().paths.sysctl_conf);
         log("rbox init: basic filesystems mounted");
@@ -280,6 +284,7 @@ impl Applet for Init {
             timers,
             paths,
             sockets,
+            notify_sock,
         )
     }
 }
@@ -545,7 +550,7 @@ fn start_unit(unit: &Unit) -> (bool, Option<ServiceInstance>) {
         return (true, None); // 无 ExecStart 的单元（如占位服务）视为启动成功
     };
     let typ = unit.service.typ.as_str();
-    if !typ.is_empty() && !matches!(typ, "simple" | "forking" | "oneshot") {
+    if !typ.is_empty() && !matches!(typ, "simple" | "forking" | "oneshot" | "notify") {
         log_at(
             LogLevel::Warn,
             &format!(
@@ -731,6 +736,7 @@ fn reap_with_shutdown(
     mut timers: Vec<TimerInstance>,
     mut paths: Vec<PathInstance>,
     sockets: Vec<SocketInstance>,
+    notify_sock: Option<NotifySocket>,
 ) -> ExitCode {
     // 创建 self-pipe：信号处理器写 1 字节唤醒主循环 poll
     let (signal_pipe_read, signal_pipe_write) = signals::create_signal_pipe();
@@ -818,6 +824,8 @@ fn reap_with_shutdown(
                 };
                 if exited {
                     svc.child = None;
+                    svc.waiting_ready = false;
+                    svc.watchdog_deadline = None;
                     if !failed {
                         // 成功退出：RemainAfterExit=yes 保持 active；触发 OnSuccess
                         if svc.unit.service.remain_after_exit {
@@ -940,6 +948,29 @@ fn reap_with_shutdown(
             }
         }
 
+        // 1e. Type=notify 看门狗：超时未收到 WATCHDOG=1 则终止并触发重启
+        let now = std::time::Instant::now();
+        for svc in services.iter_mut() {
+            if let Some(deadline) = svc.watchdog_deadline
+                && now >= deadline
+            {
+                log_at(
+                    LogLevel::Warn,
+                    &format!("rbox init: {} watchdog timeout, killing", svc.name),
+                );
+                svc.watchdog_deadline = None;
+                if let Some(child) = svc.child.as_ref() {
+                    let _ = crate::applets::core::init::syscall::kill_process_group(
+                        child.id(),
+                        libc::SIGTERM,
+                    );
+                } else if let Some(pid) = svc.tracked_pid {
+                    let _ =
+                        crate::applets::core::init::syscall::kill_process_group(pid, libc::SIGTERM);
+                }
+            }
+        }
+
         // 2. 收割收养的孤儿进程（waitpid -1），防止僵尸累积
         reap_orphans(services);
 
@@ -1012,6 +1043,14 @@ fn reap_with_shutdown(
                 revents: 0,
             });
         }
+        let notify_idx = notify_sock.as_ref().map(|n| {
+            fds.push(libc::pollfd {
+                fd: n.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            fds.len() - 1
+        });
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if n > 0 {
             if fds[0].revents & libc::POLLIN != 0 {
@@ -1059,12 +1098,87 @@ fn reap_with_shutdown(
                     ));
                 }
             }
+            // sd_notify：READY=1 / WATCHDOG=1 / STATUS=
+            if let Some(idx) = notify_idx
+                && fds[idx].revents & libc::POLLIN != 0
+                && let Some(ns) = notify_sock.as_ref()
+            {
+                for (pid, msg) in ns.drain() {
+                    let (ready, wd, status, ppid) = parse_message(&msg);
+                    if let Some(s) = status {
+                        log_at(
+                            LogLevel::Debug,
+                            &format!("rbox init: notify pid {} status {}", pid, s),
+                        );
+                    }
+                    for svc in svc_guard.iter_mut() {
+                        // 发送者可能是服务的子进程（如 sh -c 中的 rbox --sd-notify），
+                        // 沿 /proc/<pid>/stat 的 ppid 链向上匹配服务主进程
+                        let own = svc.child.as_ref().map(|c| c.id() as i32) == Some(pid)
+                            || svc.tracked_pid == Some(pid as u32)
+                            || (ppid.is_some()
+                                && svc.child.as_ref().map(|c| c.id() as i32) == ppid)
+                            || svc
+                                .child
+                                .as_ref()
+                                .is_some_and(|c| is_descendant(pid, c.id() as i32));
+                        if !own {
+                            continue;
+                        }
+                        if ready && svc.waiting_ready {
+                            svc.waiting_ready = false;
+                            log(&format!("rbox init: {} ready (sd_notify)", svc.name));
+                            if let Some(secs) = svc.watchdog_secs {
+                                svc.watchdog_deadline = Some(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(secs),
+                                );
+                            }
+                        }
+                        if wd && let Some(secs) = svc.watchdog_secs {
+                            svc.watchdog_deadline = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(secs),
+                            );
+                        }
+                    }
+                }
+            }
         } else if n < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
             // 非 EINTR 的 poll 错误：短暂休眠避免忙循环
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
+}
+
+/// pid 是否为 ancestor 的后代（沿 /proc/<pid>/stat 的 ppid 链，最多 32 层）。
+fn is_descendant(pid: i32, ancestor: i32) -> bool {
+    let mut cur = pid;
+    for _ in 0..32 {
+        if cur == ancestor {
+            return true;
+        }
+        if cur <= 1 {
+            return false;
+        }
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", cur)) else {
+            return false;
+        };
+        // comm 可能含空格/括号：取最后一个 ')' 之后字段（state ppid ...）
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            return false;
+        };
+        let ppid = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0);
+        if ppid <= 0 {
+            return false;
+        }
+        cur = ppid;
+    }
+    false
 }
 
 /// 收割收养的孤儿进程（waitpid -1, WNOHANG），防止僵尸累积。

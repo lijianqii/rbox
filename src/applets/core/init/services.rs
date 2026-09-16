@@ -64,6 +64,12 @@ pub(crate) struct ServiceInstance {
     pub(crate) restart_on_success: bool,
     /// cgroup v2 路径（有资源限制时创建）
     pub(crate) cgroup_path: Option<String>,
+    /// Type=notify：等待 READY=1
+    pub(crate) waiting_ready: bool,
+    /// WatchdogSec（秒）：READY 后需周期 WATCHDOG=1
+    pub(crate) watchdog_secs: Option<u64>,
+    /// 看门狗截止时间
+    pub(crate) watchdog_deadline: Option<std::time::Instant>,
 }
 
 impl ServiceInstance {
@@ -570,6 +576,15 @@ pub(crate) fn parse_environment_file(content: &str) -> Vec<(String, String)> {
 /// 单元环境变量：EnvironmentFile=（路径前缀 `-` 表示可选）打底，
 /// Environment= 覆盖同名项。
 pub(crate) fn unit_environment(unit: &Unit) -> Vec<(String, String)> {
+    let mut env = unit_environment_inner(unit);
+    env.push((
+        "NOTIFY_SOCKET".to_string(),
+        crate::applets::core::init::notify::NOTIFY_SOCKET.to_string(),
+    ));
+    env
+}
+
+fn unit_environment_inner(unit: &Unit) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     if let Some(path) = &unit.service.environment_file {
         let (optional, p) = match path.strip_prefix('-') {
@@ -716,6 +731,13 @@ fn new_service_instance(
         unit: unit.clone(),
         active: false,
         cgroup_path,
+        waiting_ready: unit.service.typ == "notify",
+        watchdog_secs: unit
+            .service
+            .watchdog_sec
+            .as_deref()
+            .and_then(crate::applets::core::init::units::parse_duration),
+        watchdog_deadline: None,
     }
 }
 
@@ -835,6 +857,8 @@ pub(crate) fn respawn_service(svc: &mut ServiceInstance) {
     if let Some(child) = svc.child.as_ref() {
         svc.cgroup_path = crate::applets::core::init::cgroup::setup(&svc.unit, child.id());
     }
+    svc.waiting_ready = svc.unit.service.typ == "notify";
+    svc.watchdog_deadline = None;
     if !svc.is_forking {
         return;
     }
@@ -1076,6 +1100,9 @@ pub(crate) fn test_svc(name: &str, restart_on_failure: bool) -> ServiceInstance 
         unit: Unit::default(),
         active: false,
         cgroup_path: None,
+        waiting_ready: false,
+        watchdog_secs: None,
+        watchdog_deadline: None,
     }
 }
 

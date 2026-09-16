@@ -286,6 +286,9 @@ pub(crate) struct ServiceSection {
     /// cgroup v2：所属 slice（默认 system.slice）
     #[serde(default, rename = "Slice")]
     pub(crate) slice: Option<String>,
+    /// 看门狗超时（Type=notify 服务需周期发送 WATCHDOG=1）
+    #[serde(default, rename = "WatchdogSec")]
+    pub(crate) watchdog_sec: Option<String>,
 }
 
 fn default_restart_sec() -> u64 {
@@ -315,6 +318,59 @@ pub(crate) struct InstallSection {
     #[serde(default)]
     #[serde(rename = "WantedBy")]
     pub(crate) wanted_by: Vec<String>,
+}
+
+/// 合并 `<unit>.d/*.toml` drop-in 覆盖（深合并，后加载覆盖先加载）。
+pub(crate) fn apply_dropins(path: &Path, base: &str) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dir = path.with_file_name(format!("{}.d", stem));
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return base.to_string();
+    };
+    let mut value: toml::Value = match base.parse() {
+        Ok(v) => v,
+        Err(_) => return base.to_string(),
+    };
+    let mut files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("toml"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(content) = fs::read_to_string(&f) else {
+            continue;
+        };
+        let Ok(over) = content.parse::<toml::Value>() else {
+            log_at(
+                LogLevel::Warn,
+                &format!("rbox init: parse error in drop-in {}", f.display()),
+            );
+            continue;
+        };
+        merge_toml(&mut value, over);
+    }
+    value.to_string()
+}
+
+/// 深合并 TOML（表递归合并，其余覆盖）。
+fn merge_toml(base: &mut toml::Value, over: toml::Value) {
+    match (base, over) {
+        (toml::Value::Table(b), toml::Value::Table(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => merge_toml(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
 }
 
 /// 扫描单元目录，返回 (unit_name, 路径, 是否启用) 列表（含 `*.toml.disabled`）。
@@ -475,6 +531,7 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
                     continue;
                 }
             };
+            let content = apply_dropins(&path, &content);
             match toml::from_str::<Unit>(&content) {
                 Ok(mut unit) => {
                     // 文件名去掉 .toml；单元名优先用 [Unit] Name，缺省回退文件名

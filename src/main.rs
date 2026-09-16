@@ -110,6 +110,22 @@ fn main() -> ExitCode {
             "--version" | "-V" | "version" => return print_version(),
             // 隐藏模式：管道/子 shell 中执行 shell 内置命令
             "--builtin" => return run_builtin_subprocess(&raw_args[2..]),
+            // 隐藏模式：向 $NOTIFY_SOCKET 发送 sd_notify 消息
+            "--sd-notify" => {
+                let msg = raw_args.get(2).map(String::as_str).unwrap_or("");
+                let Ok(path) = std::env::var("NOTIFY_SOCKET") else {
+                    return ExitCode::FAILURE;
+                };
+                let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() else {
+                    return ExitCode::FAILURE;
+                };
+                // 附带父进程 pid（服务主进程），便于 init 归属到对应服务
+                let full = format!("{}\nX_RBOX_PPID={}", msg, unsafe { libc::getppid() });
+                return match sock.send_to(full.as_bytes(), &path) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(_) => ExitCode::FAILURE,
+                };
+            }
             // 隐藏模式：连接 Unix 套接字并发送一行（socket 激活测试用）
             "--sockclient" => {
                 let path = raw_args.get(2).map(String::as_str).unwrap_or("");

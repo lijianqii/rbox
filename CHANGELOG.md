@@ -70,6 +70,10 @@
 - init cgroup v2：Slice/MemoryMax/CPUQuota/CPUWeight/TasksMax（自动挂载 cgroup2、启用控制器、
   服务加入子 cgroup，KillMode 优先 cgroup.kill）；内核启用 CONFIG_CFS_BANDWIDTH
 - 修复：命令替换内的内置命令（$(umask)/$(ulimit -n)）经 `rbox --builtin` 执行
+- init Type=notify + WatchdogSec：/run/systemd/notify（SO_PASSCRED）接收 READY=1/WATCHDOG=1，
+  按发送者 pid/父进程归属服务；看门狗超时终止并触发重启
+- init drop-in 覆盖：`<unit>.d/*.toml` 深合并
+- 修复：notify 套接字需在服务启动前创建；服务退出清理看门狗状态
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -104,7 +108,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 809 个、QEMU 集成断言 308 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 810 个、QEMU 集成断言 310 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标
