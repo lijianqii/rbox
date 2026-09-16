@@ -692,6 +692,26 @@ WantedBy = ["default.target"]      # 被哪个 target 拉入
 
 target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依赖图的根节点。
 
+**生产化能力（对齐 systemd 语义）**：
+
+| 类别 | 支持项 |
+|---|---|
+| 服务类型 | `simple` / `forking` / `oneshot`（+`RemainAfterExit`）/ `notify`（sd_notify `READY=1`） |
+| 生命周期钩子 | `ExecStartPre` / `ExecStartPost` / `ExecStopPost`（同步执行，失败则启动失败） |
+| 退出与重启 | `SuccessExitStatus`、`Restart=no/on-failure/always/on-success/on-abnormal/on-abort`、`RestartSec`、`StartLimitBurst/IntervalSec`、`KillSignal`、`SendSIGKILL`、`WatchdogSec` |
+| 依赖与联动 | `After`/`Before`/`Requires`/`Wants`/`Requisite`、`Conflicts`、`PartOf`、`OnFailure`、`OnSuccess` |
+| 条件 | `ConditionPathExists` / `ConditionDirectoryNotEmpty`（`!` 取反；不满足跳过且不算失败） |
+| 进程属性 | `User`/`Group`/`WorkingDirectory`、`UMask`、`Nice`、`OOMScoreAdjust`、`LimitNOFILE`/`LimitNPROC`/`LimitCORE`/`LimitAS` |
+| 沙箱 | `NoNewPrivileges`、`PrivateTmp`、`ProtectHome=yes/read-only/tmpfs`、`ProtectSystem=yes/full/strict` |
+| cgroup v2 | `Slice`、`MemoryMax`、`CPUQuota`、`CPUWeight`、`TasksMax`（自动挂载 cgroup2；`KillMode` 优先 `cgroup.kill`） |
+| 其他单元 | `.target`、`.timer`（`OnBootSec`/`OnActiveSec`/`OnUnitActiveSec`/简化 `OnCalendar`）、`.path`（`PathExists`/`PathChanged`/`DirectoryNotEmpty`）、`.socket`（`ListenStream` Unix/TCP、`Accept=yes/no`、`SocketMode`） |
+| 管理接口 | `rservice list/status/start/stop/restart/reload/enable/disable/is-enabled/isolate/reset-failed/daemon-reload`；`shutdown -h/-r/-t`、`poweroff`、`halt` |
+| 配置覆盖 | `<unit>.d/*.toml` drop-in 深合并；字段支持单值或数组写法 |
+
+尚未实现（systemd 兼容性）：模板/实例单元（`foo@.service` + `%i` specifier）、多搜索路径与
+mask、D-Bus 接口（当前为自定义 unix socket 协议）、用户管理器（`systemd --user`）、
+journal 查询（当前 logkeeper 转发 kmsg 到文件）、tmpfiles/sysusers/random-seed 等辅助工具。
+
 **单元命名**：`[Unit] Name = "..."` 显式声明单元名（rservice/status/依赖引用均使用它）；缺省时回退文件名（去掉 `.toml`）。target 类型按文件名 `.target` 后缀判定，不受 Name 影响。
 
 ### 启动流程
