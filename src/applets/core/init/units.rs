@@ -33,6 +33,9 @@ pub(crate) struct Unit {
     pub(crate) is_path: bool,
     #[serde(skip)]
     pub(crate) is_socket: bool,
+    /// 模板单元（文件名含 `@`，如 `getty@.toml`）
+    #[serde(skip)]
+    pub(crate) is_template: bool,
 }
 
 /// `[Socket]`：socket 激活单元（`*.socket.toml`）。
@@ -446,6 +449,96 @@ pub(crate) fn resolve_unit_name(file_stem: &str, declared: &str) -> String {
     }
 }
 
+/// 是否为模板单元（文件名含 `@`）。
+pub(crate) fn is_template_file(file_stem: &str) -> bool {
+    file_stem.contains('@')
+}
+
+/// 展开 systemd 风格说明符：`%i` 实例、`%I` 实例（`-`→`/`）、`%n` 完整单元名、
+/// `%N` 前缀、`%p` 前缀（同 `%N`）、`%u` 用户名、`%h` HOME、`%%` 字面 `%`。
+pub(crate) fn expand_specifiers(
+    spec: &str,
+    prefix: &str,
+    instance: &str,
+    full_name: &str,
+) -> String {
+    let mut out = String::with_capacity(spec.len());
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('i') => out.push_str(instance),
+            Some('I') => out.push_str(&instance.replace('-', "/")),
+            Some('n') => out.push_str(full_name),
+            Some('N') | Some('p') => out.push_str(prefix),
+            Some('u') => {
+                out.push_str(&std::env::var("USER").unwrap_or_else(|_| "root".to_string()))
+            }
+            Some('h') => {
+                out.push_str(&std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()))
+            }
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
+}
+
+/// 对单元所有字符串字段展开说明符。
+pub(crate) fn expand_unit_specifiers(unit: &mut Unit, prefix: &str, instance: &str) {
+    let full = unit.name.clone();
+    let ex = |s: &String| expand_specifiers(s, prefix, instance, &full);
+    let exo = |o: &Option<String>| {
+        o.as_ref()
+            .map(|s| expand_specifiers(s, prefix, instance, &full))
+    };
+    let exv = |v: &Vec<String>| v.iter().map(ex).collect::<Vec<_>>();
+    unit.unit.description = ex(&unit.unit.description);
+    unit.unit.after = exv(&unit.unit.after);
+    unit.unit.before = exv(&unit.unit.before);
+    unit.unit.requires = exv(&unit.unit.requires);
+    unit.unit.wants = exv(&unit.unit.wants);
+    unit.unit.requisite = exv(&unit.unit.requisite);
+    unit.unit.conflicts = exv(&unit.unit.conflicts);
+    unit.unit.part_of = exv(&unit.unit.part_of);
+    unit.unit.on_failure = exv(&unit.unit.on_failure);
+    unit.unit.on_success = exv(&unit.unit.on_success);
+    unit.unit.condition_path_exists = exv(&unit.unit.condition_path_exists);
+    unit.unit.condition_dir_not_empty = exv(&unit.unit.condition_dir_not_empty);
+    unit.service.exec_start = exo(&unit.service.exec_start);
+    unit.service.exec_stop = exo(&unit.service.exec_stop);
+    unit.service.exec_reload = exo(&unit.service.exec_reload);
+    unit.service.exec_start_pre = exv(&unit.service.exec_start_pre);
+    unit.service.exec_start_post = exv(&unit.service.exec_start_post);
+    unit.service.exec_stop_post = exv(&unit.service.exec_stop_post);
+    unit.service.environment = exv(&unit.service.environment);
+    unit.service.environment_file = exo(&unit.service.environment_file);
+    unit.service.working_directory = exo(&unit.service.working_directory);
+    unit.service.pidfile = exo(&unit.service.pidfile);
+    unit.service.logfile = exo(&unit.service.logfile);
+    unit.install.wanted_by = exv(&unit.install.wanted_by);
+}
+
+/// 由模板实例化单元：`full_name` 形如 `prefix@instance`。
+pub(crate) fn instantiate_template(template: &Unit, full_name: &str) -> Option<Unit> {
+    let (prefix, instance) = full_name.split_once('@')?;
+    if prefix.is_empty() || instance.is_empty() {
+        return None;
+    }
+    let mut u = template.clone();
+    u.name = full_name.to_string();
+    u.is_template = false;
+    expand_unit_specifiers(&mut u, prefix, instance);
+    Some(u)
+}
+
 /// 是否为 target 单元（按文件名 .target 后缀判定，与 Name 字段无关）。
 pub(crate) fn is_target_file(file_stem: &str) -> bool {
     file_stem.ends_with(".target")
@@ -508,19 +601,51 @@ pub(crate) fn parse_duration(spec: &str) -> Option<u64> {
 /// 加载单元目录（路径可配置，见 /etc/rbox.conf [paths] system_dir）下所有 .toml 单元文件。
 pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
     let mut units: HashMap<String, Unit> = HashMap::new();
-    let dir = Path::new(&crate::config::load().paths.system_dir);
-    if !dir.exists() {
+    let primary = crate::config::load().paths.system_dir.clone();
+    // 搜索路径优先级：/etc（配置）> /run > /usr/lib；低优先级先加载，高优先级覆盖
+    let dirs: Vec<String> = vec![
+        "/usr/lib/rbox/system".to_string(),
+        "/run/rbox/system".to_string(),
+        primary.clone(),
+    ];
+    if !Path::new(&primary).exists() {
         // 目录缺失（如测试模式/配置错误）：告警避免"无服务也能正常启动"的假象
         log_at(
             LogLevel::Warn,
-            &format!("rbox init: unit dir {} not found", dir.display()),
+            &format!("rbox init: unit dir {} not found", primary),
         );
-        return Ok(units);
     }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    for dir in dirs.iter().map(|d| Path::new(d.as_str())) {
+        if !dir.exists() {
+            continue;
+        }
+        load_dir_into(dir, &mut units);
+    }
+    // 模板实例化：收集所有引用（依赖/WantedBy/联动），出现 prefix@instance 且模板存在则实例化
+    instantiate_referenced_templates(&mut units);
+    Ok(units)
+}
+
+/// 加载单个目录的单元（高优先级目录后加载，覆盖低优先级同名单元）。
+/// 指向 /dev/null 的符号链接表示 mask：从表中移除该单元。
+fn load_dir_into(dir: &Path, units: &mut HashMap<String, Unit>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+            // mask：符号链接指向 /dev/null → 移除该单元
+            if let Ok(target) = fs::read_link(&path)
+                && target == Path::new("/dev/null")
+            {
+                let stem = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                units.remove(&stem);
+                continue;
+            }
             let content = match fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -543,6 +668,14 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
                     unit.is_timer = is_timer_file(&file_stem);
                     unit.is_path = is_path_file(&file_stem);
                     unit.is_socket = is_socket_file(&file_stem);
+                    unit.is_template = is_template_file(&file_stem);
+                    if !unit.is_template {
+                        let (prefix, instance) = match unit.name.split_once('@') {
+                            Some((p, i)) => (p.to_string(), i.to_string()),
+                            None => (unit.name.clone(), String::new()),
+                        };
+                        expand_unit_specifiers(&mut unit, &prefix, &instance);
+                    }
                     unit.name = resolve_unit_name(&file_stem, &unit.unit.name);
                     if units.contains_key(&unit.name) {
                         log_at(
@@ -565,7 +698,49 @@ pub(crate) fn load_all_units() -> std::io::Result<HashMap<String, Unit>> {
             }
         }
     }
-    Ok(units)
+    // （模板实例化在 load_all_units 末尾统一处理）
+    let _ = units;
+}
+
+/// 收集所有引用并实例化 `prefix@instance`（模板存在时）。
+fn instantiate_referenced_templates(units: &mut HashMap<String, Unit>) {
+    let mut refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for u in units.values() {
+        for list in [
+            &u.unit.after,
+            &u.unit.before,
+            &u.unit.requires,
+            &u.unit.wants,
+            &u.unit.requisite,
+            &u.unit.conflicts,
+            &u.unit.part_of,
+            &u.unit.on_failure,
+            &u.unit.on_success,
+            &u.install.wanted_by,
+        ] {
+            for r in list {
+                refs.insert(r.clone());
+            }
+        }
+    }
+    for r in refs {
+        if units.contains_key(&r) {
+            continue;
+        }
+        let Some((prefix, _)) = r.split_once('@') else {
+            continue;
+        };
+        let tname = format!("{}@", prefix);
+        let Some(t) = units.get(&tname).cloned() else {
+            continue;
+        };
+        if !t.is_template {
+            continue;
+        }
+        if let Some(inst) = instantiate_template(&t, &r) {
+            units.insert(r.clone(), inst);
+        }
+    }
 }
 
 /// 计算单元的排序依赖：Requires/After/Wants + 反向 Before +
@@ -938,5 +1113,64 @@ WantedBy = ["multi-user.target"]
         assert_eq!(u.service.success_exit_status, vec![2, 3]);
         assert_eq!(u.service.kill_signal.as_deref(), Some("INT"));
         assert!(!u.service.send_sigkill);
+    }
+
+    #[test]
+    fn specifier_expansion() {
+        assert_eq!(
+            expand_specifiers("getty@%i %n %N %%", "getty", "tty1", "getty@tty1"),
+            "getty@tty1 getty@tty1 getty %"
+        );
+        assert_eq!(
+            expand_specifiers("%I", "a", "foo-bar", "a@foo-bar"),
+            "foo/bar"
+        );
+        // 未知说明符原样保留
+        assert_eq!(expand_specifiers("%z", "a", "b", "a@b"), "%z");
+        assert_eq!(expand_specifiers("no-spec", "a", "b", "a@b"), "no-spec");
+    }
+
+    #[test]
+    fn template_instantiation() {
+        let mut t = Unit {
+            name: "getty@".to_string(),
+            is_template: true,
+            ..Default::default()
+        };
+        t.service.exec_start = Some("/bin/rbox echo getty@%i".to_string());
+        t.service.environment = vec!["TTY=%i".to_string()];
+        t.install.wanted_by = vec!["default.target".to_string()];
+        let inst = instantiate_template(&t, "getty@tty1").unwrap();
+        assert_eq!(inst.name, "getty@tty1");
+        assert!(!inst.is_template);
+        assert_eq!(
+            inst.service.exec_start.as_deref(),
+            Some("/bin/rbox echo getty@tty1")
+        );
+        assert_eq!(inst.service.environment, vec!["TTY=tty1"]);
+        // 非法实例名
+        assert!(instantiate_template(&t, "getty@").is_none());
+        assert!(instantiate_template(&t, "getty").is_none());
+    }
+
+    #[test]
+    fn load_dir_mask_removes_unit() {
+        let dir = std::path::PathBuf::from(format!("/tmp/rbox_units_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("masked.toml"),
+            "[Service]\nExecStart = \"/bin/true\"\n",
+        )
+        .unwrap();
+        let mut units = std::collections::HashMap::new();
+        load_dir_into(&dir, &mut units);
+        assert!(units.contains_key("masked"));
+        // 覆盖为指向 /dev/null 的符号链接 = mask
+        std::fs::remove_file(dir.join("masked.toml")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", dir.join("masked.toml")).unwrap();
+        load_dir_into(&dir, &mut units);
+        assert!(!units.contains_key("masked"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

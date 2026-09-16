@@ -12,6 +12,7 @@ const SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
 /// 执行有序关机：逆序停止服务，杀残留进程，再 power off。
 pub(crate) fn do_shutdown(services: &mut [ServiceInstance]) -> ExitCode {
+    crate::applets::core::init::randseed::save();
     log("rbox init: shutting down");
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(SHUTDOWN_TIMEOUT_SECS);

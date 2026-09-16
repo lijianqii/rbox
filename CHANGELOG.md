@@ -74,6 +74,8 @@
   按发送者 pid/父进程归属服务；看门狗超时终止并触发重启
 - init drop-in 覆盖：`<unit>.d/*.toml` 深合并
 - 修复：notify 套接字需在服务启动前创建；服务退出清理看门狗状态
+- init systemd 兼容补齐：模板/实例单元与 `%i` 等说明符、多搜索路径与 mask、
+  日志查询 `logctl`、`tmpfiles`、随机种子持久化（新增 2 个 applet，共 69 个）
 - 测试补齐：新增 5 个单测与 13 条集成断言（noclobber/`<>`/任意 fd/`$-`/`set -o`/
   `$RANDOM`/CDPATH/`kill %job`/命令替换多行输出/负偏移子串等），并加固重定向类测试的
   并发输出隔离；`make coverage` 报告整体约 73% 行 / 83% 函数覆盖
@@ -95,7 +97,7 @@
   Tab 补全、行编辑、作业控制（`jobs`/`fg`/`bg` + Ctrl-Z）、here-doc、`source`、PS1 展开
 - 登录：rgetty（常驻 fork/wait、`-L`/`-t` 超时）+ rlogin（shadow + crypt、降权、MOTD）、
   `su`/`passwd`
-- 67 个 applet：文件/文本/进程/系统工具（含 tar/dd/sort/cut/tr/test/find/mount 等）
+- 69 个 applet：文件/文本/进程/系统工具（含 tar/dd/sort/cut/tr/test/find/mount 等）
 
 ### Shell 脚本化（v0.1.0 内后续迭代）
 - 脚本模式：`sh script.sh args`、`sh -c`、shebang、stdin 脚本；`-e/-x/-u/-o pipefail`
@@ -108,7 +110,7 @@
 - 交互配置：`PS2`/`PS4`/`IFS`、`~/.profile`、`cd -`/`PWD`/`OLDPWD`
 
 ### 工程
-- 单测 810 个、QEMU 集成断言 310 条（含登录/超时、rescue、持久盘、emergency/single）
+- 单测 818 个、QEMU 集成断言 313 条（含登录/超时、rescue、持久盘、emergency/single）
 - Clippy `--all-targets -D warnings` 零告警、rustfmt、make verify / verify-all
 - release profile（thin LTO + strip）、musl 静态构建（rust-lld）、fuzz-lite 随机化测试、
   coverage/audit/dist 目标

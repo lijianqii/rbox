@@ -13,6 +13,7 @@ pub(crate) mod boot;
 pub(crate) mod cgroup;
 pub(crate) mod mount;
 pub(crate) mod notify;
+pub(crate) mod randseed;
 pub(crate) mod server;
 pub(crate) mod services;
 pub(crate) mod shutdown;
@@ -77,6 +78,8 @@ impl Applet for Init {
         setup_environment();
         mount_all_fs();
         crate::applets::core::init::cgroup::ensure_mounted();
+        // 随机种子：尽早恢复（crng 就绪前也能受益）
+        crate::applets::core::init::randseed::load();
         // 通知套接字须在服务启动前创建，否则 Type=notify 的 READY 会丢失
         let notify_sock = crate::applets::core::init::notify::create();
         setup_hostname();

@@ -6,7 +6,7 @@
 
 ## 特性
 
-- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 67 个命令
+- **Multi-call binary**：单一二进制通过 `argv[0]` 或 `rbox <applet>` 分发 69 个命令
 - **systemd 风格 init**：TOML 单元文件、依赖拓扑排序、`Type=simple/forking`、
   `Restart=on-failure/always`（固定 RestartSec 间隔 + 次数上限）、`Environment=`、`LogFile=`、`User=/Group=` 降权
 - **服务管理**：`rservice` 命令支持 `list/status/start/stop/restart/reload`
@@ -41,7 +41,7 @@
     `break` `continue`
   - `PS2` 续行提示、`PS4` xtrace 前缀、`IFS` 词分割可配置；启动时 source `/etc/profile`
     与 `~/.profile`
-- **工程化**：Clippy（--all-targets）零警告、810 个单元测试、310 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
+- **工程化**：Clippy（--all-targets）零警告、818 个单元测试、313 个集成断言、rustfmt、fuzz-lite 随机化测试、musl 静态构建、make doctor 环境自检
 
 ## 快速开始
 

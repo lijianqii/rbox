@@ -400,6 +400,10 @@ send_boot() {
   printf "cat /sys/fs/cgroup/test.slice/limited/cpu.max\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "cat /sys/fs/cgroup/test.slice/limited/pids.max\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "cat /sys/fs/cgroup/test.slice/limited/cpu.weight\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # logctl：查询日志文件
+  printf "logctl -F /var/log/messages -n 1\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
+  # tmpfiles：按配置创建目录/文件/链接
+  printf "echo \x27d /tmp/tf_test 0755\nf /tmp/tf_test/a.txt 0644 - - - tf-content\nL /tmp/tf_test/link /tmp/tf_test/a.txt\x27 > /tmp/tf.conf; tmpfiles /tmp/tf.conf; ls -l /tmp/tf_test/a.txt; cat /tmp/tf_test/link\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   # init 增强：reload、sysctl、User= 降权
   printf "rservice reload longrun\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
   printf "rservice reload console-shell\necho __RBOX_DONE__\n" >&7 2>/dev/null || true; wait_main
@@ -804,6 +808,9 @@ assert_line "cgroup CPUQuota 生效" "50000 100000"
 assert_line "cgroup TasksMax 生效" "10"
 assert_line "cgroup CPUWeight 生效" "200"
 assert_contains "服务加入 cgroup" "placed in cgroup"
+assert_contains "模板实例化 + 说明符" "INSTANCE_alpha unit=inst@alpha prefix=inst"
+assert_contains "logctl 查询日志" "rbox init"
+assert_contains "tmpfiles 创建文件" "tf-content"
 assert_contains "Type=notify READY 生效" "notify-ok ready (sd_notify)"
 assert_contains "WatchdogSec 超时终止" "notify-wd watchdog timeout"
 assert_contains "UMask 生效" "ATTR_UMASK=0027"

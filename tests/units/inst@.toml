@@ -1,0 +1,7 @@
+[Unit]
+Description = "Instance template (test)"
+Name = "inst@"
+
+[Service]
+Type = "oneshot"
+ExecStart = "/bin/rbox echo INSTANCE_%i unit=%n prefix=%N"

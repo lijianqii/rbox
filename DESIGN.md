@@ -188,7 +188,7 @@ pub trait Applet: Sync {
 shell 在 fork+exec 时，如果 PATH 查找失败，会回退尝试 `rbox <cmd>` -- 这样即使没有为某个 applet 创建 symlink，也能通过 shell 执行内置命令。
 ## 已实现的 Applet
 
-共 67 个 applet：
+共 69 个 applet：
 
 | # | Applet | 用法 | 说明 |
 |---|--------|------|------|
@@ -426,7 +426,7 @@ enum Token {
 
 ### 测试
 
-集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、310 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
+集成测试在 `tests/run_tests.sh` 中，通过 QEMU 全系统模拟运行所有命令。共 41 个测试组、313 个断言（涵盖 65 个 applet、Shell 全功能、init 服务管理、Wants/Requisite/Before 依赖、emergency/single 启动模式、rescue 降级、持久盘 switch_root、rgetty/rlogin 登录与超时流程、重启/关机流程）：
 
 | 测试组 | 测试项 | 数量 |
 |--------|--------|------|
@@ -468,7 +468,7 @@ enum Token {
 | rescue 启动降级 | target Requires 失败 → 停止服务进 rescue shell | 4 |
 | 持久盘模式 | switch_root、写入、重启后数据保留 | 3 |
 | Shell: ash 对齐与覆盖补齐 | 子 shell/花括号组/`!`/反引号/`:`/readonly/getopts/ulimit、位运算与三元、参数子串、`for` 无 in、复合重定向、任意 fd/`<>`/`>|`、noclobber、`$-`/`set -o`/`$RANDOM`/`set -f`、CDPATH、`cd -L/-P`、`pwd -P`、`kill %job`/`kill -l` 表格、`&&`/`||` 组、`$ENV`、ignoreeof（Ctrl-D） | 44 |
-| **合计** | | **310** |
+| **合计** | | **313** |
 
 > **注意**：Ctrl-A (0x01) 在 QEMU `-nographic` 模式下是 monitor 转义前缀，不会传递给客户机，因此无法在自动化测试中覆盖。Ctrl-A 在交互式 `make run` 中可正常使用（宿主机 stty raw 模式下传递）。
 
@@ -708,9 +708,13 @@ target 文件（如 default.target.toml）本身不含 ExecStart，仅作为依�
 | 管理接口 | `rservice list/status/start/stop/restart/reload/enable/disable/is-enabled/isolate/reset-failed/daemon-reload`；`shutdown -h/-r/-t`、`poweroff`、`halt` |
 | 配置覆盖 | `<unit>.d/*.toml` drop-in 深合并；字段支持单值或数组写法 |
 
-尚未实现（systemd 兼容性）：模板/实例单元（`foo@.service` + `%i` specifier）、多搜索路径与
-mask、D-Bus 接口（当前为自定义 unix socket 协议）、用户管理器（`systemd --user`）、
-journal 查询（当前 logkeeper 转发 kmsg 到文件）、tmpfiles/sysusers/random-seed 等辅助工具。
+已补齐：模板/实例单元（`foo@.toml` + `%i`/`%I`/`%n`/`%N`/`%u`/`%h`/`%%` 说明符）、
+多搜索路径（`/etc/rbox/system` > `/run/rbox/system` > `/usr/lib/rbox/system`）与
+mask（指向 `/dev/null` 的符号链接）、日志查询 applet `logctl`（-F/-u/-n/-p/-f/模式过滤）、
+`tmpfiles` applet（d/f/L/r/R/w/z）、随机种子持久化（启动恢复 / 关机保存）。
+
+尚未实现：D-Bus 接口（当前为自定义 unix socket 文本协议，避免引入 D-Bus 依赖）、
+用户管理器（`systemd --user`）、`sysusers` 用户批量创建。
 
 **单元命名**：`[Unit] Name = "..."` 显式声明单元名（rservice/status/依赖引用均使用它）；缺省时回退文件名（去掉 `.toml`）。target 类型按文件名 `.target` 后缀判定，不受 Name 影响。
 
@@ -882,11 +886,11 @@ here-doc 逐行发送、多行复合命令/函数在块结束处等待；历史�
 
 ### 测试覆盖
 
-集成测试共 41 个测试组、310 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
+集成测试共 41 个测试组、313 个断言，覆盖全部 65 个 applet 及 Shell/init/重启/关机流程，
 完整分组与数量见上文「已实现的 Applet」中的集成测试表格。运行结果以 `tests/run_tests.sh`
 末尾的汇总为准（`结果: N 通过, 0 失败`）。
 
-单元测试（810 个）使用 `make coverage`（cargo-llvm-cov）可生成覆盖率报告，当前整体约
+单元测试（818 个）使用 `make coverage`（cargo-llvm-cov）可生成覆盖率报告，当前整体约
 73% 行覆盖 / 83% 函数覆盖。Shell 各模块行覆盖：expander 94%、tokenizer 88%、parser 99%、
 compound 86%、options 85%、alias 96%、trap 94%、jobs 78%、completion 81%、reader 77%、
 script 65%、builtin 62%、executor 55%、mod（REPL 主循环）26%。REPL 主循环、fork/exec 子
@@ -942,7 +946,7 @@ make unittest
 | core/* | rservice 3、status 2、log 4、shutdown 1、reboot 1、control 3、rgetty 11、rlogin 12 | 37 |
 | proc / glob / fstab（共享工具） | 进程信息收集/单位格式化；glob 匹配；fstab 解析 | 15 |
 | main | applet 注册表唯一性/查找/--help 处理 | 7 |
-| **合计** | | **310** |
+| **合计** | | **313** |
 
 测试结果示例：
 
